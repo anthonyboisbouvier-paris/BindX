@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useMemo } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useProject } from '../../contexts/ProjectContext.jsx'
-import { createJob, getJobStatus, triggerRunAnalysis } from '../../api.js'
+import { createJob, triggerRunAnalysis } from '../../api.js'
 import ProgressBar from '../../components/ProgressBar.jsx'
 import TimeEstimate from '../../components/TimeEstimate.jsx'
 import AgentAdvisorCard from '../../components/AgentAdvisorCard.jsx'

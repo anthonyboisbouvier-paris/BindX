@@ -270,6 +270,14 @@ export default function ParetoFront({ molecules, onSelect }) {
     setZoom(z => Math.max(0.5, Math.min(5, z * delta)))
   }, [])
 
+  // Attach wheel as non-passive so preventDefault works
+  useEffect(() => {
+    const el = svgRef.current
+    if (!el) return
+    el.addEventListener('wheel', handleWheel, { passive: false })
+    return () => el.removeEventListener('wheel', handleWheel)
+  }, [handleWheel])
+
   // Pan handlers
   const handleMouseDown = useCallback((e) => {
     if (e.shiftKey) {
@@ -452,7 +460,7 @@ export default function ParetoFront({ molecules, onSelect }) {
       <div className="bg-white rounded-xl border border-gray-100 overflow-hidden shadow-sm"
         style={{ cursor: zoom > 1 ? (isPanning ? 'grabbing' : 'grab') : 'crosshair' }}>
         <svg ref={svgRef} viewBox={`0 0 ${VW} ${VH}`} className="w-full" style={{ display: 'block' }}
-          onWheel={handleWheel} onMouseDown={handleMouseDown} onMouseMove={handleMouseMove}
+          onMouseDown={handleMouseDown} onMouseMove={handleMouseMove}
           onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}>
           <rect x={0} y={0} width={VW} height={VH} fill="#fff" />
 

@@ -241,8 +241,7 @@ class BaseAgent:
                         "title": p.get("title", ""),
                         "pmid": p.get("pmid", ""),
                         "url": p.get("url", ""),
-                        "authors": p.get("authors", []),
-                        "year": p.get("year", ""),
+                        "finding": (p.get("abstract", "") or "")[:200],
                     }
                     for p in research["pubmed_papers"]
                 ]
@@ -280,13 +279,4 @@ class BaseAgent:
     def query_sync(self, context: dict) -> dict:
         """Synchronous wrapper for query(). Use in non-async contexts."""
         import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Already in async context — run in thread
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    return pool.submit(asyncio.run, self.query(context)).result()
-            return loop.run_until_complete(self.query(context))
-        except RuntimeError:
-            return asyncio.run(self.query(context))
+        return asyncio.run(self.query(context))

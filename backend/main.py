@@ -2264,8 +2264,9 @@ async def query_agent(agent_name: str, req: AgentQuery) -> JSONResponse:
     enriched_context = dict(req.context)
     if req.project_id:
         try:
-            from database import get_session
-            with get_session() as session:
+            from database import get_db
+            from models import ProjectORM
+            with get_db() as session:
                 proj = session.query(ProjectORM).filter_by(id=req.project_id).first()
                 if proj:
                     if proj.uniprot_id and "uniprot_id" not in enriched_context:
@@ -2293,7 +2294,7 @@ async def query_agent(agent_name: str, req: AgentQuery) -> JSONResponse:
         agent_class = getattr(mod, class_name)
         agent = agent_class()
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             _assessment_pool,
             lambda: agent.query_sync(enriched_context),
@@ -2306,7 +2307,7 @@ async def query_agent(agent_name: str, req: AgentQuery) -> JSONResponse:
         return JSONResponse({
             "available": False,
             "agent_name": agent_name,
-            "fallback": f"Agent error: {exc}",
+            "fallback": "Agent analysis failed. Please try again.",
         })
 
 
@@ -2352,9 +2353,10 @@ async def trigger_run_analysis(job_id: str) -> JSONResponse:
 
     Builds context from the job's results.json and runs the Run Analysis Agent.
     """
-    from database import get_session
+    from database import get_db
+    from models import JobORM
 
-    with get_session() as session:
+    with get_db() as session:
         job = session.query(JobORM).filter_by(id=job_id).first()
         if not job:
             raise HTTPException(404, f"Job {job_id} not found")
@@ -2399,7 +2401,7 @@ async def trigger_run_analysis(job_id: str) -> JSONResponse:
         from pipeline.agents.run_analysis_agent import RunAnalysisAgent
         agent = RunAnalysisAgent()
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             _assessment_pool,
             lambda: agent.query_sync(context),

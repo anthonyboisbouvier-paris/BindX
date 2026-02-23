@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { Link } from 'react-router-dom'
 import { useProject } from '../../contexts/ProjectContext.jsx'
 import { HitSelectionProvider, useHitSelection } from '../../contexts/HitSelectionContext.jsx'
-import { getJobResults, startOptimization, getOptimizationStatus, createJob, queryAgent } from '../../api.js'
+import { getJobResults, startOptimization, getOptimizationStatus, createJob } from '../../api.js'
 
 import OptimizationChart from '../../components/OptimizationChart.jsx'
 import AgentAdvisorCard from '../../components/AgentAdvisorCard.jsx'
