@@ -80,4 +80,12 @@ export function useProject() {
   return ctx
 }
 
+/**
+ * useProjectSafe — same as useProject but returns null when outside a ProjectProvider.
+ * Use in components that may render both inside and outside a ProjectProvider.
+ */
+export function useProjectSafe() {
+  return useContext(ProjectContext)
+}
+
 export default ProjectContext

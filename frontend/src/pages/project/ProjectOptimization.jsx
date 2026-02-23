@@ -4,9 +4,7 @@ import { useProject } from '../../contexts/ProjectContext.jsx'
 import { HitSelectionProvider, useHitSelection } from '../../contexts/HitSelectionContext.jsx'
 import { getJobResults, startOptimization, getOptimizationStatus, createJob } from '../../api.js'
 
-// Lazy-load chart
-let OptimizationChart = null
-try { OptimizationChart = require('../../components/OptimizationChart.jsx').default } catch {}
+import OptimizationChart from '../../components/OptimizationChart.jsx'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -312,7 +310,7 @@ function OptimizationInner({ jobId, results, project }) {
           </div>
         </div>
 
-        {progress.iterations.length > 0 && OptimizationChart && (
+        {progress.iterations.length > 0 && (
           <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
             <h3 className="text-sm font-semibold text-gray-700 mb-3">Score Evolution</h3>
             <OptimizationChart iterations={progress.iterations} />
@@ -402,7 +400,7 @@ function OptimizationInner({ jobId, results, project }) {
           </div>
         </div>
 
-        {data?.iterations?.length > 0 && OptimizationChart && (
+        {data?.iterations?.length > 0 && (
           <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
             <h3 className="text-sm font-semibold text-gray-700 mb-3">Score Evolution</h3>
             <OptimizationChart iterations={data.iterations} />
@@ -548,7 +546,9 @@ export default function ProjectOptimization() {
   const [loadingResults, setLoadingResults] = useState(false)
 
   // Find the latest completed screening job (not optimization runs)
-  const completedJobs = jobs.filter(j => j.status === 'completed')
+  const completedJobs = jobs
+    .filter(j => j.status === 'completed')
+    .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
   const latestJobId = completedJobs.length > 0 ? (completedJobs[0].id || completedJobs[0].job_id) : null
 
   useEffect(() => {

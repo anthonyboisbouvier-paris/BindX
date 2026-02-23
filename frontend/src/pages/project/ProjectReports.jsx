@@ -4,9 +4,7 @@ import { useProject } from '../../contexts/ProjectContext.jsx'
 import { HitSelectionProvider, useHitSelection } from '../../contexts/HitSelectionContext.jsx'
 import { getJobResults, getReportUrl, getDownloadUrl } from '../../api.js'
 
-// Lazy-load optional components
-let ReportPreview = null
-try { ReportPreview = require('../../components/ReportPreview.jsx').default } catch {}
+import ReportPreview from '../../components/ReportPreview.jsx'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -168,7 +166,7 @@ function ReportsInner({ jobId, results, job }) {
         )}
       </div>
 
-      {ReportPreview && <ReportPreview results={results} selections={selections} />}
+      {<ReportPreview results={results} selections={selections} />}
 
       {/* Download */}
       <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
@@ -214,7 +212,9 @@ export default function ProjectReports() {
   const [results, setResults] = useState(null)
   const [loadingResults, setLoadingResults] = useState(false)
 
-  const completedJobs = jobs.filter(j => j.status === 'completed')
+  const completedJobs = jobs
+    .filter(j => j.status === 'completed')
+    .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
   const latestJob = completedJobs[0] || null
   const latestJobId = latestJob ? (latestJob.id || latestJob.job_id) : null
 

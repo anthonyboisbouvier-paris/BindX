@@ -86,7 +86,7 @@ function parseFasta(text) {
 // UniProt enrichment — fetch rich protein info for druggability context
 // ---------------------------------------------------------------------------
 
-function UniProtInfoCard({ uniprotId }) {
+function UniProtInfoCard({ uniprotId, onFeaturesLoaded }) {
   const [info, setInfo] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -164,6 +164,53 @@ function UniProtInfoCard({ uniprotId }) {
           openTargetsRefs, chemblRefs, tissueText,
           ptmText, pharmaText, involvementText,
         })
+
+        // Extract structural features for 3D annotation overlays
+        if (onFeaturesLoaded) {
+          const features = data.features || []
+          onFeaturesLoaded({
+            activeSites: features
+              .filter(f => f.type === 'Active site')
+              .map(f => ({
+                position: f.location?.start?.value,
+                description: f.description || '',
+              })),
+            bindingSites: features
+              .filter(f => f.type === 'Binding site')
+              .map(f => ({
+                start: f.location?.start?.value,
+                end: f.location?.end?.value || f.location?.start?.value,
+                description: f.description || '',
+                ligand: f.ligand?.name || '',
+              })),
+            domains: features
+              .filter(f => f.type === 'Domain')
+              .map(f => ({
+                start: f.location?.start?.value,
+                end: f.location?.end?.value,
+                name: f.description || '',
+              })),
+            disulfideBonds: features
+              .filter(f => f.type === 'Disulfide bond')
+              .map(f => ({
+                start: f.location?.start?.value,
+                end: f.location?.end?.value,
+              })),
+            modifiedResidues: features
+              .filter(f => f.type === 'Modified residue')
+              .map(f => ({
+                position: f.location?.start?.value,
+                description: f.description || '',
+              })),
+            transmembrane: features
+              .filter(f => f.type === 'Transmembrane')
+              .map(f => ({
+                start: f.location?.start?.value,
+                end: f.location?.end?.value,
+                description: f.description || '',
+              })),
+          })
+        }
       })
       .catch(err => { if (!cancelled) setError(err.message) })
       .finally(() => { if (!cancelled) setLoading(false) })
@@ -369,10 +416,13 @@ function load3DmolLib() {
   })
 }
 
-function ProteinPreviewViewer({ pdbUrl, pdbData }) {
+const PREVIEW_DOMAIN_COLORS = ['#6366f1', '#8b5cf6', '#ec4899', '#14b8a6', '#f59e0b', '#06b6d4']
+
+function ProteinPreviewViewer({ pdbUrl, pdbData, uniprotFeatures }) {
   const containerRef = React.useRef(null)
   const viewerRef = React.useRef(null)
   const [viewerError, setViewerError] = React.useState(null)
+  const [viewerReady, setViewerReady] = React.useState(false)
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -409,6 +459,7 @@ function ProteinPreviewViewer({ pdbUrl, pdbData }) {
         viewer.setStyle({}, { cartoon: { color: '#4a9eff' } })
         viewer.zoomTo()
         viewer.render()
+        setViewerReady(true)
       } catch (err) {
         if (!cancelled) setViewerError(err.message)
       }
@@ -417,6 +468,22 @@ function ProteinPreviewViewer({ pdbUrl, pdbData }) {
     initViewer()
     return () => { cancelled = true }
   }, [pdbUrl, pdbData])
+
+  // Apply domain coloring when UniProt features arrive
+  useEffect(() => {
+    const viewer = viewerRef.current
+    if (!viewer || !viewerReady || !uniprotFeatures?.domains?.length) return
+
+    uniprotFeatures.domains.forEach((d, i) => {
+      if (!d.start || !d.end) return
+      const resis = []
+      for (let r = d.start; r <= d.end; r++) resis.push(r)
+      viewer.addStyle({ resi: resis }, {
+        cartoon: { color: PREVIEW_DOMAIN_COLORS[i % PREVIEW_DOMAIN_COLORS.length], opacity: 1.0 },
+      })
+    })
+    viewer.render()
+  }, [viewerReady, uniprotFeatures])
 
   if (viewerError) {
     return (
@@ -459,12 +526,18 @@ export default function TargetSetup() {
   const [selectedStructureIdx, setSelectedStructureIdx] = useState(0)
   const [selectedPocketIdx, setSelectedPocketIdx] = useState(0)
 
+  // UniProt features for 3D annotations
+  const [uniprotFeatures, setUniprotFeatures] = useState(null)
+
   // Save state
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState(null)
 
   // Pre-fill from existing config
   useEffect(() => {
+    if (targetConfig?.uniprot_features) {
+      setUniprotFeatures(targetConfig.uniprot_features)
+    }
     if (targetConfig?.uniprot_id) {
       setUniprotId(targetConfig.uniprot_id)
       setPreview(targetConfig)
@@ -529,6 +602,7 @@ export default function TargetSetup() {
       selected_structure_idx: selectedStructureIdx,
       selected_pocket_idx: selectedPocketIdx,
       configured_at: new Date().toISOString(),
+      uniprot_features: uniprotFeatures,
     }
     try {
       await updateProject(project.id, { target_preview_json: config })
@@ -670,7 +744,7 @@ export default function TargetSetup() {
 
       {/* UniProt Intelligence — shown after UniProt validation */}
       {hasPreview && inputMode === 'uniprot' && uniprotId && (
-        <UniProtInfoCard uniprotId={uniprotId} />
+        <UniProtInfoCard uniprotId={uniprotId} onFeaturesLoaded={setUniprotFeatures} />
       )}
 
       {/* Step 2 — Structure selection (all available options) */}
@@ -748,6 +822,7 @@ export default function TargetSetup() {
           <ProteinPreviewViewer
             pdbUrl={sel.download_url || null}
             pdbData={sel.pdb_data || null}
+            uniprotFeatures={uniprotFeatures}
           />
         )
       })()}

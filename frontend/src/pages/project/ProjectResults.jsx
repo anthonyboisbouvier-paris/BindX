@@ -851,9 +851,11 @@ function ProjectResultsInner({ selectedJobId, results, targetConfig }) {
   const [confidenceMol, setConfidenceMol] = useState(null)
 
   // Merge all molecules (docking + generated)
-  const rawResults = results?.results || []
-  const generatedMols = (results?.generated_molecules || []).map(m => ({ ...m, _isGeneratedMol: true }))
-  const allMolsUnfiltered = useMemo(() => [...rawResults, ...generatedMols], [rawResults, generatedMols])
+  const allMolsUnfiltered = useMemo(() => {
+    const raw = results?.results || []
+    const gen = (results?.generated_molecules || []).map(m => ({ ...m, _isGeneratedMol: true }))
+    return [...raw, ...gen]
+  }, [results])
 
   // Apply filters
   const allMols = useMemo(() => {
@@ -900,7 +902,8 @@ function ProjectResultsInner({ selectedJobId, results, targetConfig }) {
   }, [allMolsUnfiltered, setTag])
 
   const hasAdmet = allMolsUnfiltered.some(m => m.admet)
-  const hasSources = allMolsUnfiltered.some(m => m.source) || generatedMols.length > 0
+  const generatedMolCount = allMolsUnfiltered.filter(m => m._isGeneratedMol).length
+  const hasSources = allMolsUnfiltered.some(m => m.source) || generatedMolCount > 0
 
   return (
     <div className="space-y-5">
@@ -948,11 +951,12 @@ function ProjectResultsInner({ selectedJobId, results, targetConfig }) {
               const pocket = pockets?.[selIdx] || pockets?.[0]
               return pocket?.residues || null
             })()}
+            uniprotFeatures={targetConfig?.uniprot_features || null}
           />
         </div>
         <div className="space-y-4">
           {selectedMol && (
-            <MoleculeCard molecule={selectedMol} rank={selectedPoseIndex + 1} jobId={selectedJobId} />
+            <MoleculeCard molecule={selectedMol} rank={selectedPoseIndex} jobId={selectedJobId} />
           )}
           {selectedMol && (
             <SafetyConfidencePanel
@@ -970,7 +974,7 @@ function ProjectResultsInner({ selectedJobId, results, targetConfig }) {
         allMols={allMols}
         selectedPoseIndex={selectedPoseIndex}
         setSelectedPoseIndex={setSelectedPoseIndex}
-        generatedMolCount={generatedMols.length}
+        generatedMolCount={generatedMolCount}
       />
 
       {/* Pareto Front */}

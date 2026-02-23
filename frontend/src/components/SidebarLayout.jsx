@@ -1,6 +1,6 @@
 import React from 'react'
 import { Outlet, NavLink, useParams, useLocation } from 'react-router-dom'
-import { ProjectProvider, useProject } from '../contexts/ProjectContext.jsx'
+import { ProjectProvider, useProjectSafe } from '../contexts/ProjectContext.jsx'
 import { HitSelectionProvider } from '../contexts/HitSelectionContext.jsx'
 
 // ---------------------------------------------------------------------------
@@ -173,13 +173,8 @@ function SidebarLayoutInner() {
   const location = useLocation()
 
   // Safely read isTargetConfigured — may not be in a ProjectProvider
-  let isTargetConfigured = false
-  try {
-    const ctx = useProject()
-    isTargetConfigured = ctx.isTargetConfigured
-  } catch {
-    // Not inside ProjectProvider — leave false
-  }
+  const ctx = useProjectSafe()
+  const isTargetConfigured = ctx?.isTargetConfigured ?? false
 
   // Sub-items for mobile (flat list)
   const mobileSubItems = projectId ? buildSubNavItems(projectId, isTargetConfigured) : []
