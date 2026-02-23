@@ -1,8 +1,10 @@
-import React, { useState, useCallback } from 'react'
+import React, { useState, useCallback, useMemo } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useProject } from '../../contexts/ProjectContext.jsx'
-import { createJob, getJobStatus } from '../../api.js'
+import { createJob, getJobStatus, triggerRunAnalysis } from '../../api.js'
 import ProgressBar from '../../components/ProgressBar.jsx'
+import TimeEstimate from '../../components/TimeEstimate.jsx'
+import AgentAdvisorCard from '../../components/AgentAdvisorCard.jsx'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -56,6 +58,7 @@ const ENGINE_OPTIONS = [
 // Single-source ligand options
 const LIGAND_SOURCE_OPTIONS = [
   { value: 'chembl', label: 'ChEMBL', description: 'Known active compounds from ChEMBL database' },
+  { value: 'pubchem', label: 'PubChem', description: 'Bioactive compounds from NCBI PubChem' },
   { value: 'zinc',   label: 'ZINC',   description: 'Drug-like molecules from ZINC20' },
   { value: 'custom', label: 'Custom SMILES', description: 'Your own molecules (paste SMILES below)' },
 ]
@@ -81,7 +84,38 @@ export default function RunsList() {
   // Active run tracking (inline progress)
   const [activeJobId, setActiveJobId] = useState(null)
 
+  // Agent 2: Run Analysis state
+  const [analysisJobId, setAnalysisJobId] = useState(null)
+  const [analysisResult, setAnalysisResult] = useState(null)
+  const [analysisLoading, setAnalysisLoading] = useState(false)
+
+  const handleRunAnalysis = useCallback(async (jobId) => {
+    if (analysisJobId === jobId) { setAnalysisJobId(null); return }
+    setAnalysisJobId(jobId)
+    setAnalysisLoading(true)
+    setAnalysisResult(null)
+    try {
+      const data = await triggerRunAnalysis(jobId)
+      setAnalysisResult(data)
+    } catch (err) {
+      setAnalysisResult({ available: false, fallback: err?.userMessage || 'Failed' })
+    } finally {
+      setAnalysisLoading(false)
+    }
+  }, [analysisJobId])
+
   const canCreateRun = !!(project && isTargetConfigured && (targetConfig?.uniprot_id || targetConfig?.sequence))
+
+  // V9: Time estimation params (memoized for debounce stability)
+  const timeEstimateParams = useMemo(() => ({
+    n_ligands: maxLigands,
+    mode,
+    docking_engine: engine,
+    enable_generation: mode !== 'rapid',
+    enable_retrosynthesis: mode !== 'rapid',
+    use_chembl: ligandSource === 'chembl',
+    use_pubchem: ligandSource === 'pubchem',
+  }), [maxLigands, mode, engine, ligandSource])
 
   const handleCreateRun = useCallback(async () => {
     if (!canCreateRun) return
@@ -91,8 +125,9 @@ export default function RunsList() {
     const params = {
       mode,
       max_ligands: maxLigands,
-      use_chembl: ligandSource === 'chembl',
+      use_chembl: ligandSource === 'chembl' || ligandSource === 'pubchem',
       use_zinc: ligandSource === 'zinc',
+      auto_strategy: ligandSource === 'pubchem' || ligandSource === 'chembl',
       project_id: project.id,
       docking_engine: engine === 'auto' ? undefined : engine,
       // Pass target config so backend can skip structure+pockets recomputation
@@ -350,6 +385,9 @@ export default function RunsList() {
             </div>
           </div>
 
+          {/* V9: Time Estimate */}
+          {showForm && <TimeEstimate params={timeEstimateParams} />}
+
           {/* Error */}
           {createError && (
             <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700">
@@ -410,7 +448,8 @@ export default function RunsList() {
               {sortedJobs.map((row) => {
                 const rowId = row.id || row.job_id
                 return (
-                  <tr key={rowId} className="border-b border-gray-50 last:border-0 hover:bg-gray-50 transition-colors">
+                  <React.Fragment key={rowId}>
+                  <tr className="border-b border-gray-50 last:border-0 hover:bg-gray-50 transition-colors">
                     <td className="py-3.5 px-4">
                       <StatusBadge status={row.status} />
                     </td>
@@ -429,26 +468,68 @@ export default function RunsList() {
                       <span className="text-xs text-gray-400">{formatDate(row.created_at)}</span>
                     </td>
                     <td className="py-3.5 px-4 text-right">
-                      {row.status === 'completed' ? (
-                        <Link
-                          to={`../results?run=${rowId}`}
-                          relative="path"
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#22c55e] bg-green-50 border border-green-200 rounded-lg hover:bg-green-100 transition-colors"
-                        >
-                          Results
-                          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                          </svg>
-                        </Link>
-                      ) : row.status === 'running' ? (
-                        <span className="text-xs text-blue-600 font-medium">
-                          {row.progress || 0}%
-                        </span>
-                      ) : (
-                        <span className="text-xs text-gray-400">{row.status}</span>
-                      )}
+                      <div className="flex items-center justify-end gap-2">
+                        {row.status === 'completed' && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); handleRunAnalysis(rowId) }}
+                            className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-lg transition-colors border ${
+                              analysisJobId === rowId
+                                ? 'text-emerald-700 bg-emerald-50 border-emerald-200'
+                                : 'text-gray-500 bg-white border-gray-200 hover:border-emerald-300 hover:text-emerald-600'
+                            }`}
+                          >
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                                d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                            </svg>
+                            AI
+                          </button>
+                        )}
+                        {row.status === 'completed' ? (
+                          <Link
+                            to={`../results?run=${rowId}`}
+                            relative="path"
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#22c55e] bg-green-50 border border-green-200 rounded-lg hover:bg-green-100 transition-colors"
+                          >
+                            Results
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                            </svg>
+                          </Link>
+                        ) : row.status === 'running' ? (
+                          <span className="text-xs text-blue-600 font-medium">
+                            {row.progress || 0}%
+                          </span>
+                        ) : (
+                          <span className="text-xs text-gray-400">{row.status}</span>
+                        )}
+                      </div>
                     </td>
                   </tr>
+                  {/* Agent 2: Run Analysis expandable section */}
+                  {analysisJobId === rowId && (
+                    <tr>
+                      <td colSpan="6" className="px-4 py-3 bg-emerald-50/30">
+                        {analysisLoading ? (
+                          <div className="flex items-center gap-2 py-2 text-sm text-emerald-600">
+                            <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                            </svg>
+                            Analyzing run results...
+                          </div>
+                        ) : analysisResult ? (
+                          <AgentAdvisorCard
+                            agentName="run_analysis"
+                            context={{}}
+                            result={analysisResult}
+                            projectId={project?.id}
+                          />
+                        ) : null}
+                      </td>
+                    </tr>
+                  )}
+                  </React.Fragment>
                 )
               })}
             </tbody>

@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useProject } from '../../contexts/ProjectContext.jsx'
-import { previewTarget, previewSequence, updateProject } from '../../api.js'
+import { previewTarget, previewSequence, updateProject, runTargetAssessment } from '../../api.js'
+import AssessmentCard from '../../components/AssessmentCard.jsx'
+import AgentAdvisorCard from '../../components/AgentAdvisorCard.jsx'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -529,6 +531,11 @@ export default function TargetSetup() {
   // UniProt features for 3D annotations
   const [uniprotFeatures, setUniprotFeatures] = useState(null)
 
+  // Assessment state (BindX)
+  const [assessment, setAssessment] = useState(null)
+  const [assessmentLoading, setAssessmentLoading] = useState(false)
+  const [assessmentError, setAssessmentError] = useState(null)
+
   // Save state
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState(null)
@@ -537,6 +544,15 @@ export default function TargetSetup() {
   useEffect(() => {
     if (targetConfig?.uniprot_features) {
       setUniprotFeatures(targetConfig.uniprot_features)
+    }
+    if (targetConfig?.assessment) {
+      const saved = targetConfig.assessment
+      // If saved assessment has unavailable agent, clear agent_analysis so re-run picks it up
+      if (saved.agent_analysis && !saved.agent_analysis.available) {
+        setAssessment({ ...saved, agent_analysis: null })
+      } else {
+        setAssessment(saved)
+      }
     }
     if (targetConfig?.uniprot_id) {
       setUniprotId(targetConfig.uniprot_id)
@@ -593,6 +609,24 @@ export default function TargetSetup() {
     }
   }
 
+  const handleRunAssessment = async () => {
+    const targetId = uniprotId || preview?.uniprot_id
+    if (!targetId) return
+    setAssessmentLoading(true)
+    setAssessmentError(null)
+    try {
+      const data = await runTargetAssessment(targetId, null, {
+        project_id: project?.id,
+        include_agents: true,
+      })
+      setAssessment(data)
+    } catch (err) {
+      setAssessmentError(err?.userMessage || err?.message || 'Assessment failed')
+    } finally {
+      setAssessmentLoading(false)
+    }
+  }
+
   const handleSave = async () => {
     if (!preview || !project) return
     setSaving(true)
@@ -603,6 +637,7 @@ export default function TargetSetup() {
       selected_pocket_idx: selectedPocketIdx,
       configured_at: new Date().toISOString(),
       uniprot_features: uniprotFeatures,
+      assessment: assessment || null,
     }
     try {
       await updateProject(project.id, { target_preview_json: config })
@@ -1030,6 +1065,93 @@ export default function TargetSetup() {
               </div>
             )
           })()}
+        </div>
+      )}
+
+      {/* BindX: Target Assessment */}
+      {hasPreview && inputMode === 'uniprot' && uniprotId && (
+        <div className="space-y-3">
+          {!assessment && (
+            <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
+              <div className="flex items-center gap-2 mb-3">
+                <div className="w-7 h-7 rounded-full bg-[#1e3a5f] flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                  </svg>
+                </div>
+                <h3 className="text-sm font-bold text-[#1e3a5f]">Target Assessment (BindX)</h3>
+              </div>
+              <p className="text-xs text-gray-500 mb-3">
+                Run a comprehensive 5-score assessment of this target before screening. Evaluates evidence, druggability, novelty, safety, and feasibility.
+              </p>
+              <button
+                onClick={handleRunAssessment}
+                disabled={assessmentLoading}
+                className="flex items-center gap-2 px-5 py-2.5 bg-[#1e3a5f] text-white font-semibold rounded-lg hover:bg-[#2a4f7c] disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm"
+              >
+                {assessmentLoading ? (
+                  <>
+                    <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                    </svg>
+                    Assessing target...
+                  </>
+                ) : 'Run Target Assessment'}
+              </button>
+              {assessmentError && (
+                <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700">
+                  {assessmentError}
+                </div>
+              )}
+            </div>
+          )}
+
+          {assessment && (
+            <div className="space-y-3">
+              <AssessmentCard assessment={assessment} />
+              {/* Agent 1: Target Assessment — inline prominent card */}
+              {assessment.agent_analysis && (
+                <AgentAdvisorCard
+                  agentName="target"
+                  context={{
+                    scores: assessment.scores,
+                    composite_score: assessment.composite_score,
+                    recommendation: assessment.recommendation,
+                    rationale: assessment.rationale,
+                    uniprot_id: uniprotId,
+                    protein_name: preview?.protein_name,
+                    target_name: preview?.protein_name,
+                  }}
+                  result={assessment.agent_analysis}
+                  projectId={project?.id}
+                />
+              )}
+              {!assessment.agent_analysis && (
+                <AgentAdvisorCard
+                  agentName="target"
+                  context={{
+                    scores: assessment.scores,
+                    composite_score: assessment.composite_score,
+                    recommendation: assessment.recommendation,
+                    rationale: assessment.rationale,
+                    uniprot_id: uniprotId,
+                    protein_name: preview?.protein_name,
+                    target_name: preview?.protein_name,
+                  }}
+                  projectId={project?.id}
+                />
+              )}
+              <button
+                onClick={handleRunAssessment}
+                disabled={assessmentLoading}
+                className="text-xs text-[#1e3a5f] hover:underline font-medium flex items-center gap-1"
+              >
+                {assessmentLoading ? 'Re-assessing...' : 'Re-run Assessment'}
+              </button>
+            </div>
+          )}
         </div>
       )}
 

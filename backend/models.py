@@ -124,6 +124,27 @@ class ProjectORM(Base):
 
 
 # ---------------------------------------------------------------------------
+# SQLAlchemy ORM — Target Assessment table (BindX)
+# ---------------------------------------------------------------------------
+
+class TargetAssessmentORM(Base):
+    """Persistent storage for target assessment results."""
+
+    __tablename__ = "target_assessments"
+
+    id: str = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: str = Column(String(36), ForeignKey("projects.id"), nullable=True)
+    uniprot_id: str = Column(String(20), nullable=False)
+    disease_context: str = Column(String(500), nullable=True)
+    assessment_json: str = Column(Text, nullable=True)  # Full assessment result
+    agent_responses_json: str = Column(Text, nullable=True)  # Agent analysis results
+    input_hash: str = Column(String(64), nullable=True, index=True)  # For idempotence
+    created_at: datetime.datetime = Column(
+        DateTime, nullable=False, default=datetime.datetime.utcnow
+    )
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -523,3 +544,78 @@ class ProjectResponse(BaseModel):
     target_preview_json: Optional[dict] = None
     created_at: Optional[str] = None
     job_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# BindX: Target Assessment schemas
+# ---------------------------------------------------------------------------
+
+class TargetAssessmentRequest(BaseModel):
+    """Payload for POST /api/target-assessment."""
+
+    uniprot_id: str = Field(..., min_length=2, max_length=20)
+    disease_context: Optional[str] = Field(
+        default=None, description="EFO disease ID or free-text disease name",
+    )
+    modality: str = Field(
+        default="small_molecule",
+        description="Drug modality: small_molecule, biologic, degrader",
+    )
+    project_id: Optional[str] = Field(
+        default=None, description="Project to associate this assessment with",
+    )
+    weights: Optional[dict[str, float]] = Field(
+        default=None,
+        description="Custom aggregation weights (evidence, druggability, novelty, safety, feasibility)",
+    )
+    include_agents: bool = Field(
+        default=True,
+        description="Whether to run AI agent analysis (requires OPENAI_API_KEY)",
+    )
+    force_refresh: bool = Field(
+        default=False,
+        description="Bypass cache and re-run the full assessment",
+    )
+
+
+class TargetAssessmentResult(BaseModel):
+    """Returned by GET /api/target-assessment/{id}."""
+
+    id: str
+    uniprot_id: str
+    disease_context: Optional[str] = None
+    modality: str = "small_molecule"
+    scores: dict = {}
+    composite_score: float = 0.0
+    recommendation: str = "CAUTION"
+    rationale: Optional[str] = None
+    flags: list[str] = []
+    critical_flags: list[str] = []
+    agent_analysis: Optional[dict] = None
+    provenance: dict = {}
+    input_hash: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# BindX: Agent query schemas
+# ---------------------------------------------------------------------------
+
+class AgentQuery(BaseModel):
+    """Payload for POST /api/agent/{agent_name}/query."""
+
+    context: dict = Field(..., description="Structured input context for the agent")
+    project_id: Optional[str] = Field(default=None, description="Project ID for enriched agent queries")
+
+
+class AgentResponse(BaseModel):
+    """Response from an agent query."""
+
+    available: bool = False
+    agent_name: str = ""
+    model: str = "gpt-4o"
+    analysis: Optional[dict] = None
+    fallback: Optional[str] = None
+    version: str = ""
+    timestamp: Optional[str] = None
+    input_hash: Optional[str] = None

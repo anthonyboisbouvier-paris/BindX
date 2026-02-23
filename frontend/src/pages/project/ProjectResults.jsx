@@ -12,6 +12,7 @@ import InfoTip from '../../components/InfoTip.jsx'
 import Badge from '../../components/Badge.jsx'
 import SafetyReport from '../../components/SafetyReport.jsx'
 import ConfidenceBreakdown from '../../components/ConfidenceBreakdown.jsx'
+import AgentAdvisorCard from '../../components/AgentAdvisorCard.jsx'
 
 // ---------------------------------------------------------------------------
 // Filter bar with configurable criteria
@@ -338,7 +339,7 @@ function Modal({ title, onClose, children }) {
 // Safety & Selectivity panel for selected molecule
 // ---------------------------------------------------------------------------
 
-function SafetyConfidencePanel({ mol, pipelineSummary, onSafetyReport, onConfidenceBreakdown }) {
+function SafetyConfidencePanel({ mol, pipelineSummary, onSafetyReport, onConfidenceBreakdown, onAIAnalysis }) {
   if (!mol) return null
 
   const offTarget = mol.off_target
@@ -506,6 +507,14 @@ function SafetyConfidencePanel({ mol, pipelineSummary, onSafetyReport, onConfide
             Confidence Breakdown
           </button>
         )}
+        <button onClick={onAIAnalysis}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-[#1e3a5f] hover:bg-[#2a4f7c] rounded-lg transition-colors">
+          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+              d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+          </svg>
+          AI Analysis
+        </button>
       </div>
     </div>
   )
@@ -849,6 +858,7 @@ function ProjectResultsInner({ selectedJobId, results, targetConfig }) {
   const [showAutoHit, setShowAutoHit] = useState(false)
   const [safetyMol, setSafetyMol] = useState(null)
   const [confidenceMol, setConfidenceMol] = useState(null)
+  const [showAgentCard, setShowAgentCard] = useState(false)
 
   // Merge all molecules (docking + generated)
   const allMolsUnfiltered = useMemo(() => {
@@ -964,6 +974,7 @@ function ProjectResultsInner({ selectedJobId, results, targetConfig }) {
               pipelineSummary={results?.pipeline_summary}
               onSafetyReport={() => setSafetyMol(selectedMol)}
               onConfidenceBreakdown={() => setConfidenceMol(selectedMol)}
+              onAIAnalysis={() => setShowAgentCard(v => !v)}
             />
           )}
         </div>
@@ -1021,6 +1032,52 @@ function ProjectResultsInner({ selectedJobId, results, targetConfig }) {
             pipeline_summary={results?.pipeline_summary || {}}
           />
         </Modal>
+      )}
+
+      {/* Agent 3: Candidate Evaluation — inline card */}
+      {showAgentCard && selectedMol && (
+        <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
+          <div className="px-5 py-3.5 bg-[#1e3a5f] flex items-center justify-between">
+            <h3 className="text-white font-semibold text-sm">AI Expert Analysis</h3>
+            <button onClick={() => setShowAgentCard(false)}
+              className="text-white/60 hover:text-white text-xs font-medium">
+              Hide
+            </button>
+          </div>
+          <div className="p-4">
+            <AgentAdvisorCard
+              agentName="candidate"
+              context={{
+                molecule_name: selectedMol.name || selectedMol.ligand_name,
+                smiles: selectedMol.smiles,
+                affinity: selectedMol.affinity,
+                composite_score: selectedMol.composite_score,
+                score_100: selectedMol.score_100,
+                mw: selectedMol.mw,
+                logp: selectedMol.logp,
+                qed: selectedMol.qed,
+                tpsa: selectedMol.tpsa,
+                hbd: selectedMol.hbd,
+                hba: selectedMol.hba,
+                rotatable_bonds: selectedMol.rotatable_bonds,
+                cnn_score: selectedMol.cnn_score,
+                vina_score: selectedMol.vina_score,
+                admet: selectedMol.admet,
+                off_target: selectedMol.off_target,
+                synthesis_route: selectedMol.synthesis_route ? {
+                  n_steps: selectedMol.synthesis_route.n_steps,
+                  confidence: selectedMol.synthesis_route.confidence,
+                  estimated_cost: selectedMol.synthesis_route.estimated_cost,
+                } : null,
+                toxicity_level: selectedMol.toxicity_level,
+                confidence: selectedMol.confidence,
+                pains_alert: selectedMol.pains_alert,
+                sa_score: selectedMol.sa_score,
+              }}
+              autoFetch={true}
+            />
+          </div>
+        </div>
       )}
     </div>
   )

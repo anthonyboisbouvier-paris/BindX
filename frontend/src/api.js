@@ -239,4 +239,49 @@ export async function updateProject(projectId, data) {
   return response.data
 }
 
+// ---------------------------------------------------------------------------
+// BindX: Target Assessment API
+// ---------------------------------------------------------------------------
+
+export async function runTargetAssessment(uniprotId, diseaseContext = null, options = {}) {
+  const response = await apiClient.post('/target-assessment', {
+    uniprot_id: uniprotId,
+    disease_context: diseaseContext,
+    ...options,
+  }, { timeout: 120000 })
+  return response.data
+}
+
+export async function getTargetAssessment(assessmentId) {
+  const response = await apiClient.get(`/target-assessment/${assessmentId}`)
+  return response.data
+}
+
+export async function queryAgent(agentName, context, projectId) {
+  const response = await apiClient.post(`/agent/${agentName}/query`, {
+    context,
+    ...(projectId ? { project_id: projectId } : {}),
+  }, { timeout: 120000 })
+  return response.data
+}
+
+export async function triggerRunAnalysis(jobId) {
+  const response = await apiClient.post(`/jobs/${jobId}/agent-analysis`, {}, { timeout: 120000 })
+  return response.data
+}
+
+// ---------------------------------------------------------------------------
+// V9: Time Estimation API
+// ---------------------------------------------------------------------------
+
+export async function estimatePipelineTime(params) {
+  const response = await apiClient.post('/estimate-time', params)
+  return response.data
+}
+
+export async function listDatabases() {
+  const response = await apiClient.get('/databases')
+  return response.data
+}
+
 export default apiClient

@@ -2,9 +2,10 @@ import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { Link } from 'react-router-dom'
 import { useProject } from '../../contexts/ProjectContext.jsx'
 import { HitSelectionProvider, useHitSelection } from '../../contexts/HitSelectionContext.jsx'
-import { getJobResults, startOptimization, getOptimizationStatus, createJob } from '../../api.js'
+import { getJobResults, startOptimization, getOptimizationStatus, createJob, queryAgent } from '../../api.js'
 
 import OptimizationChart from '../../components/OptimizationChart.jsx'
+import AgentAdvisorCard from '../../components/AgentAdvisorCard.jsx'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -114,6 +115,7 @@ function OptimizationInner({ jobId, results, project }) {
   const [progress, setProgress] = useState({ iteration: 0, total: 0, iterations: [], best_molecule: null, objectives: null })
   const [finalData, setFinalData] = useState(null)
   const pollRef = useRef(null)
+  const [showAgentCard, setShowAgentCard] = useState(false)
 
   const handleWeightChange = useCallback((name, val) => {
     setWeights(prev => ({ ...prev, [name]: val }))
@@ -504,7 +506,20 @@ function OptimizationInner({ jobId, results, project }) {
               </div>
             </div>
             <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
-              <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Objective Weights</h2>
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Objective Weights</h2>
+                <button
+                  onClick={() => setShowAgentCard(v => !v)}
+                  disabled={!selectedMol}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-[#1e3a5f] hover:bg-[#2a4f7c] disabled:opacity-40 disabled:cursor-not-allowed rounded-lg transition-colors"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                  </svg>
+                  {showAgentCard ? 'Hide AI' : 'Get AI Recommendation'}
+                </button>
+              </div>
               <div className="space-y-4">
                 <WeightSlider label="Binding affinity" name="binding_affinity" value={weights.binding_affinity} onChange={handleWeightChange} />
                 <WeightSlider label="Minimize toxicity" name="toxicity" value={weights.toxicity} onChange={handleWeightChange} />
@@ -530,6 +545,45 @@ function OptimizationInner({ jobId, results, project }) {
             </button>
           </div>
         </>
+      )}
+
+      {/* Agent 4: Optimization Strategy — inline card */}
+      {showAgentCard && selectedMol && (
+        <AgentAdvisorCard
+          agentName="optimization"
+          context={{
+            molecule_name: selectedMol.name || 'molecule',
+            smiles: selectedMol.smiles,
+            affinity: selectedMol.affinity,
+            composite_score: selectedMol.composite_score,
+            mw: selectedMol.mw,
+            logp: selectedMol.logp,
+            qed: selectedMol.qed,
+            tpsa: selectedMol.tpsa,
+            admet: selectedMol.admet,
+            off_target: selectedMol.off_target,
+            toxicity_level: selectedMol.toxicity_level,
+            synthesis_route: selectedMol.synthesis_route ? {
+              n_steps: selectedMol.synthesis_route.n_steps,
+              confidence: selectedMol.synthesis_route.confidence,
+            } : null,
+            current_weights: weights,
+            target_protein: project?.name || null,
+          }}
+          autoFetch={true}
+          onResult={(data) => {
+            if (data?.available && data?.analysis?.recommended_weights) {
+              const rw = data.analysis.recommended_weights
+              setWeights({
+                binding_affinity: rw.binding_affinity ?? weights.binding_affinity,
+                toxicity: rw.toxicity ?? weights.toxicity,
+                bioavailability: rw.bioavailability ?? weights.bioavailability,
+                synthesis: rw.synthesis ?? weights.synthesis,
+              })
+            }
+          }}
+          projectId={project?.id}
+        />
       )}
     </div>
   )
