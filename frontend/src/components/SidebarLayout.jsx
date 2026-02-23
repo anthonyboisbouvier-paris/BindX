@@ -1,6 +1,6 @@
 import React from 'react'
 import { Outlet, NavLink, useParams, useLocation } from 'react-router-dom'
-import { ProjectProvider, useProjectSafe } from '../contexts/ProjectContext.jsx'
+import { ProjectProvider, useProject, useProjectSafe } from '../contexts/ProjectContext.jsx'
 import { HitSelectionProvider } from '../contexts/HitSelectionContext.jsx'
 
 // ---------------------------------------------------------------------------
