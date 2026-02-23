@@ -1,5 +1,6 @@
 import React, { useState, useMemo } from 'react'
 import InfoTip from './InfoTip.jsx'
+import MoleculeCard from './MoleculeCard'
 
 // --------------------------------------------------
 // Helpers
@@ -85,10 +86,10 @@ function AICard({ mol, index, isSelected, onSelect }) {
       </span>
 
       {/* 2D structure thumbnail */}
-      <div className="w-full h-24 flex items-center justify-center bg-gray-50 rounded-lg overflow-hidden border border-gray-100">
+      <div className="w-full h-36 flex items-center justify-center bg-gray-50 rounded-lg border border-gray-100 [&>svg]:max-w-full [&>svg]:max-h-full [&>svg]:w-auto [&>svg]:h-auto">
         {mol.svg ? (
           <div
-            className="w-full h-full"
+            className="w-full h-full flex items-center justify-center [&>svg]:max-w-full [&>svg]:max-h-full [&>svg]:w-auto [&>svg]:h-auto"
             dangerouslySetInnerHTML={{ __html: mol.svg }}
           />
         ) : (
@@ -402,7 +403,34 @@ export default function GeneratedMols({ generatedMolecules, onSelectMolecule }) 
 
         {/* Detail panel */}
         {selectedMol && (
-          <MolDetail mol={selectedMol} onClose={() => handleSelect(null)} />
+          <div className="border-2 border-purple-200 rounded-xl overflow-hidden">
+            {/* Close button row */}
+            <div className="flex items-center justify-between px-4 py-2 bg-purple-50 border-b border-purple-100">
+              <span className="flex items-center gap-1.5 text-xs font-semibold text-purple-700">
+                <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
+                  <path fillRule="evenodd" d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.38z" clipRule="evenodd" />
+                </svg>
+                AI Generated — Full Details
+              </span>
+              <button
+                onClick={() => handleSelect(null)}
+                className="text-gray-400 hover:text-gray-600 transition-colors"
+                aria-label="Close detail panel"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <MoleculeCard
+              molecule={{
+                ...selectedMol,
+                name: selectedMol.name || selectedMol.molecule_name || selectedMol.smiles?.slice(0, 20),
+                svg: selectedMol.svg || '',
+              }}
+              rank={selectedIndex}
+            />
+          </div>
         )}
       </div>
     </div>

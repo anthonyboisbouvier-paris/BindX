@@ -24,26 +24,26 @@ apiClient.interceptors.response.use(
   (response) => response,
   (error) => {
     if (error.code === 'ECONNREFUSED' || error.code === 'ERR_NETWORK') {
-      console.error('[API] Backend non disponible')
-      error.userMessage = 'Le serveur backend est inaccessible. Verifiez que le backend est demarré sur le port 8000.'
+      console.error('[API] Backend unreachable')
+      error.userMessage = 'The backend server is unreachable. Make sure the backend is running on port 8000.'
     } else if (error.response) {
       const status = error.response.status
       if (status === 404) {
-        error.userMessage = 'Ressource introuvable.'
+        error.userMessage = 'Resource not found.'
       } else if (status === 422) {
         const detail = error.response.data?.detail
         if (Array.isArray(detail)) {
           error.userMessage = detail.map(d => d.msg).join(', ')
         } else {
-          error.userMessage = detail || 'Donnees invalides.'
+          error.userMessage = detail || 'Invalid data.'
         }
       } else if (status >= 500) {
-        error.userMessage = 'Erreur serveur interne. Consultez les logs du backend.'
+        error.userMessage = 'Internal server error. Check the backend logs.'
       } else {
-        error.userMessage = error.response.data?.detail || 'Une erreur est survenue.'
+        error.userMessage = error.response.data?.detail || 'An error occurred.'
       }
     } else {
-      error.userMessage = 'Erreur de connexion au serveur.'
+      error.userMessage = 'Connection error with the server.'
     }
     return Promise.reject(error)
   }
@@ -136,13 +136,29 @@ export async function checkHealth() {
 }
 
 /**
+ * Preview target information before submitting a job.
+ * Returns structure source, pocket data, and ChEMBL stats.
+ * @param {string} uniprotId - UniProt accession ID
+ * @returns {Promise<Object>} Preview data
+ */
+export async function previewTarget(uniprotId) {
+  const response = await apiClient.post('/preview-target', { uniprot_id: uniprotId })
+  return response.data
+}
+
+export async function previewSequence(sequence) {
+  const response = await apiClient.post('/preview-sequence', { sequence })
+  return response.data
+}
+
+/**
  * Get retrosynthesis route for a specific molecule in a job
  * @param {string} jobId
  * @param {number} molIndex - 0-based molecule index in results
  * @returns {Promise<Object>} Synthesis route object
  */
 export const getSynthesisRoute = (jobId, molIndex) =>
-  apiClient.get(`/jobs/${jobId}/synthesis/${molIndex}`)
+  apiClient.get(`/jobs/${jobId}/synthesis/${molIndex}`).then(r => r.data)
 
 /**
  * Start a lead optimization run for a given molecule in a job.
@@ -177,6 +193,49 @@ export async function getOptimizationStatus(jobId, optId) {
  */
 export async function getAuditLog(jobId) {
   const response = await apiClient.get(`/jobs/${jobId}/audit_log`)
+  return response.data
+}
+
+// ---------------------------------------------------------------------------
+// V7: Auth API
+// ---------------------------------------------------------------------------
+
+export async function authRegister(email, username, password) {
+  const response = await apiClient.post('/auth/register', { email, username, password })
+  return response.data
+}
+
+export async function authLogin(email, password) {
+  const response = await apiClient.post('/auth/login', { email, password })
+  return response.data
+}
+
+export async function authMe() {
+  const response = await apiClient.get('/auth/me')
+  return response.data
+}
+
+// ---------------------------------------------------------------------------
+// V7: Projects API
+// ---------------------------------------------------------------------------
+
+export async function listProjects() {
+  const response = await apiClient.get('/projects')
+  return response.data
+}
+
+export async function createProject(data) {
+  const response = await apiClient.post('/projects', data)
+  return response.data
+}
+
+export async function getProjectDetail(projectId) {
+  const response = await apiClient.get(`/projects/${projectId}`)
+  return response.data
+}
+
+export async function updateProject(projectId, data) {
+  const response = await apiClient.put(`/projects/${projectId}`, data)
   return response.data
 }
 

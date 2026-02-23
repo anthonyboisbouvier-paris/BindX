@@ -280,6 +280,27 @@ def run_docking(
     return _run_mock_docking(ligand_pdbqt)
 
 
+def _extract_first_model_sdf(path: Path) -> None:
+    """Keep only the first molecule from a multi-model SDF file.
+
+    GNINA outputs multi-model SDF files where all poses are concatenated.
+    3Dmol.js may render an incomplete fragment if the full file is loaded.
+    This function truncates the file to contain only the first model.
+
+    Parameters
+    ----------
+    path : Path
+        Path to the SDF file to truncate in-place.
+    """
+    try:
+        content = path.read_text()
+        if "$$$$" in content:
+            first_model = content.split("$$$$")[0] + "$$$$\n"
+            path.write_text(first_model)
+    except Exception as e:
+        logger.warning("Could not extract first SDF model: %s", e)
+
+
 def _try_gnina_single(
     receptor_pdbqt: Path,
     ligand_pdbqt: Path,
@@ -304,6 +325,7 @@ def _try_gnina_single(
             if best.get("pose_path") and Path(best["pose_path"]).exists():
                 try:
                     shutil.copy2(best["pose_path"], pose_path)
+                    _extract_first_model_sdf(pose_path)
                 except Exception:
                     pass
 

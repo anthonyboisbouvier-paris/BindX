@@ -120,7 +120,7 @@ export default function OptimizationView({ jobId, molecule, onBack, onComplete }
   const [variantsPerIter, setVariantsPerIter] = useState(50)
 
   const [optId, setOptId] = useState(null)
-  const [progress, setProgress] = useState({ iteration: 0, iterations: [], best_molecule: null, objectives: null, eta: null })
+  const [progress, setProgress] = useState({ iteration: 0, total: 0, iterations: [], best_molecule: null, objectives: null, eta: null })
   const [finalData, setFinalData] = useState(null)
   const [error, setError] = useState(null)
 
@@ -147,17 +147,19 @@ export default function OptimizationView({ jobId, molecule, onBack, onComplete }
     )
 
     const params = {
+      smiles: molSmiles,
+      molecule_name: molName,
       weights: normalizedWeights,
       n_iterations: numIterations,
-      variants_per_iteration: variantsPerIter,
-      starting_smiles: molSmiles,
+      variants_per_iter: variantsPerIter,
     }
 
     try {
       const result = await startOptimization(jobId, params)
-      setOptId(result.opt_id || result.id || 'mock')
+      const id = result.optimization_id || result.opt_id || result.id || 'mock'
+      setOptId(id)
       // Start polling
-      pollRef.current = setInterval(() => pollStatus(result.opt_id || result.id || 'mock'), 2000)
+      pollRef.current = setInterval(() => pollStatus(id), 2000)
     } catch (err) {
       // API not ready — use mock mode
       console.warn('[OptimizationView] API not available, using mock data:', err.message)
@@ -222,6 +224,8 @@ export default function OptimizationView({ jobId, molecule, onBack, onComplete }
       setProgress((prev) => ({
         ...prev,
         ...data,
+        iteration: data.current_iteration || data.iteration || prev.iteration,
+        total: data.total_iterations || data.total || prev.total,
         iterations: data.iterations || prev.iterations,
       }))
       if (data.status === 'complete' || data.status === 'done') {
@@ -244,7 +248,7 @@ export default function OptimizationView({ jobId, molecule, onBack, onComplete }
     }
   }, [])
 
-  const pctDone = progress.total > 0 ? Math.round((progress.iteration / progress.total) * 100) : 0
+  const pctDone = Math.round((progress.iteration / (progress.total || numIterations || 1)) * 100)
   const objectiveLabels = {
     binding_affinity: 'Binding Affinity',
     toxicity: 'Toxicity Safety',

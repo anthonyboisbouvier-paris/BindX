@@ -6,29 +6,42 @@ and downloading results.
 V2: advanced mode with generation, ADMET, retrosynthesis.
 V3: rapid/standard/deep modes, sequence input, auto strategy, score_100,
     affinity_stars, toxicity, pedagogical tips, pipeline_summary.
+V7: authentication (JWT), user accounts, project management.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+import requests as http_requests
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-from database import create_job, get_job, init_db
+from auth import create_token, decode_token, hash_password, verify_password
+from database import (
+    create_job, get_job, init_db, list_jobs,
+    create_user, get_user, get_user_by_email,
+    create_project, get_project, list_projects, update_project,
+    count_project_jobs, list_project_jobs,
+)
 from models import (
     ADMETResult, DockingResult, JobCreate, JobResults, JobStatus,
     OffTargetResult, OptimizationRequest, OptimizationStatus,
     SynthesisRoute, SynthesisStep,
+    UserCreate, UserLogin, UserResponse,
+    ProjectCreate, ProjectUpdate, ProjectResponse,
 )
+from pipeline.structure import query_rcsb_pdb, fetch_structure_from_sequence
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -43,6 +56,23 @@ DATA_DIR = Path(os.environ.get("DOCKIT_DATA_DIR", "/data")) / "jobs"
 
 # Thread pool for non-blocking Celery dispatch
 _dispatch_pool = ThreadPoolExecutor(max_workers=2)
+
+# Thread pool for preview-target blocking I/O (API calls, pocket detection)
+_preview_pool = ThreadPoolExecutor(max_workers=4)
+
+
+# ---------------------------------------------------------------------------
+# V7: Auth dependency
+# ---------------------------------------------------------------------------
+
+async def get_current_user_id(request: Request) -> Optional[str]:
+    """Extract user_id from JWT if present. Returns None for anonymous requests."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[7:]
+    user_id = decode_token(token)
+    return user_id
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +356,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
     logger.info("DockIt API shutting down")
     _dispatch_pool.shutdown(wait=False)
+    _preview_pool.shutdown(wait=False)
 
 
 # ---------------------------------------------------------------------------
@@ -334,8 +365,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 app = FastAPI(
     title="DockIt API",
-    description="Virtual screening / molecular docking pipeline — V5bis (Scientific Rigor Upgrade)",
-    version="5.1.0",
+    description="Virtual screening / molecular docking pipeline — V7.0 (Auth + Projects)",
+    version="7.0.0",
     lifespan=lifespan,
 )
 
@@ -514,15 +545,864 @@ def _parse_results(raw_list: list[dict]) -> list[DockingResult]:
 @app.get("/api/health")
 async def health_check() -> dict:
     """Health-check endpoint."""
-    return {"status": "ok", "service": "dockit-api", "version": "5.1.0"}
+    return {"status": "ok", "service": "dockit-api", "version": "7.0.0"}
+
+
+# ---------------------------------------------------------------------------
+# V7: Auth endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/auth/register", response_model=dict)
+async def register(payload: UserCreate):
+    """Create a new user account."""
+    existing = get_user_by_email(payload.email)
+    if existing:
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    user_id = str(uuid4())
+    pw_hash = hash_password(payload.password)
+    user = create_user(user_id, payload.email, payload.username, pw_hash)
+    token = create_token(user_id)
+
+    return {
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "username": user.username,
+        },
+        "token": token,
+    }
+
+
+@app.post("/api/auth/login", response_model=dict)
+async def login(payload: UserLogin):
+    """Login and receive a JWT token."""
+    user = get_user_by_email(payload.email)
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    token = create_token(user.id)
+    return {
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "username": user.username,
+        },
+        "token": token,
+    }
+
+
+@app.get("/api/auth/me", response_model=dict)
+async def get_me(user_id: Optional[str] = Depends(get_current_user_id)):
+    """Get current user info from JWT."""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    user = get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {
+        "id": user.id,
+        "email": user.email,
+        "username": user.username,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# V7: Project endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/projects", response_model=dict)
+async def create_project_endpoint(
+    payload: ProjectCreate,
+    user_id: Optional[str] = Depends(get_current_user_id),
+):
+    """Create a new project (requires auth)."""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required to create projects")
+
+    import json as _json
+    project_id = str(uuid4())
+    preview_json = _json.dumps(payload.target_preview_json) if payload.target_preview_json else None
+
+    project = create_project(
+        project_id=project_id,
+        user_id=user_id,
+        name=payload.name,
+        uniprot_id=payload.uniprot_id,
+        sequence=payload.sequence,
+        description=payload.description,
+        target_preview_json=preview_json,
+    )
+
+    return {
+        "id": project.id,
+        "name": project.name,
+        "uniprot_id": project.uniprot_id,
+        "description": project.description,
+        "created_at": project.created_at.isoformat() if project.created_at else None,
+    }
+
+
+@app.get("/api/projects", response_model=list)
+async def list_projects_endpoint(
+    user_id: Optional[str] = Depends(get_current_user_id),
+):
+    """List current user's projects (requires auth)."""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    import json as _json
+    projects = list_projects(user_id)
+    result = []
+    for p in projects:
+        job_count = count_project_jobs(p.id)
+        preview = None
+        if p.target_preview_json:
+            try:
+                preview = _json.loads(p.target_preview_json)
+            except Exception:
+                preview = None
+        result.append({
+            "id": p.id,
+            "name": p.name,
+            "uniprot_id": p.uniprot_id,
+            "description": p.description,
+            "target_preview_json": preview,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+            "job_count": job_count,
+        })
+    return result
+
+
+@app.get("/api/projects/{project_id}", response_model=dict)
+async def get_project_endpoint(
+    project_id: str,
+    user_id: Optional[str] = Depends(get_current_user_id),
+):
+    """Get project detail with its jobs list."""
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Only owner can see project details
+    if project.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    import json as _json
+    jobs = list_project_jobs(project_id)
+    preview = None
+    if project.target_preview_json:
+        try:
+            preview = _json.loads(project.target_preview_json)
+        except Exception:
+            preview = None
+
+    return {
+        "id": project.id,
+        "name": project.name,
+        "uniprot_id": project.uniprot_id,
+        "sequence": project.sequence,
+        "description": project.description,
+        "target_preview_json": preview,
+        "created_at": project.created_at.isoformat() if project.created_at else None,
+        "jobs": [{
+            "id": j.id,
+            "status": j.status,
+            "mode": j.mode,
+            "progress": j.progress,
+            "current_step": j.current_step,
+            "protein_name": j.protein_name,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+            "completed_at": j.completed_at.isoformat() if j.completed_at else None,
+        } for j in jobs],
+    }
+
+
+@app.put("/api/projects/{project_id}", response_model=dict)
+async def update_project_endpoint(
+    project_id: str,
+    payload: ProjectUpdate,
+    user_id: Optional[str] = Depends(get_current_user_id),
+):
+    """Update a project."""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if project.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    import json as _json
+    updates = {}
+    if payload.name is not None:
+        updates["name"] = payload.name
+    if payload.description is not None:
+        updates["description"] = payload.description
+    if payload.target_preview_json is not None:
+        updates["target_preview_json"] = _json.dumps(payload.target_preview_json)
+
+    if updates:
+        update_project(project_id, **updates)
+
+    return {"status": "updated", "id": project_id}
+
+
+# ---------------------------------------------------------------------------
+# Job endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/jobs")
+async def list_all_jobs(
+    limit: int = 50,
+    project_id: Optional[str] = None,
+    user_id: Optional[str] = Depends(get_current_user_id),
+) -> list[dict]:
+    """List recent jobs, ordered by creation date descending.
+
+    Parameters
+    ----------
+    limit : int
+        Maximum number of jobs to return (default 50, max 200).
+    project_id : str, optional
+        Filter by project ID (V7).
+    user_id : str, optional
+        Injected from JWT. Used to filter by user when project_id is given.
+
+    Returns
+    -------
+    list[dict]
+        List of job summaries with ``job_id``, ``uniprot_id``, ``mode``,
+        ``status``, and ``created_at``.
+    """
+    limit = max(1, min(limit, 200))
+    jobs = list_jobs(limit=limit, project_id=project_id, user_id=None)
+    return [
+        {
+            "job_id": job.id,
+            "uniprot_id": job.uniprot_id or None,
+            "mode": job.mode or "rapid",
+            "status": job.status,
+            "created_at": job.created_at.isoformat() if job.created_at else None,
+        }
+        for job in jobs
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Preview target helpers (blocking I/O, run in thread pool)
+# ---------------------------------------------------------------------------
+
+def _fetch_protein_name(uniprot_id: str) -> Optional[str]:
+    """Fetch the recommended protein name from the UniProt REST API.
+
+    Parameters
+    ----------
+    uniprot_id : str
+        UniProt accession (e.g. ``"P00533"``).
+
+    Returns
+    -------
+    str or None
+        The recommended full name, or None on failure.
+    """
+    try:
+        resp = http_requests.get(
+            f"https://rest.uniprot.org/uniprotkb/{uniprot_id}.json",
+            timeout=(5, 15),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # Navigate: proteinDescription -> recommendedName -> fullName -> value
+        protein_desc = data.get("proteinDescription", {})
+        rec_name = protein_desc.get("recommendedName", {})
+        full_name = rec_name.get("fullName", {})
+        name = full_name.get("value")
+        if name:
+            return name
+        # Fallback: submittedName
+        submitted = protein_desc.get("submittedName", [])
+        if submitted and isinstance(submitted, list):
+            return submitted[0].get("fullName", {}).get("value")
+        return None
+    except Exception as exc:
+        logger.warning("Failed to fetch protein name for %s: %s", uniprot_id, exc)
+        return None
+
+
+def _check_alphafold_availability(uniprot_id: str) -> bool:
+    """Check whether AlphaFold DB has a prediction for this UniProt ID.
+
+    Parameters
+    ----------
+    uniprot_id : str
+        UniProt accession.
+
+    Returns
+    -------
+    bool
+        True if AlphaFold has a prediction available.
+    """
+    try:
+        resp = http_requests.head(
+            f"https://alphafold.ebi.ac.uk/api/prediction/{uniprot_id}",
+            timeout=(5, 10),
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _fetch_chembl_info(uniprot_id: str) -> dict:
+    """Fetch ChEMBL target info and activity counts for a UniProt accession.
+
+    Parameters
+    ----------
+    uniprot_id : str
+        UniProt accession (e.g. ``"P00533"``).
+
+    Returns
+    -------
+    dict
+        Dictionary with ``has_data``, ``n_actives``, ``n_with_ic50``,
+        ``target_chembl_id``, and ``description`` keys.
+    """
+    result: dict = {
+        "has_data": False,
+        "n_actives": 0,
+        "n_with_ic50": 0,
+        "target_chembl_id": None,
+        "description": "No ChEMBL data available for this target.",
+    }
+
+    try:
+        # Step 1: Get target_chembl_id from UniProt accession
+        target_resp = http_requests.get(
+            "https://www.ebi.ac.uk/chembl/api/data/target.json",
+            params={
+                "target_components__accession": uniprot_id,
+                "limit": 1,
+                "format": "json",
+            },
+            timeout=(5, 15),
+        )
+        target_resp.raise_for_status()
+        target_data = target_resp.json()
+
+        targets = target_data.get("targets", [])
+        if not targets:
+            return result
+
+        target_chembl_id = targets[0].get("target_chembl_id")
+        if not target_chembl_id:
+            return result
+
+        result["target_chembl_id"] = target_chembl_id
+
+        # Step 2: Count total activities for this target
+        activity_resp = http_requests.get(
+            "https://www.ebi.ac.uk/chembl/api/data/activity.json",
+            params={
+                "target_chembl_id": target_chembl_id,
+                "limit": 0,
+                "format": "json",
+            },
+            timeout=(5, 15),
+        )
+        activity_resp.raise_for_status()
+        activity_data = activity_resp.json()
+
+        total_activities = activity_data.get("page_meta", {}).get("total_count", 0)
+
+        # Step 3: Count activities with IC50 data
+        ic50_resp = http_requests.get(
+            "https://www.ebi.ac.uk/chembl/api/data/activity.json",
+            params={
+                "target_chembl_id": target_chembl_id,
+                "standard_type": "IC50",
+                "limit": 0,
+                "format": "json",
+            },
+            timeout=(5, 15),
+        )
+        ic50_resp.raise_for_status()
+        ic50_data = ic50_resp.json()
+
+        n_ic50 = ic50_data.get("page_meta", {}).get("total_count", 0)
+
+        result["has_data"] = total_activities > 0
+        result["n_actives"] = total_activities
+        result["n_with_ic50"] = n_ic50
+
+        if total_activities > 0:
+            result["description"] = (
+                f"{total_activities} known active compounds found in ChEMBL, "
+                f"including {n_ic50} with IC50 data. "
+                f"ChEMBL is recommended as the primary screening library for this target."
+            )
+        else:
+            result["description"] = (
+                "No known active compounds found in ChEMBL for this target. "
+                "ZINC drug-like library or de novo generation is recommended."
+            )
+
+    except Exception as exc:
+        logger.warning("ChEMBL lookup failed for %s: %s", uniprot_id, exc)
+        result["description"] = f"ChEMBL lookup failed: {exc}"
+
+    return result
+
+
+def _build_structures_list(pdb_info: Optional[dict], uniprot_id: str) -> list[dict]:
+    """Return all available structure options for the preview, in priority order.
+
+    Returns a list with up to 3 entries: PDB (if found), AlphaFold (if available),
+    ESMFold (always, as on-demand fallback). The first entry is marked recommended.
+    """
+    structures: list[dict] = []
+
+    if pdb_info is not None:
+        pdb_id = pdb_info.get("pdb_id", "unknown")
+        resolution = pdb_info.get("resolution")
+        method = pdb_info.get("method", "UNKNOWN")
+        ligand_id = pdb_info.get("ligand_id")
+        ligand_name = pdb_info.get("ligand_name")
+        source = "pdb_holo" if ligand_id else "pdb_experimental"
+        label = "PDB Holo" if ligand_id else "PDB Experimental"
+        confidence = 0.98 if ligand_id else 0.90
+        desc = f"Experimental {method} structure ({pdb_id})"
+        if resolution:
+            desc += f" at {resolution} Å"
+        if ligand_id:
+            lig = f"{ligand_id} ({ligand_name})" if ligand_name else ligand_id
+            desc += f" — co-crystallized ligand {lig}"
+        structures.append({
+            "source": source,
+            "label": label,
+            "pdb_id": pdb_id,
+            "resolution": resolution,
+            "method": method,
+            "ligand_id": ligand_id,
+            "ligand_name": ligand_name,
+            "confidence": confidence,
+            "recommended": True,
+            "explanation": desc,
+            "download_url": pdb_info.get("download_url"),
+        })
+
+    has_alphafold = _check_alphafold_availability(uniprot_id)
+    if has_alphafold:
+        structures.append({
+            "source": "alphafold",
+            "label": "AlphaFold",
+            "pdb_id": None,
+            "resolution": None,
+            "method": "AI prediction",
+            "ligand_id": None,
+            "ligand_name": None,
+            "confidence": 0.85,
+            "recommended": len(structures) == 0,
+            "explanation": f"AlphaFold DB predicted structure for {uniprot_id}. Good for targets without experimental structure.",
+            "download_url": f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.pdb",
+        })
+
+    # ESMFold always available as on-demand option
+    structures.append({
+        "source": "esmfold",
+        "label": "ESMFold",
+        "pdb_id": None,
+        "resolution": None,
+        "method": "ESMFold (on-demand)",
+        "ligand_id": None,
+        "ligand_name": None,
+        "confidence": 0.60,
+        "recommended": len(structures) == 0,
+        "explanation": "On-demand ESMFold structure prediction. Lower quality than experimental structures, but always available.",
+        "download_url": None,
+    })
+
+    return structures
+
+
+def _build_structure_info(pdb_info: Optional[dict], uniprot_id: str) -> dict:
+    """Build the ``structure`` section of the preview response.
+
+    Parameters
+    ----------
+    pdb_info : dict or None
+        Result from ``query_rcsb_pdb()`` or None if no PDB found.
+    uniprot_id : str
+        UniProt accession for AlphaFold fallback check.
+
+    Returns
+    -------
+    dict
+        Structure information with ``source``, ``explanation``, and optional
+        PDB metadata.
+    """
+    if pdb_info is not None:
+        pdb_id = pdb_info.get("pdb_id", "unknown")
+        resolution = pdb_info.get("resolution")
+        method = pdb_info.get("method", "UNKNOWN")
+        ligand_id = pdb_info.get("ligand_id")
+        ligand_name = pdb_info.get("ligand_name")
+
+        explanation_parts = [
+            f"Experimental {method} structure from PDB ({pdb_id})"
+        ]
+        if resolution:
+            explanation_parts[0] += f" at {resolution} A resolution"
+        if ligand_id:
+            lig_desc = ligand_id
+            if ligand_name:
+                lig_desc = f"{ligand_id} ({ligand_name})"
+            explanation_parts.append(
+                f"with co-crystallized ligand {lig_desc}"
+            )
+        explanation_parts.append(
+            "This is the highest quality structure available."
+        )
+
+        return {
+            "source": "pdb_experimental",
+            "pdb_id": pdb_id,
+            "resolution": resolution,
+            "method": method,
+            "ligand_id": ligand_id,
+            "ligand_name": ligand_name,
+            "explanation": ". ".join(explanation_parts) + ".",
+        }
+
+    # No PDB -- check AlphaFold
+    has_alphafold = _check_alphafold_availability(uniprot_id)
+    if has_alphafold:
+        return {
+            "source": "alphafold",
+            "pdb_id": None,
+            "resolution": None,
+            "method": "AI prediction",
+            "ligand_id": None,
+            "ligand_name": None,
+            "explanation": (
+                f"No experimental structure found in PDB for {uniprot_id}. "
+                "AlphaFold DB has a predicted structure available. "
+                "AI-predicted structures are suitable for pocket detection "
+                "but may be less accurate for docking near flexible loops."
+            ),
+        }
+
+    return {
+        "source": "none",
+        "pdb_id": None,
+        "resolution": None,
+        "method": None,
+        "ligand_id": None,
+        "ligand_name": None,
+        "explanation": (
+            f"No experimental or AlphaFold structure found for {uniprot_id}. "
+            "ESMFold on-demand folding will be attempted when the pipeline runs. "
+            "This may take longer and the predicted structure may have lower confidence."
+        ),
+    }
+
+
+def _build_pockets_info(
+    pdb_info: Optional[dict],
+    uniprot_id: str,
+) -> list[dict]:
+    """Detect pockets if a PDB structure can be quickly obtained.
+
+    This downloads the PDB to a temporary directory, runs pocket detection,
+    and returns formatted pocket information.
+
+    Parameters
+    ----------
+    pdb_info : dict or None
+        Result from ``query_rcsb_pdb()`` with ``download_url``.
+    uniprot_id : str
+        UniProt accession.
+
+    Returns
+    -------
+    list[dict]
+        List of pocket dicts with ``rank``, ``method``, ``probability``,
+        ``residues_count``, ``center``, ``selected``, and ``explanation``.
+    """
+    if pdb_info is None:
+        return []
+
+    from pipeline.pockets import detect_pockets
+
+    try:
+        # Download PDB to a temporary directory
+        download_url = pdb_info.get("download_url", "")
+        if not download_url:
+            return []
+
+        with tempfile.TemporaryDirectory(prefix="dockit_preview_") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            pdb_path = tmp_path / f"{uniprot_id}.pdb"
+
+            resp = http_requests.get(download_url, timeout=(5, 30))
+            resp.raise_for_status()
+            content = resp.text
+            if "ATOM" not in content or len(content) < 100:
+                logger.warning("Preview PDB download has no ATOM records")
+                return []
+
+            pdb_path.write_text(content)
+
+            # Run pocket detection
+            ligand_id = pdb_info.get("ligand_id")
+            raw_pockets = detect_pockets(
+                pdb_path=pdb_path,
+                work_dir=tmp_path,
+                ligand_id=ligand_id,
+            )
+
+            # Format pockets for the preview response
+            formatted: list[dict] = []
+            for i, pocket in enumerate(raw_pockets[:5]):  # Limit to top 5
+                method = pocket.get("method", "unknown")
+                probability = pocket.get("probability", 0.0)
+                residues = pocket.get("residues", [])
+                center = pocket.get("center", (0.0, 0.0, 0.0))
+
+                # Build explanation based on method
+                if method == "co-crystallized_ligand":
+                    lig = pocket.get("ligand_id", ligand_id or "unknown")
+                    explanation = (
+                        f"Pocket defined by co-crystallized ligand {lig}. "
+                        "This is an experimentally validated binding site."
+                    )
+                elif method == "p2rank":
+                    explanation = (
+                        f"Pocket detected by P2Rank ML model with "
+                        f"{probability:.0%} probability."
+                    )
+                elif method == "p2rank_mock":
+                    explanation = (
+                        f"Pocket detected by P2Rank with "
+                        f"{probability:.0%} probability."
+                    )
+                elif method == "fpocket":
+                    explanation = (
+                        f"Pocket detected by fpocket geometric algorithm "
+                        f"(druggability score: {probability:.2f})."
+                    )
+                else:
+                    explanation = (
+                        f"Pocket detected by {method} method "
+                        f"(score: {probability:.2f})."
+                    )
+
+                formatted.append({
+                    "rank": i + 1,
+                    "method": method,
+                    "probability": round(probability, 4),
+                    "residues_count": len(residues) if isinstance(residues, list) else 0,
+                    "center": list(center) if isinstance(center, tuple) else center,
+                    "selected": (i == 0),  # First pocket is the selected one
+                    "explanation": explanation,
+                })
+
+            return formatted
+
+    except Exception as exc:
+        logger.warning(
+            "Pocket detection failed during preview for %s: %s",
+            uniprot_id, exc,
+        )
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Preview target endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/api/preview-target")
+async def preview_target(body: dict) -> dict:
+    """Preview protein structure and target information before running the pipeline.
+
+    This endpoint fetches protein name, structure info, pocket detection, and
+    ChEMBL compound availability without creating a job. It is designed to be
+    fast and return partial results if some lookups fail.
+
+    Parameters
+    ----------
+    body : dict
+        Must contain ``"uniprot_id"`` (str).
+
+    Returns
+    -------
+    dict
+        Preview data with ``uniprot_id``, ``protein_name``, ``structure``,
+        ``pockets``, and ``chembl_info`` sections.
+
+    Raises
+    ------
+    HTTPException
+        400 if ``uniprot_id`` is missing or empty.
+    """
+    uniprot_id = body.get("uniprot_id", "").strip().upper()
+    if not uniprot_id:
+        raise HTTPException(
+            status_code=400,
+            detail="uniprot_id is required",
+        )
+
+    loop = asyncio.get_event_loop()
+
+    # Launch all blocking I/O tasks concurrently in the thread pool
+    protein_name_future = loop.run_in_executor(
+        _preview_pool, _fetch_protein_name, uniprot_id,
+    )
+    pdb_info_future = loop.run_in_executor(
+        _preview_pool, query_rcsb_pdb, uniprot_id,
+    )
+    chembl_future = loop.run_in_executor(
+        _preview_pool, _fetch_chembl_info, uniprot_id,
+    )
+
+    # Await the independent lookups concurrently
+    protein_name, pdb_info, chembl_info = await asyncio.gather(
+        protein_name_future,
+        pdb_info_future,
+        chembl_future,
+        return_exceptions=True,
+    )
+
+    # Handle exceptions from gather -- replace with safe defaults
+    if isinstance(protein_name, BaseException):
+        logger.warning("Protein name lookup raised: %s", protein_name)
+        protein_name = None
+    if isinstance(pdb_info, BaseException):
+        logger.warning("RCSB PDB lookup raised: %s", pdb_info)
+        pdb_info = None
+    if isinstance(chembl_info, BaseException):
+        logger.warning("ChEMBL lookup raised: %s", chembl_info)
+        chembl_info = {
+            "has_data": False,
+            "n_actives": 0,
+            "n_with_ic50": 0,
+            "target_chembl_id": None,
+            "description": f"ChEMBL lookup failed: {chembl_info}",
+        }
+
+    # Build all available structure options (PDB, AlphaFold, ESMFold)
+    structures_list = _build_structures_list(pdb_info, uniprot_id)
+    # Keep backward-compat single `structure` field = first (recommended) option
+    structure_info = structures_list[0] if structures_list else _build_structure_info(pdb_info, uniprot_id)
+
+    # Pocket detection requires downloading the PDB -- run in executor
+    pockets_info: list[dict] = []
+    try:
+        pockets_info = await loop.run_in_executor(
+            _preview_pool, _build_pockets_info, pdb_info, uniprot_id,
+        )
+    except Exception as exc:
+        logger.warning("Pocket detection raised during preview: %s", exc)
+
+    return {
+        "uniprot_id": uniprot_id,
+        "protein_name": protein_name or uniprot_id,
+        "structure": structure_info,
+        "structures": structures_list,
+        "pockets": pockets_info,
+        "chembl_info": chembl_info,
+    }
+
+
+@app.post("/api/preview-sequence")
+async def preview_sequence(body: dict) -> dict:
+    """Fold a raw amino-acid sequence with ESMFold and detect binding pockets."""
+    sequence = body.get("sequence", "").strip().upper()
+    if not sequence or len(sequence) < 10:
+        raise HTTPException(400, "sequence must be at least 10 amino acids")
+
+    loop = asyncio.get_event_loop()
+    work_dir = Path("/tmp/dockit_preview_sequences")
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Fold with ESMFold (blocking, run in thread pool)
+    try:
+        pdb_path, source = await loop.run_in_executor(
+            _preview_pool, fetch_structure_from_sequence, sequence, work_dir
+        )
+    except Exception as exc:
+        logger.error("ESMFold failed for sequence preview: %s", exc)
+        raise HTTPException(500, f"Structure prediction failed: {exc}")
+
+    # 2. Read PDB content to send to frontend (for 3D viewer)
+    pdb_data = pdb_path.read_text() if pdb_path and pdb_path.exists() else ""
+
+    # 3. Pocket detection on the folded PDB (run directly on local path)
+    pockets_info: list[dict] = []
+    try:
+        def _detect_pockets_local() -> list[dict]:
+            from pipeline.pockets import detect_pockets
+            raw = detect_pockets(pdb_path=pdb_path, work_dir=pdb_path.parent, ligand_id=None)
+            formatted: list[dict] = []
+            for i, pocket in enumerate(raw[:5]):
+                method = pocket.get("method", "unknown")
+                probability = float(pocket.get("probability", 0.0))
+                residues = pocket.get("residues", [])
+                center = pocket.get("center", (0.0, 0.0, 0.0))
+                formatted.append({
+                    "rank": i + 1,
+                    "method": method,
+                    "probability": round(probability, 4),
+                    "n_residues": len(residues) if isinstance(residues, list) else 0,
+                    "volume": pocket.get("volume"),
+                    "center": list(center) if isinstance(center, tuple) else center,
+                    "selected": (i == 0),
+                    "explanation": f"Pocket detected by {method} (score: {probability:.2f}).",
+                })
+            return formatted
+
+        pockets_info = await loop.run_in_executor(_preview_pool, _detect_pockets_local)
+    except Exception as exc:
+        logger.warning("Pocket detection failed for sequence preview: %s", exc)
+
+    structure = {
+        "source": source,
+        "label": "ESMFold" if source == "esmfold" else "Mock",
+        "pdb_id": None,
+        "resolution": None,
+        "method": "ESMFold (on-demand)",
+        "ligand_id": None,
+        "ligand_name": None,
+        "confidence": 0.60,
+        "recommended": True,
+        "explanation": f"Structure predicted from sequence ({len(sequence)} aa) via ESMFold.",
+        "pdb_data": pdb_data,
+    }
+
+    return {
+        "uniprot_id": None,
+        "protein_name": f"Custom sequence ({len(sequence)} aa)",
+        "sequence": sequence,
+        "structure": structure,
+        "structures": [structure],
+        "pockets": pockets_info,
+        "chembl_info": {"has_data": False, "n_actives": 0},
+    }
 
 
 @app.post("/api/jobs")
-async def create_docking_job(body: JobCreate) -> dict:
+async def create_docking_job(
+    body: JobCreate,
+    user_id: Optional[str] = Depends(get_current_user_id),
+) -> dict:
     """Create a new docking job and dispatch it to the Celery worker.
 
     V3: accepts sequence input, mode rapid/standard/deep, auto-determines
     ligand strategy. Deep mode dispatches run_deep_screening task.
+    V7: optionally associates job with a project and user.
     """
     job_id = str(uuid4())
 
@@ -562,6 +1442,9 @@ async def create_docking_job(body: JobCreate) -> dict:
         sequence=body.sequence,
         notification_email=body.notification_email,
         docking_engine=body.docking_engine,
+        # V7 fields
+        project_id=body.project_id,
+        user_id=user_id,
     )
 
     # Choose task type based on mode
@@ -837,11 +1720,31 @@ async def download_pose(job_id: str, ligand_index: int) -> FileResponse:
     if not pose_path.exists():
         raise HTTPException(status_code=404, detail="Pose file not found on disk")
 
+    # Detect actual format from content (file extension may be wrong,
+    # e.g. .pdbqt extension but SDF data from GNINA)
+    try:
+        content = pose_path.read_text()
+    except Exception:
+        content = ""
+
+    if "V2000" in content or "V3000" in content or "$$$$" in content:
+        media_type = "chemical/x-mdl-sdfile"
+        filename_ext = ".sdf"
+    elif "BRANCH" in content or "ENDROOT" in content or "TORSDOF" in content:
+        media_type = "chemical/x-pdbqt"
+        filename_ext = ".pdbqt"
+    elif "ATOM" in content or "HETATM" in content:
+        media_type = "chemical/x-pdb"
+        filename_ext = ".pdb"
+    else:
+        media_type = "application/octet-stream"
+        filename_ext = pose_path.suffix
+
     ligand_name = results[ligand_index].get("name", f"ligand_{ligand_index}")
     return FileResponse(
         path=str(pose_path),
-        media_type="chemical/x-pdbqt",
-        filename=f"{ligand_name}_pose.pdbqt",
+        media_type=media_type,
+        filename=f"{ligand_name}_pose{filename_ext}",
     )
 
 
@@ -850,6 +1753,7 @@ async def download_pose(job_id: str, ligand_index: int) -> FileResponse:
 # ---------------------------------------------------------------------------
 
 # In-memory store for optimization results (keyed by optimization_id)
+# TODO: persist to DB — currently lost on process restart
 _optimization_results: dict[str, dict] = {}
 
 

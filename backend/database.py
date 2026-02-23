@@ -18,7 +18,7 @@ from typing import Generator, Optional
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from models import Base, JobORM
+from models import Base, JobORM, ProjectORM, UserORM
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +41,22 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db() -> None:
-    """Create all tables if they do not exist."""
+    """Create all tables if they do not exist, and migrate existing tables."""
     Base.metadata.create_all(bind=engine)
+
+    # V7 migration: add new columns to existing jobs table if missing
+    from sqlalchemy import text, inspect
+    insp = inspect(engine)
+    if "jobs" in insp.get_table_names():
+        existing_cols = {c["name"] for c in insp.get_columns("jobs")}
+        with engine.begin() as conn:
+            if "project_id" not in existing_cols:
+                conn.execute(text("ALTER TABLE jobs ADD COLUMN project_id VARCHAR(36)"))
+                logger.info("Migrated: added project_id column to jobs table")
+            if "user_id" not in existing_cols:
+                conn.execute(text("ALTER TABLE jobs ADD COLUMN user_id VARCHAR(36)"))
+                logger.info("Migrated: added user_id column to jobs table")
+
     logger.info("Database initialised at %s", DATABASE_URL)
 
 
@@ -80,6 +94,9 @@ def create_job(
     sequence: Optional[str] = None,
     notification_email: Optional[str] = None,
     docking_engine: str = "vina",
+    # V7 fields
+    project_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> JobORM:
     """Insert a new job row and return it.
 
@@ -113,6 +130,10 @@ def create_job(
         Email for completion notification (V3).
     docking_engine : str
         Docking engine to use, default "vina" (V3).
+    project_id : str, optional
+        Project to associate with (V7).
+    user_id : str, optional
+        User who owns this job (V7).
 
     Returns
     -------
@@ -139,10 +160,14 @@ def create_job(
             sequence=sequence,
             notification_email=notification_email,
             docking_engine=docking_engine,
+            # V7 fields
+            project_id=project_id,
+            user_id=user_id,
             created_at=datetime.utcnow(),
         )
         db.add(job)
         db.flush()
+        db.expunge(job)
         display_id = uniprot_id or f"seq[{len(sequence or '')}aa]"
         logger.info("Job %s created for %s (mode=%s, engine=%s)", job_id, display_id, mode, docking_engine)
     return job
@@ -158,6 +183,44 @@ def get_job(job_id: str) -> Optional[JobORM]:
         return job
 
 
+def list_jobs(
+    limit: int = 50,
+    project_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> list[JobORM]:
+    """Return the most recent jobs, ordered by created_at descending.
+
+    Parameters
+    ----------
+    limit : int
+        Maximum number of jobs to return (default 50).
+    project_id : str, optional
+        Filter by project ID (V7).
+    user_id : str, optional
+        Filter by user ID (V7).
+
+    Returns
+    -------
+    list[JobORM]
+        List of detached JobORM instances.
+    """
+    with get_db() as db:
+        query = db.query(JobORM)
+        if project_id is not None:
+            query = query.filter(JobORM.project_id == project_id)
+        if user_id is not None:
+            query = query.filter(JobORM.user_id == user_id)
+        jobs = (
+            query
+            .order_by(JobORM.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        for job in jobs:
+            db.expunge(job)
+        return jobs
+
+
 def update_job(job_id: str, **kwargs) -> None:
     """Update arbitrary columns on a job row."""
     with get_db() as db:
@@ -168,3 +231,233 @@ def update_job(job_id: str, **kwargs) -> None:
         for key, value in kwargs.items():
             setattr(job, key, value)
         db.flush()
+
+
+# ---------------------------------------------------------------------------
+# V7: User helpers
+# ---------------------------------------------------------------------------
+
+def create_user(
+    user_id: str,
+    email: str,
+    username: str,
+    password_hash: str,
+) -> UserORM:
+    """Insert a new user row and return it.
+
+    Parameters
+    ----------
+    user_id : str
+        UUID4 identifier for the user.
+    email : str
+        User email (unique).
+    username : str
+        Display name.
+    password_hash : str
+        Bcrypt hash of the password.
+
+    Returns
+    -------
+    UserORM
+        The created user record.
+    """
+    with get_db() as db:
+        user = UserORM(
+            id=user_id,
+            email=email,
+            username=username,
+            password_hash=password_hash,
+            created_at=datetime.utcnow(),
+        )
+        db.add(user)
+        db.flush()
+        db.expunge(user)
+        logger.info("User %s created (email=%s)", user_id, email)
+    return user
+
+
+def get_user(user_id: str) -> Optional[UserORM]:
+    """Fetch a user by ID, or return None."""
+    with get_db() as db:
+        user = db.get(UserORM, user_id)
+        if user is not None:
+            db.expunge(user)
+        return user
+
+
+def get_user_by_email(email: str) -> Optional[UserORM]:
+    """Fetch a user by email address, or return None.
+
+    Parameters
+    ----------
+    email : str
+        The email address to look up.
+
+    Returns
+    -------
+    UserORM or None
+        The user record, or None if not found.
+    """
+    with get_db() as db:
+        user = db.query(UserORM).filter(UserORM.email == email).first()
+        if user is not None:
+            db.expunge(user)
+        return user
+
+
+# ---------------------------------------------------------------------------
+# V7: Project helpers
+# ---------------------------------------------------------------------------
+
+def create_project(
+    project_id: str,
+    user_id: str,
+    name: str,
+    uniprot_id: Optional[str] = None,
+    sequence: Optional[str] = None,
+    description: Optional[str] = None,
+    target_preview_json: Optional[str] = None,
+) -> ProjectORM:
+    """Insert a new project row and return it.
+
+    Parameters
+    ----------
+    project_id : str
+        UUID4 identifier for the project.
+    user_id : str
+        UUID of the owning user.
+    name : str
+        Project display name.
+    uniprot_id : str, optional
+        Target UniProt accession.
+    sequence : str, optional
+        Target amino acid sequence.
+    description : str, optional
+        Free-text description.
+    target_preview_json : str, optional
+        JSON-encoded preview data.
+
+    Returns
+    -------
+    ProjectORM
+        The created project record.
+    """
+    with get_db() as db:
+        project = ProjectORM(
+            id=project_id,
+            user_id=user_id,
+            name=name,
+            uniprot_id=uniprot_id,
+            sequence=sequence,
+            description=description,
+            target_preview_json=target_preview_json,
+            created_at=datetime.utcnow(),
+        )
+        db.add(project)
+        db.flush()
+        db.expunge(project)
+        logger.info("Project %s created by user %s", project_id, user_id)
+    return project
+
+
+def get_project(project_id: str) -> Optional[ProjectORM]:
+    """Fetch a project by ID, or return None."""
+    with get_db() as db:
+        project = db.get(ProjectORM, project_id)
+        if project is not None:
+            db.expunge(project)
+        return project
+
+
+def list_projects(user_id: str, limit: int = 50) -> list[ProjectORM]:
+    """Return all projects for a user, ordered by created_at descending.
+
+    Parameters
+    ----------
+    user_id : str
+        UUID of the user.
+    limit : int
+        Maximum number of projects to return (default 50).
+
+    Returns
+    -------
+    list[ProjectORM]
+        List of detached ProjectORM instances.
+    """
+    with get_db() as db:
+        projects = (
+            db.query(ProjectORM)
+            .filter(ProjectORM.user_id == user_id)
+            .order_by(ProjectORM.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        for p in projects:
+            db.expunge(p)
+        return projects
+
+
+def update_project(project_id: str, **kwargs) -> None:
+    """Update arbitrary columns on a project row.
+
+    Parameters
+    ----------
+    project_id : str
+        UUID of the project.
+    **kwargs
+        Column name/value pairs to update.
+    """
+    with get_db() as db:
+        project = db.get(ProjectORM, project_id)
+        if project is None:
+            logger.warning("update_project: project %s not found", project_id)
+            return
+        for key, value in kwargs.items():
+            setattr(project, key, value)
+        db.flush()
+
+
+def count_project_jobs(project_id: str) -> int:
+    """Count the number of jobs associated with a project.
+
+    Parameters
+    ----------
+    project_id : str
+        UUID of the project.
+
+    Returns
+    -------
+    int
+        Number of jobs.
+    """
+    with get_db() as db:
+        count = db.query(JobORM).filter(JobORM.project_id == project_id).count()
+        return count
+
+
+def list_project_jobs(project_id: str, limit: int = 50) -> list[JobORM]:
+    """Return all jobs for a project, ordered by created_at descending.
+
+    Parameters
+    ----------
+    project_id : str
+        UUID of the project.
+    limit : int
+        Maximum number of jobs to return (default 50).
+
+    Returns
+    -------
+    list[JobORM]
+        List of detached JobORM instances.
+    """
+    with get_db() as db:
+        jobs = (
+            db.query(JobORM)
+            .filter(JobORM.project_id == project_id)
+            .order_by(JobORM.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        for job in jobs:
+            db.expunge(job)
+        return jobs

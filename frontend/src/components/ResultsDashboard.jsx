@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useMemo } from 'react'
 import { getReportUrl } from '../api.js'
 import InfoTip from './InfoTip.jsx'
 import SafetyReport from './SafetyReport.jsx'
@@ -249,8 +249,8 @@ function ChevronIcon({ open }) {
 // --------------------------------------------------
 // Single candidate card (V6: collapsible details)
 // --------------------------------------------------
-function CandidateCard({ mol, rank, onSelect3D, onOptimize, onSafetyReport, onConfidence }) {
-  const [showDetails, setShowDetails] = useState(false)
+function CandidateCard({ mol, rank, onSelect3D, onOptimize, onSafetyReport, onConfidence, defaultExpanded = true }) {
+  const [showDetails, setShowDetails] = useState(defaultExpanded)
 
   const score100 = Math.round((mol.composite_score || 0) * 100)
   const stars = affinityToStars(mol.affinity)
@@ -611,6 +611,13 @@ export default function ResultsDashboard({ results, onSelect3D, onShowAll, onOpt
   const [safetyMol, setSafetyMol] = useState(null)
   const [confidenceMol, setConfidenceMol] = useState(null)
   const [showEliminated, setShowEliminated] = useState(false)
+  const [filtersOpen, setFiltersOpen] = useState(false)
+  const [filters, setFilters] = useState({
+    minScore: 0,
+    maxAffinity: 0, // 0 means no filter (kcal/mol is negative, so 0 = no filter)
+    safetyLevels: [], // empty = show all
+    sources: [],     // empty = show all
+  })
 
   if (!results) return null
 
@@ -628,7 +635,54 @@ export default function ResultsDashboard({ results, onSelect3D, onShowAll, onOpt
   const passed = allMolecules.filter((m) => m.eliminated !== true)
   const eliminated = allMolecules.filter((m) => m.eliminated === true)
 
-  const topCandidates = passed.slice(0, 3)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const filteredPassed = useMemo(() => {
+    if (!passed || passed.length === 0) return passed
+    return passed.filter((mol) => {
+      // Score filter
+      if (filters.minScore > 0) {
+        const score = (mol.composite_score || 0) * 100
+        if (score < filters.minScore) return false
+      }
+      // Affinity filter (values are negative — more negative = stronger binding)
+      if (filters.maxAffinity < 0) {
+        const affinity = mol.affinity || mol.vina_score || 0
+        if (affinity > filters.maxAffinity) return false
+      }
+      // Safety / toxicity filter
+      if (filters.safetyLevels.length > 0) {
+        const code = mol.admet?.color_code
+        let level = 'unknown'
+        if (code === 'green') level = 'Low'
+        else if (code === 'yellow') level = 'Medium'
+        else if (code === 'red') level = 'High'
+        else {
+          const logp = mol.logp ?? mol.log_p ?? 0
+          const mw = mol.mw ?? mol.molecular_weight ?? 0
+          level = (logp > 5 || mw > 500) ? 'Medium' : 'Low'
+        }
+        if (!filters.safetyLevels.includes(level)) return false
+      }
+      // Source filter
+      if (filters.sources.length > 0) {
+        const src = (mol.source || mol.library || '').toLowerCase()
+        const matchedSource = filters.sources.some((s) => {
+          if (s === 'AI') return src.includes('reinvent') || src.includes('generated') || src.includes('ai') || src.includes('mock_generation')
+          return src.includes(s.toLowerCase())
+        })
+        if (!matchedSource) return false
+      }
+      return true
+    })
+  }, [passed, filters])
+
+  const hasActiveFilters =
+    filters.minScore > 0 ||
+    filters.maxAffinity < 0 ||
+    filters.safetyLevels.length > 0 ||
+    filters.sources.length > 0
+
+  const topCandidates = filteredPassed.slice(0, 3)
   const remainingCount = Math.max(0, passed.length - 3)
 
   // Stats for summary strip
@@ -771,6 +825,154 @@ export default function ResultsDashboard({ results, onSelect3D, onShowAll, onOpt
         </div>
       </div>
 
+      {/* Filter bar */}
+      <div className="mb-2">
+        <div className="flex items-center justify-between mb-2">
+          <button
+            onClick={() => setFiltersOpen((v) => !v)}
+            className="flex items-center gap-2 text-sm font-medium text-gray-500 hover:text-dockit-blue transition-colors"
+          >
+            <svg
+              className={`w-4 h-4 transition-transform duration-200 ${filtersOpen ? 'rotate-180' : ''}`}
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2a1 1 0 01-.293.707l-6.414 6.414A1 1 0 0014 13.414V19a1 1 0 01-.553.894l-4 2A1 1 0 018 21v-7.586a1 1 0 00-.293-.707L1.293 6.707A1 1 0 011 6V4z" />
+            </svg>
+            Filters
+            {hasActiveFilters && (
+              <span className="bg-dockit-blue text-white text-xs px-2 py-0.5 rounded-full font-semibold">
+                Active
+              </span>
+            )}
+          </button>
+
+          <p className="text-xs text-gray-400">
+            Showing{' '}
+            <span className="font-semibold text-dockit-blue">{filteredPassed.length}</span>
+            {' '}of{' '}
+            <span className="font-semibold">{passed.length}</span>
+            {' '}molecules
+          </p>
+        </div>
+
+        {filtersOpen && (
+          <div className="bg-white border border-gray-200 rounded-xl p-4 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-5 mb-3 shadow-sm">
+            {/* Min Score slider */}
+            <div>
+              <label className="text-xs font-semibold text-gray-500 block mb-2 flex items-center gap-1">
+                Min Score
+                <span className="ml-auto font-mono text-dockit-blue">{filters.minScore > 0 ? filters.minScore : 'Off'}</span>
+              </label>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                step="5"
+                value={filters.minScore}
+                onChange={(e) => setFilters((f) => ({ ...f, minScore: Number(e.target.value) }))}
+                className="w-full accent-dockit-blue"
+              />
+              <div className="flex justify-between text-[10px] text-gray-300 mt-0.5">
+                <span>0</span>
+                <span>100</span>
+              </div>
+            </div>
+
+            {/* Max Affinity input */}
+            <div>
+              <label className="text-xs font-semibold text-gray-500 block mb-2">
+                Max Affinity (kcal/mol)
+              </label>
+              <input
+                type="number"
+                step="0.5"
+                value={filters.maxAffinity < 0 ? filters.maxAffinity : ''}
+                placeholder="e.g. -8.0"
+                onChange={(e) => setFilters((f) => ({ ...f, maxAffinity: Number(e.target.value) || 0 }))}
+                className="w-full border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-dockit-blue/30 focus:border-dockit-blue"
+              />
+              <p className="text-[10px] text-gray-300 mt-1">More negative = stronger binding</p>
+            </div>
+
+            {/* Safety / Toxicity toggles */}
+            <div>
+              <label className="text-xs font-semibold text-gray-500 block mb-2">Toxicity Level</label>
+              <div className="flex flex-wrap gap-1.5">
+                {[
+                  { label: 'Low',    active: 'bg-dockit-green border-dockit-green text-white' },
+                  { label: 'Medium', active: 'bg-yellow-500 border-yellow-500 text-white' },
+                  { label: 'High',   active: 'bg-red-500 border-red-500 text-white' },
+                ].map(({ label, active }) => {
+                  const isOn = filters.safetyLevels.includes(label)
+                  return (
+                    <button
+                      key={label}
+                      onClick={() =>
+                        setFilters((f) => ({
+                          ...f,
+                          safetyLevels: isOn
+                            ? f.safetyLevels.filter((l) => l !== label)
+                            : [...f.safetyLevels, label],
+                        }))
+                      }
+                      className={`px-2.5 py-1 text-xs rounded-lg border font-medium transition-colors ${
+                        isOn ? active : 'bg-white text-gray-500 border-gray-200 hover:border-gray-400'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+
+            {/* Source toggles */}
+            <div>
+              <label className="text-xs font-semibold text-gray-500 block mb-2">Source</label>
+              <div className="flex flex-wrap gap-1.5">
+                {[
+                  { label: 'ChEMBL', active: 'bg-dockit-blue border-dockit-blue text-white' },
+                  { label: 'ZINC',   active: 'bg-dockit-blue border-dockit-blue text-white' },
+                  { label: 'AI',     active: 'bg-purple-600 border-purple-600 text-white' },
+                ].map(({ label, active }) => {
+                  const isOn = filters.sources.includes(label)
+                  return (
+                    <button
+                      key={label}
+                      onClick={() =>
+                        setFilters((f) => ({
+                          ...f,
+                          sources: isOn
+                            ? f.sources.filter((s) => s !== label)
+                            : [...f.sources, label],
+                        }))
+                      }
+                      className={`px-2.5 py-1 text-xs rounded-lg border font-medium transition-colors ${
+                        isOn ? active : 'bg-white text-gray-500 border-gray-200 hover:border-gray-400'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  )
+                })}
+              </div>
+
+              {/* Reset all */}
+              {hasActiveFilters && (
+                <button
+                  onClick={() => setFilters({ minScore: 0, maxAffinity: 0, safetyLevels: [], sources: [] })}
+                  className="mt-3 text-xs text-red-500 hover:text-red-700 font-medium underline underline-offset-2 transition-colors"
+                >
+                  Reset all filters
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
       {/* Top candidates grid — passed molecules only */}
       {topCandidates.length > 0 ? (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -779,12 +981,22 @@ export default function ResultsDashboard({ results, onSelect3D, onShowAll, onOpt
               key={mol.name || mol.ligand_name || i}
               mol={mol}
               rank={i + 1}
-              onSelect3D={() => onSelect3D(i)}
+              onSelect3D={() => onSelect3D(mol.name || mol.smiles, mol)}
               onOptimize={() => onOptimize && onOptimize(mol)}
               onSafetyReport={() => setSafetyMol(mol)}
               onConfidence={() => setConfidenceMol(mol)}
             />
           ))}
+        </div>
+      ) : passed.length > 0 ? (
+        <div className="card p-10 text-center text-gray-400">
+          <p className="font-medium text-gray-500 mb-1">No molecules match the current filters.</p>
+          <button
+            onClick={() => setFilters({ minScore: 0, maxAffinity: 0, safetyLevels: [], sources: [] })}
+            className="mt-2 text-sm text-dockit-blue hover:underline font-medium"
+          >
+            Reset filters
+          </button>
         </div>
       ) : (
         <div className="card p-10 text-center text-gray-400">
@@ -816,8 +1028,7 @@ export default function ResultsDashboard({ results, onSelect3D, onShowAll, onOpt
             <ParetoFront
               molecules={allMolecules}
               onSelect={(mol) => {
-                const idx = passed.findIndex((m) => m === mol || m.name === mol.name)
-                if (idx >= 0 && onSelect3D) onSelect3D(idx)
+                if (onSelect3D) onSelect3D(mol.name || mol.smiles, mol)
               }}
             />
           </div>

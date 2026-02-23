@@ -162,7 +162,7 @@ function SourceStatusIcon({ status }) {
 function StructureSourceHierarchy({ pipeline_summary }) {
   if (!pipeline_summary) return null
 
-  const structureSource = pipeline_summary.structure_source || null
+  const structureSource = pipeline_summary?.effective_structure_source || pipeline_summary?.structure_source || null
   const pdbInfo = pipeline_summary.pdb_info || {}
   const pdbId = pdbInfo.pdb_id || pipeline_summary.pdb_id || null
   const pdbResolution = pdbInfo.resolution || pipeline_summary.pdb_resolution || null

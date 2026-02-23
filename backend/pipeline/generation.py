@@ -81,6 +81,7 @@ def generate_molecules(
     n_molecules: int = 100,
     n_top: int = 20,
     timeout_minutes: int = 10,
+    seed_smiles: list[str] | None = None,
 ) -> list[dict]:
     """Generate novel drug-like molecules optimized for the target pocket.
 
@@ -154,6 +155,7 @@ def generate_molecules(
         work_dir=work_dir,
         n_molecules=n_molecules,
         n_top=n_top,
+        seed_smiles=seed_smiles,
     )
 
 
@@ -432,6 +434,7 @@ def _mock_generate(
     work_dir: Path,
     n_molecules: int,
     n_top: int,
+    seed_smiles: list[str] | None = None,
 ) -> list[dict]:
     """Generate molecules via RDKit scaffold modification (mock).
 
@@ -445,7 +448,7 @@ def _mock_generate(
     """
     if not _check_rdkit():
         logger.info("RDKit unavailable; returning hardcoded generated molecules")
-        return _hardcoded_generated(n_top)
+        return _hardcoded_generated(n_top, seed_smiles=seed_smiles)
 
     from rdkit import Chem, RDLogger
     from rdkit.Chem import AllChem, Descriptors, QED as QED_module
@@ -477,8 +480,12 @@ def _mock_generate(
     while len(candidates) < n_molecules and attempts < max_attempts:
         attempts += 1
 
-        # Pick a random scaffold
-        scaffold_name, scaffold_smi = rng.choice(_SEED_SCAFFOLDS)
+        # Use seed_smiles from screening hits when available
+        if seed_smiles and rng.random() < 0.5:
+            scaffold_smi = rng.choice(seed_smiles)
+            scaffold_name = "screening_hit"
+        else:
+            scaffold_name, scaffold_smi = rng.choice(_SEED_SCAFFOLDS)
         scaffold_mol = Chem.MolFromSmiles(scaffold_smi)
         if scaffold_mol is None:
             continue
@@ -761,7 +768,7 @@ def _atom_element_swap(
     """Swap O<->S or N<->O on a random non-ring atom."""
     from rdkit import Chem
 
-    swappable = {8: 16, 16: 8, 7: 8, 8: 7}  # O<->S, N<->O
+    swappable = {8: 16, 16: 8, 7: 8}  # O<->S, N->O
     candidates = [
         a for a in rwmol.GetAtoms()
         if not a.IsInRing() and a.GetAtomicNum() in swappable
@@ -972,7 +979,7 @@ def _compute_novelty_single(smiles: str) -> float:
 # HARDCODED FALLBACK (no RDKit, no REINVENT4)
 # ===================================================================
 
-def _hardcoded_generated(n_top: int) -> list[dict]:
+def _hardcoded_generated(n_top: int, seed_smiles: list[str] | None = None) -> list[dict]:
     """Return a static set of realistic generated drug-like molecules.
 
     These are hand-curated SMILES that resemble plausible de novo

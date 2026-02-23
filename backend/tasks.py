@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import requests as http_requests
+
 from celery_app import celery_app
 from database import get_db, update_job
 
@@ -66,6 +68,42 @@ def _store_pipeline_summary(job_id: str, summary: dict) -> None:
         update_job(job_id, pipeline_summary_json=json.dumps(summary))
     except Exception as exc:
         logger.warning("[%s] Failed to store pipeline summary: %s", job_id, exc)
+
+
+def _fetch_protein_name(uniprot_id: str) -> Optional[str]:
+    """Fetch the recommended protein name from the UniProt REST API.
+
+    Parameters
+    ----------
+    uniprot_id : str
+        UniProt accession (e.g. ``"P00533"``).
+
+    Returns
+    -------
+    str or None
+        The recommended full name, or None on failure.
+    """
+    try:
+        resp = http_requests.get(
+            f"https://rest.uniprot.org/uniprotkb/{uniprot_id}.json",
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        protein_desc = data.get("proteinDescription", {})
+        rec_name = protein_desc.get("recommendedName", {})
+        full_name = rec_name.get("fullName", {})
+        name = full_name.get("value")
+        if name:
+            return name
+        # Fallback: submittedName
+        submitted = protein_desc.get("submittedName", [])
+        if submitted and isinstance(submitted, list):
+            return submitted[0].get("fullName", {}).get("value")
+        return None
+    except Exception as exc:
+        logger.warning("Failed to fetch protein name for %s: %s", uniprot_id, exc)
+        return None
 
 
 @celery_app.task(name="run_pipeline", bind=True, max_retries=0)
@@ -172,6 +210,12 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
                                 pdb_info.get("pdb_id", "?"), ligand_id or "none")
             except Exception as exc:
                 logger.warning("[%s] Failed to retrieve PDB info: %s", job_id, exc)
+
+        # --- A1: Compute effective_structure_source early ---
+        effective_structure_source = structure_source
+        if structure_source == "pdb_experimental" and pdb_info and pdb_info.get("ligand_id"):
+            effective_structure_source = "pdb_holo"
+        pipeline_summary["effective_structure_source"] = effective_structure_source
 
         audit.log("structure", f"Structure retrieved from {structure_source}", {
             "source": structure_source,
@@ -447,6 +491,9 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
             _update_progress(job_id, 56, "Generating novel molecules (AI)")
             from pipeline.generation import generate_molecules
 
+            # A2: Extract top 5 hit SMILES from docking results to seed generation
+            top_hit_smiles = [r["smiles"] for r in sorted(docking_results, key=lambda x: x.get("affinity", 0))[:5] if r.get("smiles")]
+
             gen_mols = generate_molecules(
                 pocket_center=center,
                 pocket_size=pocket_size,
@@ -454,6 +501,7 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
                 work_dir=work_dir,
                 n_molecules=n_generated_molecules,
                 n_top=20,
+                seed_smiles=top_hit_smiles,
             )
             logger.info("Generated %d novel molecules", len(gen_mols))
 
@@ -841,11 +889,6 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
         # ------------------------------------------------------------------
         try:
             from pipeline.confidence import calculate_confidence
-            # V6: Determine effective structure source for confidence scoring
-            # If we have PDB info with a ligand, treat as "pdb_holo" for higher confidence
-            effective_structure_source = structure_source
-            if structure_source == "pdb_experimental" and pdb_info and pdb_info.get("ligand_id"):
-                effective_structure_source = "pdb_holo"
 
             for mol in scored_known + scored_generated:
                 # V5bis: attach pocket method for confidence scoring
@@ -869,10 +912,15 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
         # Step 11: Generate report + ZIP (92% -> 98%)
         # ------------------------------------------------------------------
         _update_progress(job_id, 93, "Generating PDF report")
+        # Resolve protein name from UniProt API (fallback to uniprot_id)
+        protein_name: str = "Sequence-based target"
+        if uniprot_id:
+            protein_name = _fetch_protein_name(uniprot_id) or uniprot_id
+        update_job(job_id, protein_name=protein_name)
         job_meta = {
             "job_id": job_id,
             "uniprot_id": uniprot_id or "N/A",
-            "protein_name": uniprot_id or "Sequence-based target",
+            "protein_name": protein_name,
             "mode": mode,
             "structure_source": structure_source,
             "strategy_message": strategy_message,
@@ -1050,6 +1098,12 @@ def run_deep_screening(self, job_id: str, params: dict) -> dict:
             except Exception as exc:
                 logger.warning("[%s] Failed to retrieve PDB info in deep: %s", job_id, exc)
 
+        # --- A1: Compute effective_structure_source early (deep) ---
+        effective_structure_source_deep = structure_source
+        if structure_source == "pdb_experimental" and pdb_info_deep and pdb_info_deep.get("ligand_id"):
+            effective_structure_source_deep = "pdb_holo"
+        pipeline_summary["effective_structure_source"] = effective_structure_source_deep
+
         # ------------------------------------------------------------------
         # Step 2: Detect pockets (5% -> 8%)
         # ------------------------------------------------------------------
@@ -1173,6 +1227,8 @@ def run_deep_screening(self, job_id: str, params: dict) -> dict:
         _update_progress(job_id, 66, "Deep screening: Generating novel molecules (AI)")
         try:
             from pipeline.generation import generate_molecules
+            # A2: Extract top 5 hit SMILES from docking results to seed generation
+            top_hit_smiles_deep = [r["smiles"] for r in sorted(all_docking_results, key=lambda x: x.get("affinity", 0))[:5] if r.get("smiles")]
             gen_mols = generate_molecules(
                 pocket_center=center,
                 pocket_size=pocket_size,
@@ -1180,6 +1236,7 @@ def run_deep_screening(self, job_id: str, params: dict) -> dict:
                 work_dir=work_dir,
                 n_molecules=n_generated_molecules,
                 n_top=30,
+                seed_smiles=top_hit_smiles_deep,
             )
             if gen_mols:
                 gen_ligands = [
@@ -1304,6 +1361,72 @@ def run_deep_screening(self, job_id: str, params: dict) -> dict:
             logger.warning("[%s] Deep Pareto ranking failed: %s", job_id, exc)
 
         # ------------------------------------------------------------------
+        # Step 8d: Off-target screening (deep) — top 5
+        # ------------------------------------------------------------------
+        try:
+            _update_progress(job_id, 86, "Deep screening: Off-target safety screening")
+            from pipeline.off_target import screen_candidates
+            all_scored_deep_ot = sorted(
+                scored_known + scored_generated,
+                key=lambda x: x.get("composite_score", 0),
+                reverse=True,
+            )
+            top5_deep_ot = all_scored_deep_ot[:5]
+            top5_deep_screened = screen_candidates(top5_deep_ot, work_dir)
+            ot_by_smiles_deep = {
+                m.get("smiles", ""): m.get("off_target_results")
+                for m in top5_deep_screened
+                if m.get("off_target_results")
+            }
+            for mol in scored_known + scored_generated:
+                smi = mol.get("smiles", "")
+                if smi in ot_by_smiles_deep:
+                    mol["off_target_results"] = ot_by_smiles_deep[smi]
+            pipeline_summary["steps_completed"].append("off_target")
+            logger.info("[%s] Deep off-target screening: screened %d molecules", job_id, len(top5_deep_screened))
+        except Exception as exc:
+            logger.warning("[%s] Deep off-target screening failed: %s", job_id, exc)
+
+        # ------------------------------------------------------------------
+        # Step 8e: Confidence scoring (deep) — all results
+        # ------------------------------------------------------------------
+        try:
+            from pipeline.confidence import calculate_confidence
+            for mol in scored_known + scored_generated:
+                mol.setdefault("pocket_method", pocket_method_deep)
+                mol["confidence"] = calculate_confidence(mol, effective_structure_source_deep)
+            pipeline_summary["steps_completed"].append("confidence")
+            logger.info("[%s] Deep confidence scoring complete", job_id)
+        except Exception as exc:
+            logger.warning("[%s] Deep confidence scoring failed: %s", job_id, exc)
+
+        # ------------------------------------------------------------------
+        # Step 8f: Interaction analysis (deep) — top 10
+        # ------------------------------------------------------------------
+        try:
+            _update_progress(job_id, 87, "Deep screening: Analyzing protein-ligand interactions")
+            from pipeline.interaction_analysis import analyze_interactions
+            all_scored_deep_ia = sorted(
+                scored_known + scored_generated,
+                key=lambda x: x.get("composite_score", 0), reverse=True,
+            )
+            top_for_interactions_deep = all_scored_deep_ia[:10]
+            for mol in top_for_interactions_deep:
+                smi = mol.get("smiles", "")
+                interaction_result = analyze_interactions(
+                    protein_path=str(pdb_path),
+                    ligand_path=mol.get("pose_pdbqt_path", ""),
+                    uniprot_id=uniprot_id,
+                    smiles=smi,
+                )
+                mol["interactions"] = interaction_result
+                mol["interaction_quality"] = interaction_result.get("interaction_quality", 0.5)
+            pipeline_summary["steps_completed"].append("interactions")
+            logger.info("[%s] Deep interaction analysis: analyzed %d molecules", job_id, len(top_for_interactions_deep))
+        except Exception as exc:
+            logger.warning("[%s] Deep interaction analysis failed: %s", job_id, exc)
+
+        # ------------------------------------------------------------------
         # Step 9: Retrosynthesis (85% -> 92%)
         # ------------------------------------------------------------------
         _update_progress(job_id, 86, "Deep screening: Retrosynthesis planning")
@@ -1332,10 +1455,15 @@ def run_deep_screening(self, job_id: str, params: dict) -> dict:
         # Step 10: Report + ZIP (92% -> 98%)
         # ------------------------------------------------------------------
         _update_progress(job_id, 93, "Deep screening: Generating report")
+        # Resolve protein name from UniProt API (fallback to uniprot_id)
+        protein_name_deep: str = "Sequence-based target"
+        if uniprot_id:
+            protein_name_deep = _fetch_protein_name(uniprot_id) or uniprot_id
+        update_job(job_id, protein_name=protein_name_deep)
         job_meta = {
             "job_id": job_id,
             "uniprot_id": uniprot_id or "N/A",
-            "protein_name": uniprot_id or "Sequence-based target",
+            "protein_name": protein_name_deep,
             "mode": "deep",
             "structure_source": structure_source,
             "strategy_message": strategy_message,

@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import datetime
 import re
+import uuid
 from typing import Optional
 
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import Column, DateTime, Float, Integer, String, Text
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase
 
 
@@ -66,6 +67,10 @@ class JobORM(Base):
     pipeline_summary_json: str = Column(Text, nullable=True)  # JSON-encoded pipeline summary dict
     docking_engine: str = Column(String(20), nullable=False, default="auto")  # gnina | vina | auto
 
+    # V7: Project + user association (nullable for backwards compatibility)
+    project_id: str = Column(String(36), ForeignKey("projects.id"), nullable=True)
+    user_id: str = Column(String(36), ForeignKey("users.id"), nullable=True)
+
     # Result metadata
     results_json: str = Column(Text, nullable=True)  # JSON-encoded list[DockingResult]
     generated_json: str = Column(Text, nullable=True)  # JSON-encoded V2 generated molecules
@@ -77,6 +82,45 @@ class JobORM(Base):
         DateTime, nullable=False, default=datetime.datetime.utcnow
     )
     completed_at: datetime.datetime = Column(DateTime, nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# SQLAlchemy ORM — User table (V7)
+# ---------------------------------------------------------------------------
+
+class UserORM(Base):
+    """User account for project organization."""
+
+    __tablename__ = "users"
+
+    id: str = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    email: str = Column(String(200), unique=True, nullable=False)
+    username: str = Column(String(100), nullable=False)
+    password_hash: str = Column(String(200), nullable=False)
+    created_at: datetime.datetime = Column(
+        DateTime, nullable=False, default=datetime.datetime.utcnow
+    )
+
+
+# ---------------------------------------------------------------------------
+# SQLAlchemy ORM — Project table (V7)
+# ---------------------------------------------------------------------------
+
+class ProjectORM(Base):
+    """A project groups jobs around a single target protein."""
+
+    __tablename__ = "projects"
+
+    id: str = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: str = Column(String(36), ForeignKey("users.id"), nullable=False)
+    name: str = Column(String(200), nullable=False)
+    uniprot_id: str = Column(String(20), nullable=True)
+    sequence: str = Column(Text, nullable=True)
+    description: str = Column(Text, nullable=True)
+    target_preview_json: str = Column(Text, nullable=True)  # JSON-encoded preview data
+    created_at: datetime.datetime = Column(
+        DateTime, nullable=False, default=datetime.datetime.utcnow
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +169,11 @@ class JobCreate(BaseModel):
     )
     notification_email: Optional[str] = Field(
         default=None, description="Email address for completion notification (deep mode)",
+    )
+
+    # V7: Project association
+    project_id: Optional[str] = Field(
+        default=None, description="Project ID to associate this job with",
     )
 
     # V2 fields kept for backward compat but no longer required
@@ -409,3 +458,62 @@ class OptimizationStatus(BaseModel):
     best_score: Optional[float] = None
     result: Optional[dict] = None
     error_message: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# V7: Auth and Project schemas
+# ---------------------------------------------------------------------------
+
+class UserCreate(BaseModel):
+    """Payload for POST /api/auth/register."""
+
+    email: str = Field(..., min_length=3, max_length=200)
+    username: str = Field(..., min_length=2, max_length=100)
+    password: str = Field(..., min_length=6, max_length=100)
+
+
+class UserLogin(BaseModel):
+    """Payload for POST /api/auth/login."""
+
+    email: str
+    password: str
+
+
+class UserResponse(BaseModel):
+    """Returned user info."""
+
+    id: str
+    email: str
+    username: str
+    created_at: Optional[str] = None
+
+
+class ProjectCreate(BaseModel):
+    """Payload for POST /api/projects."""
+
+    name: str = Field(..., min_length=1, max_length=200)
+    uniprot_id: Optional[str] = None
+    sequence: Optional[str] = None
+    description: Optional[str] = None
+    target_preview_json: Optional[dict] = None
+
+
+class ProjectUpdate(BaseModel):
+    """Payload for PUT /api/projects/{id}."""
+
+    name: Optional[str] = None
+    description: Optional[str] = None
+    target_preview_json: Optional[dict] = None
+
+
+class ProjectResponse(BaseModel):
+    """Returned project info."""
+
+    id: str
+    name: str
+    uniprot_id: Optional[str] = None
+    sequence: Optional[str] = None
+    description: Optional[str] = None
+    target_preview_json: Optional[dict] = None
+    created_at: Optional[str] = None
+    job_count: int = 0
