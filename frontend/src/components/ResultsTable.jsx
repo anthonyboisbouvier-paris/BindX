@@ -49,7 +49,9 @@ function detectV2Fields(rows) {
   return { hasSource, hasAdmet, hasMethod, hasAgreement }
 }
 
-function SourceBadge({ source }) {
+function SourceBadge({ source, isGeneratedMol }) {
+  // Molecules merged from generated_molecules get a purple AI badge regardless of source field
+  if (isGeneratedMol) return <Badge variant="purple">AI</Badge>
   if (!source) return <span className="text-xs text-gray-400">—</span>
   const lower = source.toLowerCase()
   const isAI = lower.includes('reinvent') || lower.includes('mock_generation') || lower.includes('generated')
@@ -67,7 +69,6 @@ function AdmetDot({ admet }) {
   const colorCode = admet.color_code || null
 
   let dotClass = 'bg-yellow-400'
-  let label = null
   if (colorCode) {
     if (colorCode.toLowerCase() === 'green')  dotClass = 'bg-green-500'
     if (colorCode.toLowerCase() === 'red')    dotClass = 'bg-red-500'
@@ -76,7 +77,7 @@ function AdmetDot({ admet }) {
     if (score >= 0.6)     dotClass = 'bg-green-500'
     else if (score < 0.4) dotClass = 'bg-red-500'
   }
-  if (score !== null) label = Number(score).toFixed(2)
+  const label = score !== null ? Number(score).toFixed(2) : null
 
   return (
     <span className="flex items-center gap-1.5">
@@ -113,9 +114,23 @@ export default function ResultsTable({ results, selectedIndex, onSelect }) {
   const [showMoreCols, setShowMoreCols] = useState(false)
 
   const rawResults = results?.results || []
-  const top10 = rawResults.slice(0, 10)
 
-  const { hasSource, hasAdmet, hasMethod, hasAgreement } = detectV2Fields(top10)
+  // Merge generated molecules from results.generated_molecules into the table.
+  // Each generated molecule is tagged with _isGeneratedMol = true so the
+  // SourceBadge can render a purple "AI" badge even when source field is absent.
+  const generatedMols = (results?.generated_molecules || []).map(mol => ({
+    ...mol,
+    _isGeneratedMol: true,
+  }))
+
+  // Combine docking results with generated molecules, then sort by composite_score
+  // descending so the merged list is ordered before the user applies a custom sort.
+  const allResults = [...rawResults, ...generatedMols]
+
+  const { hasSource, hasAdmet, hasMethod, hasAgreement } = detectV2Fields(allResults)
+
+  // Source column should always be shown when generated molecules are present
+  const showSourceCol = hasSource || generatedMols.length > 0
 
   const handleSort = (key) => {
     if (sortKey === key) {
@@ -127,7 +142,7 @@ export default function ResultsTable({ results, selectedIndex, onSelect }) {
     }
   }
 
-  const sorted = [...top10].sort((a, b) => {
+  const sorted = [...allResults].sort((a, b) => {
     const va = a[sortKey] ?? -Infinity
     const vb = b[sortKey] ?? -Infinity
     if (sortDir === 'asc') return va - vb
@@ -138,27 +153,28 @@ export default function ResultsTable({ results, selectedIndex, onSelect }) {
   const MOBILE_HIDDEN = new Set(['logp', 'mw'])
 
   const BASE_COLUMNS = [
-    { key: 'rank',            label: 'Rank',                sticky: true,  sortable: false, tooltip: null },
-    { key: 'name',            label: 'Name',                sticky: true,  sortable: false, tooltip: null },
+    { key: 'rank',            label: 'Rank',          sticky: true,  sortable: false, tooltip: null },
+    { key: 'name',            label: 'Name',          sticky: true,  sortable: false, tooltip: null },
+    { key: 'structure',       label: 'Structure',     sticky: false, sortable: false, tooltip: '2D molecular structure thumbnail.' },
     { key: 'affinity',        label: 'Affinity (kcal/mol)', sticky: false, sortable: true,  tooltip: 'Predicted binding energy. More negative = stronger binding.' },
-    { key: 'composite_score', label: 'Composite Score',     sticky: false, sortable: true,  tooltip: 'Combined score (0-1) from affinity, drug-likeness, and ADMET.' },
-    { key: 'logp',            label: 'LogP',                sticky: false, sortable: true,  tooltip: 'Lipophilicity measure. Optimal range: 0-5 for oral drugs.' },
-    { key: 'mw',              label: 'MW (Da)',             sticky: false, sortable: true,  tooltip: 'Molecular weight in Daltons. Should be below 500 Da (Lipinski rule).' },
-    { key: 'qed',             label: 'QED',                 sticky: false, sortable: true,  tooltip: 'Quantitative Estimate of Drug-likeness (0-1). Higher is better.' },
+    { key: 'composite_score', label: 'Score',         sticky: false, sortable: true,  tooltip: 'Combined score (0-1) from affinity, drug-likeness, and ADMET.' },
+    { key: 'logp',            label: 'LogP',          sticky: false, sortable: true,  tooltip: 'Lipophilicity measure. Optimal range: 0-5 for oral drugs.' },
+    { key: 'mw',              label: 'MW (Da)',       sticky: false, sortable: true,  tooltip: 'Molecular weight in Daltons. Should be below 500 Da (Lipinski rule).' },
+    { key: 'qed',             label: 'QED',           sticky: false, sortable: true,  tooltip: 'Quantitative Estimate of Drug-likeness (0-1). Higher is better.' },
   ]
 
   const EXTRA_COLUMNS = [
-    ...(hasAgreement ? [{ key: 'agreement',      label: 'Agreement', sticky: false, sortable: false, tooltip: 'Consensus between scoring methods. 3/3 = all agree (green).' }] : []),
-    ...(hasSource    ? [{ key: 'source',          label: 'Source',    sticky: false, sortable: false, tooltip: 'Database origin of this molecule (ChEMBL, ZINC, or AI-generated).' }] : []),
-    ...(hasAdmet     ? [{ key: 'admet',           label: 'ADMET',     sticky: false, sortable: false, tooltip: 'Drug safety score. Green = favorable, yellow = acceptable, red = problematic.' }] : []),
-    ...(hasMethod    ? [{ key: 'docking_method',  label: 'Method',    sticky: false, sortable: false, tooltip: 'Docking algorithm used to compute binding pose and affinity.' }] : []),
+    ...(hasAgreement   ? [{ key: 'agreement',     label: 'Agree',  sticky: false, sortable: false, tooltip: 'Consensus between scoring methods. 3/3 = all agree (green).' }] : []),
+    ...(showSourceCol  ? [{ key: 'source',         label: 'Source', sticky: false, sortable: false, tooltip: 'Database origin of this molecule (ChEMBL, ZINC, or AI-generated).' }] : []),
+    ...(hasAdmet       ? [{ key: 'admet',          label: 'ADMET', sticky: false, sortable: false, tooltip: 'Drug safety score. Green = favorable, yellow = acceptable, red = problematic.' }] : []),
+    ...(hasMethod      ? [{ key: 'docking_method', label: 'Method', sticky: false, sortable: false, tooltip: 'Docking algorithm used to compute binding pose and affinity.' }] : []),
   ]
 
   const COLUMNS = [...BASE_COLUMNS, ...EXTRA_COLUMNS]
 
   const getName = (r) => r.name || r.molecule_name || r.smiles?.slice(0, 20) || 'Unknown'
 
-  if (!top10.length) {
+  if (!allResults.length) {
     return (
       <div className="card p-8 text-center text-gray-400">
         <svg className="w-12 h-12 mx-auto mb-3 text-gray-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -180,7 +196,12 @@ export default function ResultsTable({ results, selectedIndex, onSelect }) {
           <svg className="w-4 h-4 text-dockit-green" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
           </svg>
-          Top {top10.length} docking results
+          All Results
+          {generatedMols.length > 0 && (
+            <span className="ml-1 text-purple-300 text-xs font-normal">
+              (incl. {generatedMols.length} AI-generated)
+            </span>
+          )}
         </h3>
         <div className="flex items-center gap-3">
           {/* Mobile "More columns" toggle */}
@@ -196,180 +217,207 @@ export default function ResultsTable({ results, selectedIndex, onSelect }) {
             {showMoreCols ? 'Fewer columns' : 'More columns'}
           </button>
           <span className="text-white/60 text-xs">
-            {rawResults.length} ligands tested in total
+            {allResults.length} molecule{allResults.length !== 1 ? 's' : ''} total
           </span>
         </div>
       </div>
 
-      {/* Scrollable table wrapper */}
+      {/* Outer wrapper: horizontal scroll + vertical scroll capped at 600px */}
       <div className="overflow-x-auto">
-        <table className="w-full results-table">
-          <thead>
-            <tr className="border-b border-gray-100 bg-gray-50">
-              {COLUMNS.map((col) => {
-                const isMobileHidden = MOBILE_HIDDEN.has(col.key) && !showMoreCols
-                // Sticky classes for first two columns
-                const stickyClass = col.sticky
-                  ? 'sticky left-0 bg-gray-50 z-10'
-                  : ''
-                // Offset the "name" sticky column so it doesn't overlap "rank"
-                const stickyOffset = col.key === 'name' ? 'left-[52px]' : ''
+        <div className="max-h-[600px] overflow-y-auto">
+          <table className="w-full results-table">
+            <thead className="sticky top-0 z-20">
+              <tr className="border-b border-gray-100 bg-gray-50">
+                {COLUMNS.map((col) => {
+                  const isMobileHidden = MOBILE_HIDDEN.has(col.key) && !showMoreCols
+                  // Sticky classes for first two columns
+                  const stickyClass = col.sticky
+                    ? 'sticky left-0 bg-gray-50 z-10'
+                    : ''
+                  // Offset the "name" sticky column so it doesn't overlap "rank"
+                  const stickyOffset = col.key === 'name' ? 'left-[52px]' : ''
+
+                  return (
+                    <th
+                      key={col.key}
+                      onClick={col.sortable ? () => handleSort(col.key) : undefined}
+                      className={[
+                        'px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide',
+                        col.sortable ? 'cursor-pointer hover:text-dockit-blue select-none' : '',
+                        sortKey === col.key ? 'text-dockit-blue' : '',
+                        stickyClass,
+                        stickyOffset,
+                        // Shadow separator on last sticky column
+                        col.key === 'name' ? `relative ${STICKY_SHADOW}` : '',
+                        // Mobile visibility
+                        isMobileHidden ? 'hidden md:table-cell' : '',
+                      ].filter(Boolean).join(' ')}
+                    >
+                      <span className="inline-flex items-center">
+                        {col.label}
+                        {col.tooltip && <InfoTip text={col.tooltip} />}
+                        {col.sortable && (
+                          <SortIcon active={sortKey === col.key} direction={sortDir} />
+                        )}
+                      </span>
+                    </th>
+                  )
+                })}
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((result, displayIdx) => {
+                // The original index into allResults (pre-sort) drives onSelect
+                // so the 3D viewer can look up the correct molecule.
+                const originalIdx = allResults.indexOf(result)
+                const isSelected = selectedIndex === originalIdx
+                // "Top" highlight only applies to rank 0 in allResults (not generated mols)
+                const isTop = originalIdx === 0 && !result._isGeneratedMol
+
+                const rowBase = isSelected
+                  ? 'bg-dockit-blue/5 border-l-4 border-l-dockit-blue'
+                  : isTop
+                  ? 'bg-green-50/50 hover:bg-green-50'
+                  : result._isGeneratedMol
+                  ? 'bg-purple-50/30 hover:bg-purple-50/60'
+                  : 'hover:bg-blue-50/50'
+
+                const stickyBg = isSelected
+                  ? 'bg-blue-50'
+                  : isTop
+                  ? 'bg-green-50/80'
+                  : result._isGeneratedMol
+                  ? 'bg-purple-50/50'
+                  : 'bg-white'
 
                 return (
-                  <th
-                    key={col.key}
-                    onClick={col.sortable ? () => handleSort(col.key) : undefined}
-                    className={[
-                      'px-3 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide whitespace-nowrap',
-                      col.sortable ? 'cursor-pointer hover:text-dockit-blue select-none' : '',
-                      sortKey === col.key ? 'text-dockit-blue' : '',
-                      stickyClass,
-                      stickyOffset,
-                      // Shadow separator on last sticky column
-                      col.key === 'name' ? `relative ${STICKY_SHADOW}` : '',
-                      // Mobile visibility
-                      isMobileHidden ? 'hidden md:table-cell' : '',
-                    ].filter(Boolean).join(' ')}
+                  <tr
+                    key={`${result._isGeneratedMol ? 'gen' : 'dock'}-${originalIdx}`}
+                    onClick={() => onSelect(originalIdx)}
+                    className={`border-b border-gray-100 cursor-pointer transition-colors duration-150 ${rowBase}`}
                   >
-                    <span className="inline-flex items-center">
-                      {col.label}
-                      {col.tooltip && <InfoTip text={col.tooltip} />}
-                      {col.sortable && (
-                        <SortIcon active={sortKey === col.key} direction={sortDir} />
+                    {/* Rank — sticky left */}
+                    <td className={`px-2 py-3 sticky left-0 z-10 ${stickyBg}`}>
+                      <div className="flex items-center gap-1.5">
+                        {originalIdx === 0 && !result._isGeneratedMol ? (
+                          <span className="w-6 h-6 bg-dockit-green text-white text-xs font-bold rounded-full flex items-center justify-center">
+                            1
+                          </span>
+                        ) : (
+                          <span className="w-6 h-6 bg-gray-100 text-gray-500 text-xs font-medium rounded-full flex items-center justify-center">
+                            {displayIdx + 1}
+                          </span>
+                        )}
+                        {isTop && (
+                          <span className="text-yellow-500 text-xs">★</span>
+                        )}
+                      </div>
+                    </td>
+
+                    {/* Name — sticky second column, wider and wrapping */}
+                    <td className={`px-2 py-3 sticky left-[52px] z-10 relative ${stickyBg} ${STICKY_SHADOW}`}>
+                      <div className="flex flex-col max-w-[220px]">
+                        <span
+                          className={`text-sm font-medium whitespace-normal break-words ${
+                            result.eliminated
+                              ? 'text-red-400 line-through'
+                              : isTop
+                              ? 'text-dockit-green'
+                              : result._isGeneratedMol
+                              ? 'text-purple-700'
+                              : 'text-gray-800'
+                          }`}
+                          title={getName(result)}
+                        >
+                          {getName(result)}
+                        </span>
+                        {result.eliminated && (
+                          <span className="text-[10px] text-red-500 font-semibold">{result.elimination_reason || 'Eliminated'}</span>
+                        )}
+                        {result.chembl_id && (
+                          <span className="text-xs text-gray-400 font-mono">{result.chembl_id}</span>
+                        )}
+                      </div>
+                    </td>
+
+                    {/* Structure SVG thumbnail */}
+                    <td className="px-1 py-1">
+                      {result.svg ? (
+                        <div className="w-10 h-10 [&>svg]:w-full [&>svg]:h-full"
+                             dangerouslySetInnerHTML={{ __html: result.svg }} />
+                      ) : (
+                        <div className="w-10 h-10 bg-gray-100 rounded flex items-center justify-center text-xs text-gray-400">-</div>
                       )}
-                    </span>
-                  </th>
+                    </td>
+
+                    {/* Affinity */}
+                    <td className="px-2 py-3">
+                      <span className={`text-sm font-mono font-semibold ${
+                        (result.affinity || 0) < -9 ? 'text-green-600' :
+                        (result.affinity || 0) < -7 ? 'text-blue-600' :
+                        'text-gray-600'
+                      }`}>
+                        {result.affinity !== undefined ? Number(result.affinity).toFixed(1) : 'N/A'}
+                      </span>
+                    </td>
+
+                    {/* Composite score */}
+                    <td className="px-2 py-3">
+                      <ScoreBadge value={result.composite_score} low={0} high={1} />
+                    </td>
+
+                    {/* LogP — hidden on mobile by default */}
+                    <td className={`px-2 py-3 ${!showMoreCols ? 'hidden md:table-cell' : ''}`}>
+                      <span className="text-sm text-gray-600 font-mono">
+                        {result.logp !== undefined ? Number(result.logp).toFixed(2) : 'N/A'}
+                      </span>
+                    </td>
+
+                    {/* MW — hidden on mobile by default */}
+                    <td className={`px-2 py-3 ${!showMoreCols ? 'hidden md:table-cell' : ''}`}>
+                      <span className="text-sm text-gray-600">
+                        {result.mw !== undefined ? Math.round(result.mw) : 'N/A'}
+                      </span>
+                    </td>
+
+                    {/* QED */}
+                    <td className="px-2 py-3">
+                      <ScoreBadge value={result.qed} low={0} high={1} />
+                    </td>
+
+                    {/* Agreement (optional) */}
+                    {hasAgreement && (
+                      <td className="px-2 py-3">
+                        <AgreementBadge agreement={result.consensus_detail?.agreement} />
+                      </td>
+                    )}
+
+                    {/* Source — always shown when generated molecules are present */}
+                    {showSourceCol && (
+                      <td className="px-2 py-3">
+                        <SourceBadge source={result.source} isGeneratedMol={result._isGeneratedMol} />
+                      </td>
+                    )}
+
+                    {/* ADMET (V2) */}
+                    {hasAdmet && (
+                      <td className="px-2 py-3">
+                        <AdmetDot admet={result.admet} />
+                      </td>
+                    )}
+
+                    {/* Docking method (V2) */}
+                    {hasMethod && (
+                      <td className="px-2 py-3">
+                        <MethodBadge method={result.docking_method} />
+                      </td>
+                    )}
+                  </tr>
                 )
               })}
-            </tr>
-          </thead>
-          <tbody>
-            {sorted.map((result, displayIdx) => {
-              const originalIdx = top10.indexOf(result)
-              const isSelected = selectedIndex === originalIdx
-              const isTop = originalIdx === 0
-
-              const rowBase = isSelected
-                ? 'bg-dockit-blue/5 border-l-4 border-l-dockit-blue'
-                : isTop
-                ? 'bg-green-50/50 hover:bg-green-50'
-                : 'hover:bg-blue-50/50'
-
-              const stickyBg = isSelected
-                ? 'bg-blue-50'
-                : isTop
-                ? 'bg-green-50/80'
-                : 'bg-white'
-
-              return (
-                <tr
-                  key={originalIdx}
-                  onClick={() => onSelect(originalIdx)}
-                  className={`border-b border-gray-100 cursor-pointer transition-colors duration-150 ${rowBase}`}
-                >
-                  {/* Rank — sticky left */}
-                  <td className={`px-3 py-3 sticky left-0 z-10 ${stickyBg}`}>
-                    <div className="flex items-center gap-1.5">
-                      {originalIdx === 0 ? (
-                        <span className="w-6 h-6 bg-dockit-green text-white text-xs font-bold rounded-full flex items-center justify-center">
-                          1
-                        </span>
-                      ) : (
-                        <span className="w-6 h-6 bg-gray-100 text-gray-500 text-xs font-medium rounded-full flex items-center justify-center">
-                          {originalIdx + 1}
-                        </span>
-                      )}
-                      {isTop && (
-                        <span className="text-yellow-500 text-xs">★</span>
-                      )}
-                    </div>
-                  </td>
-
-                  {/* Name — sticky second column */}
-                  <td className={`px-3 py-3 sticky left-[52px] z-10 relative ${stickyBg} ${STICKY_SHADOW}`}>
-                    <div className="flex flex-col">
-                      <span className={`text-sm font-medium truncate max-w-[150px] ${
-                        result.eliminated ? 'text-red-400 line-through' : isTop ? 'text-dockit-green' : 'text-gray-800'
-                      }`}
-                        title={getName(result)}>
-                        {getName(result)}
-                      </span>
-                      {result.eliminated && (
-                        <span className="text-[10px] text-red-500 font-semibold">{result.elimination_reason || 'Eliminated'}</span>
-                      )}
-                      {result.chembl_id && (
-                        <span className="text-xs text-gray-400 font-mono">{result.chembl_id}</span>
-                      )}
-                    </div>
-                  </td>
-
-                  {/* Affinity */}
-                  <td className="px-3 py-3">
-                    <span className={`text-sm font-mono font-semibold ${
-                      (result.affinity || 0) < -9 ? 'text-green-600' :
-                      (result.affinity || 0) < -7 ? 'text-blue-600' :
-                      'text-gray-600'
-                    }`}>
-                      {result.affinity !== undefined ? Number(result.affinity).toFixed(1) : 'N/A'}
-                    </span>
-                  </td>
-
-                  {/* Composite score */}
-                  <td className="px-3 py-3">
-                    <ScoreBadge value={result.composite_score} low={0} high={1} />
-                  </td>
-
-                  {/* LogP — hidden on mobile by default */}
-                  <td className={`px-3 py-3 ${!showMoreCols ? 'hidden md:table-cell' : ''}`}>
-                    <span className="text-sm text-gray-600 font-mono">
-                      {result.logp !== undefined ? Number(result.logp).toFixed(2) : 'N/A'}
-                    </span>
-                  </td>
-
-                  {/* MW — hidden on mobile by default */}
-                  <td className={`px-3 py-3 ${!showMoreCols ? 'hidden md:table-cell' : ''}`}>
-                    <span className="text-sm text-gray-600">
-                      {result.mw !== undefined ? Math.round(result.mw) : 'N/A'}
-                    </span>
-                  </td>
-
-                  {/* QED */}
-                  <td className="px-3 py-3">
-                    <ScoreBadge value={result.qed} low={0} high={1} />
-                  </td>
-
-                  {/* Agreement (optional) */}
-                  {hasAgreement && (
-                    <td className="px-3 py-3">
-                      <AgreementBadge agreement={result.consensus_detail?.agreement} />
-                    </td>
-                  )}
-
-                  {/* Source (V2) */}
-                  {hasSource && (
-                    <td className="px-3 py-3">
-                      <SourceBadge source={result.source} />
-                    </td>
-                  )}
-
-                  {/* ADMET (V2) */}
-                  {hasAdmet && (
-                    <td className="px-3 py-3">
-                      <AdmetDot admet={result.admet} />
-                    </td>
-                  )}
-
-                  {/* Docking method (V2) */}
-                  {hasMethod && (
-                    <td className="px-3 py-3">
-                      <MethodBadge method={result.docking_method} />
-                    </td>
-                  )}
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
+            </tbody>
+          </table>
+        </div>
       </div>
 
       {/* Legend */}
@@ -386,6 +434,12 @@ export default function ResultsTable({ results, selectedIndex, onSelect }) {
           <span className="w-2 h-2 rounded-full bg-red-400 inline-block" />
           Weak
         </span>
+        {generatedMols.length > 0 && (
+          <span className="flex items-center gap-1">
+            <span className="w-2 h-2 rounded-full bg-purple-400 inline-block" />
+            AI-generated
+          </span>
+        )}
         <span className="ml-auto">Click a row to view the 3D pose</span>
       </div>
     </div>

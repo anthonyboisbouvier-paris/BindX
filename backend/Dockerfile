@@ -16,9 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openbabel libopenbabel-dev \
     2>/dev/null; rm -rf /var/lib/apt/lists/* || true
 
-# Try to install fpocket and vina (non-fatal if not in apt)
+# Try to install autodock-vina (non-fatal if not in apt)
+# Note: fpocket is not in Debian repos; pipeline uses P2Rank or geometric fallback
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    fpocket \
     autodock-vina \
     2>/dev/null; rm -rf /var/lib/apt/lists/* || true
 
@@ -49,6 +49,11 @@ WORKDIR /app
 
 # Install core Python dependencies
 COPY requirements.txt .
+
+# Pre-install CPU-only PyTorch BEFORE other deps to avoid pulling 16GB CUDA version
+# (admet-ai depends on torch, but this project runs without GPU)
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install optional packages (may fail on some platforms)

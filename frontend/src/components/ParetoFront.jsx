@@ -14,28 +14,13 @@ const OBJECTIVES = [
 // Chart layout constants
 // --------------------------------------------------
 const VIEWBOX_W   = 480
-const VIEWBOX_H   = 380
-const PAD_LEFT    = 54
-const PAD_RIGHT   = 20
-const PAD_TOP     = 20
-const PAD_BOTTOM  = 52
-const PLOT_W      = VIEWBOX_W - PAD_LEFT - PAD_RIGHT
-const PLOT_H      = VIEWBOX_H - PAD_TOP  - PAD_BOTTOM
-const TICK_COUNT  = 5
-
-// --------------------------------------------------
-// Map a [0,1] value to pixel coords within the plot
-// --------------------------------------------------
-function toX(v) {
-  const clamped = Math.max(0, Math.min(1, v ?? 0))
-  return PAD_LEFT + clamped * PLOT_W
-}
-
-function toY(v) {
-  const clamped = Math.max(0, Math.min(1, v ?? 0))
-  // SVG Y-axis is inverted: 0 at top, so we invert
-  return PAD_TOP + (1 - clamped) * PLOT_H
-}
+const VIEWBOX_H   = 260
+const MARGIN_L    = 54
+const MARGIN_R    = 20
+const MARGIN_T    = 20
+const MARGIN_B    = 52
+const PLOT_W      = VIEWBOX_W - MARGIN_L - MARGIN_R
+const PLOT_H      = VIEWBOX_H - MARGIN_T  - MARGIN_B
 
 // --------------------------------------------------
 // Tooltip component rendered in SVG via foreignObject
@@ -50,7 +35,7 @@ function Tooltip({ mol, xKey, yKey, svgX, svgY }) {
   let tx = svgX + 12
   let ty = svgY - H / 2
   if (tx + W > VIEWBOX_W - 4) tx = svgX - W - 12
-  if (ty < PAD_TOP) ty = PAD_TOP
+  if (ty < MARGIN_T) ty = MARGIN_T
   if (ty + H > VIEWBOX_H - 4) ty = VIEWBOX_H - H - 4
 
   return (
@@ -93,50 +78,53 @@ function Tooltip({ mol, xKey, yKey, svgX, svgY }) {
 }
 
 // --------------------------------------------------
-// Grid lines
+// Grid lines — receives dynamic ticks and mapping fns
 // --------------------------------------------------
-function GridLines() {
-  const ticks = Array.from({ length: TICK_COUNT + 1 }, (_, i) => i / TICK_COUNT)
+function GridLines({ xTicks, yTicks, toX, toY }) {
   return (
     <g>
-      {ticks.map((t) => {
+      {xTicks.map((t, i) => {
         const x = toX(t)
-        const y = toY(t)
+        const isEdge = i === 0 || i === xTicks.length - 1
         return (
-          <g key={t}>
-            {/* Vertical grid line */}
+          <g key={`xg-${i}`}>
             <line
-              x1={x} y1={PAD_TOP}
-              x2={x} y2={PAD_TOP + PLOT_H}
+              x1={x} y1={MARGIN_T}
+              x2={x} y2={MARGIN_T + PLOT_H}
               stroke="#e5e7eb"
-              strokeWidth={t === 0 || t === 1 ? 1.5 : 0.75}
-              strokeDasharray={t === 0 || t === 1 ? '0' : '3,3'}
+              strokeWidth={isEdge ? 1.5 : 0.75}
+              strokeDasharray={isEdge ? '0' : '3,3'}
             />
-            {/* Horizontal grid line */}
-            <line
-              x1={PAD_LEFT} y1={y}
-              x2={PAD_LEFT + PLOT_W} y2={y}
-              stroke="#e5e7eb"
-              strokeWidth={t === 0 || t === 1 ? 1.5 : 0.75}
-              strokeDasharray={t === 0 || t === 1 ? '0' : '3,3'}
-            />
-            {/* X axis tick label */}
             <text
-              x={x} y={PAD_TOP + PLOT_H + 16}
+              x={x} y={MARGIN_T + PLOT_H + 16}
               textAnchor="middle"
               fontSize={9}
               fill="#9ca3af"
             >
-              {t.toFixed(1)}
+              {Math.abs(t) < 10 ? t.toFixed(2) : t.toFixed(1)}
             </text>
-            {/* Y axis tick label */}
+          </g>
+        )
+      })}
+      {yTicks.map((t, i) => {
+        const y = toY(t)
+        const isEdge = i === 0 || i === yTicks.length - 1
+        return (
+          <g key={`yg-${i}`}>
+            <line
+              x1={MARGIN_L} y1={y}
+              x2={MARGIN_L + PLOT_W} y2={y}
+              stroke="#e5e7eb"
+              strokeWidth={isEdge ? 1.5 : 0.75}
+              strokeDasharray={isEdge ? '0' : '3,3'}
+            />
             <text
-              x={PAD_LEFT - 8} y={y + 3.5}
+              x={MARGIN_L - 8} y={y + 3.5}
               textAnchor="end"
               fontSize={9}
               fill="#9ca3af"
             >
-              {t.toFixed(1)}
+              {Math.abs(t) < 10 ? t.toFixed(2) : t.toFixed(1)}
             </text>
           </g>
         )
@@ -148,7 +136,7 @@ function GridLines() {
 // --------------------------------------------------
 // Pareto front connecting dashed line
 // --------------------------------------------------
-function ParetoLine({ paretoMols, xKey, yKey }) {
+function ParetoLine({ paretoMols, xKey, yKey, toX, toY }) {
   if (paretoMols.length < 2) return null
 
   // Sort by X for the line to connect them left-to-right
@@ -198,6 +186,39 @@ export default function ParetoFront({ molecules, onSelect }) {
   const paretoMols    = mols.filter((m) => m.pareto_front === true)
   const nonParetoMols = mols.filter((m) => m.pareto_front !== true)
   const paretoCount   = paretoMols.length
+
+  // --------------------------------------------------
+  // Dynamic axis ranges from actual data
+  // --------------------------------------------------
+  const xValues = mols.map((d) => (d.pareto_objectives || {})[xKey] ?? 0)
+  const yValues = mols.map((d) => (d.pareto_objectives || {})[yKey] ?? 0)
+
+  const xMin = mols.length ? Math.min(...xValues) : 0
+  const xMax = mols.length ? Math.max(...xValues) : 1
+  const yMin = mols.length ? Math.min(...yValues) : 0
+  const yMax = mols.length ? Math.max(...yValues) : 1
+
+  const xPad = (xMax - xMin) * 0.05 || 0.1
+  const yPad = (yMax - yMin) * 0.05 || 0.1
+  const xRange = [xMin - xPad, xMax + xPad]
+  const yRange = [yMin - yPad, yMax + yPad]
+
+  // Mapping functions using dynamic ranges
+  const toX = useCallback(
+    (val) => MARGIN_L + ((val - xRange[0]) / (xRange[1] - xRange[0])) * PLOT_W,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [xRange[0], xRange[1]]
+  )
+
+  const toY = useCallback(
+    (val) => MARGIN_T + PLOT_H - ((val - yRange[0]) / (yRange[1] - yRange[0])) * PLOT_H,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [yRange[0], yRange[1]]
+  )
+
+  // Generate 5 evenly-spaced ticks across each range
+  const xTicks = Array.from({ length: 5 }, (_, i) => xRange[0] + (i / 4) * (xRange[1] - xRange[0]))
+  const yTicks = Array.from({ length: 5 }, (_, i) => yRange[0] + (i / 4) * (yRange[1] - yRange[0]))
 
   const handleMouseEnter = useCallback((mol, svgX, svgY) => {
     setHovered(mol)
@@ -275,17 +296,17 @@ export default function ParetoFront({ molecules, onSelect }) {
 
           {/* Plot area background */}
           <rect
-            x={PAD_LEFT} y={PAD_TOP}
+            x={MARGIN_L} y={MARGIN_T}
             width={PLOT_W} height={PLOT_H}
             fill="#f9fafb"
             rx={4}
           />
 
           {/* Grid */}
-          <GridLines />
+          <GridLines xTicks={xTicks} yTicks={yTicks} toX={toX} toY={toY} />
 
           {/* Pareto front connecting line (drawn before dots) */}
-          <ParetoLine paretoMols={paretoMols} xKey={xKey} yKey={yKey} />
+          <ParetoLine paretoMols={paretoMols} xKey={xKey} yKey={yKey} toX={toX} toY={toY} />
 
           {/* Non-pareto dots */}
           {nonParetoMols.map((mol, idx) => {
@@ -356,7 +377,7 @@ export default function ParetoFront({ molecules, onSelect }) {
 
           {/* Axis labels */}
           <text
-            x={PAD_LEFT + PLOT_W / 2}
+            x={MARGIN_L + PLOT_W / 2}
             y={VIEWBOX_H - 6}
             textAnchor="middle"
             fontSize={11}
@@ -367,12 +388,12 @@ export default function ParetoFront({ molecules, onSelect }) {
           </text>
           <text
             x={12}
-            y={PAD_TOP + PLOT_H / 2}
+            y={MARGIN_T + PLOT_H / 2}
             textAnchor="middle"
             fontSize={11}
             fontWeight={600}
             fill="#374151"
-            transform={`rotate(-90, 12, ${PAD_TOP + PLOT_H / 2})`}
+            transform={`rotate(-90, 12, ${MARGIN_T + PLOT_H / 2})`}
           >
             {yLabel}
           </text>

@@ -14,7 +14,7 @@ function formatElapsed(seconds) {
 
 // Classify a single result into a category
 function classifyResult(mol) {
-  const score = mol.score_100 ?? mol.composite_score ?? null
+  const score = mol.score_100 ?? (mol.composite_score != null ? mol.composite_score * 100 : null)
   const affinity = mol.affinity ?? mol.affinity_kcal ?? null
 
   // Bad ADMET flag

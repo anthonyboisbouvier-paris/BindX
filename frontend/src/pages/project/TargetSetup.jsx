@@ -1,0 +1,612 @@
+import React, { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { useProject } from '../../contexts/ProjectContext.jsx'
+import { previewTarget, previewSequence, updateProject } from '../../api.js'
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const SOURCE_CONFIGS = {
+  pdb_holo:         { label: 'PDB Holo',        classes: 'bg-green-100 text-green-700 border-green-200' },
+  pdb_experimental: { label: 'PDB Experimental', classes: 'bg-green-100 text-green-700 border-green-200' },
+  alphafold:        { label: 'AlphaFold',         classes: 'bg-yellow-100 text-yellow-700 border-yellow-200' },
+  esmfold:          { label: 'ESMFold',           classes: 'bg-gray-100 text-gray-600 border-gray-200' },
+}
+
+function StructureBadge({ source }) {
+  if (!source) return null
+  const key = Object.keys(SOURCE_CONFIGS).find((k) => source.toLowerCase().includes(k)) || null
+  const cfg = key ? SOURCE_CONFIGS[key] : { label: source, classes: 'bg-gray-100 text-gray-600 border-gray-200' }
+  return (
+    <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold border ${cfg.classes}`}>
+      {cfg.label}
+    </span>
+  )
+}
+
+function DruggabilityBar({ value }) {
+  if (value == null) return <span className="text-gray-400 text-sm">—</span>
+  const pct = Math.round(value * 100)
+  let barColor = 'bg-red-400'
+  let textColor = 'text-red-600'
+  if (value >= 0.7) { barColor = 'bg-[#22c55e]'; textColor = 'text-green-700' }
+  else if (value >= 0.4) { barColor = 'bg-yellow-400'; textColor = 'text-yellow-700' }
+  return (
+    <div className="flex items-center gap-3">
+      <div className="flex-1 h-2.5 bg-gray-100 rounded-full overflow-hidden">
+        <div className={`h-full rounded-full transition-all ${barColor}`} style={{ width: `${pct}%` }} />
+      </div>
+      <span className={`text-sm font-bold tabular-nums w-10 text-right ${textColor}`}>{pct}%</span>
+    </div>
+  )
+}
+
+function ConfidenceDot({ value }) {
+  if (value == null) return null
+  const pct = Math.round(value * 100)
+  const color = value >= 0.9 ? 'text-green-600' : value >= 0.7 ? 'text-yellow-600' : 'text-gray-400'
+  return <span className={`text-xs font-medium ${color}`}>Confidence {pct}%</span>
+}
+
+function StepHeader({ number, title, done, active }) {
+  return (
+    <div className="flex items-center gap-3 mb-4">
+      <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm ${
+        done
+          ? 'bg-[#22c55e] text-white'
+          : active
+          ? 'bg-[#1e3a5f] text-white'
+          : 'bg-gray-100 text-gray-400'
+      }`}>
+        {done ? (
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+          </svg>
+        ) : number}
+      </div>
+      <h2 className="text-lg font-bold text-[#1e3a5f]">{title}</h2>
+    </div>
+  )
+}
+
+// Validate that a string looks like a FASTA or raw AA sequence
+function parseFasta(text) {
+  const lines = text.trim().split('\n')
+  let seq = ''
+  for (const line of lines) {
+    if (line.startsWith('>')) continue
+    seq += line.trim().toUpperCase()
+  }
+  const validAA = /^[ACDEFGHIKLMNPQRSTVWYBXZJUO*]+$/
+  return validAA.test(seq) ? seq : null
+}
+
+// ---------------------------------------------------------------------------
+// ProteinPreviewViewer — lightweight 3D viewer for Target Setup
+// ---------------------------------------------------------------------------
+
+function load3DmolLib() {
+  return new Promise((resolve, reject) => {
+    if (window.$3Dmol) { resolve(window.$3Dmol); return }
+    const existing = document.getElementById('3dmol-script')
+    if (existing) {
+      existing.addEventListener('load', () => resolve(window.$3Dmol))
+      existing.addEventListener('error', reject)
+      return
+    }
+    const script = document.createElement('script')
+    script.id = '3dmol-script'
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/3Dmol/2.0.4/3Dmol-min.js'
+    script.onload = () => window.$3Dmol ? resolve(window.$3Dmol) : reject(new Error('3Dmol unavailable'))
+    script.onerror = () => reject(new Error('Failed to load 3Dmol.js'))
+    document.head.appendChild(script)
+  })
+}
+
+function ProteinPreviewViewer({ pdbUrl, pdbData }) {
+  const containerRef = React.useRef(null)
+  const viewerRef = React.useRef(null)
+  const [viewerError, setViewerError] = React.useState(null)
+
+  useEffect(() => {
+    if (!containerRef.current) return
+    if (!pdbUrl && !pdbData) return
+
+    let cancelled = false
+
+    async function initViewer() {
+      try {
+        const $3Dmol = await load3DmolLib()
+        if (cancelled || !containerRef.current) return
+
+        // Clean up previous viewer
+        if (viewerRef.current) {
+          try { viewerRef.current.clear() } catch (_) {}
+        }
+        containerRef.current.innerHTML = ''
+
+        const viewer = $3Dmol.createViewer(containerRef.current, {
+          backgroundColor: '#f8fafc',
+          antialias: true,
+        })
+        viewerRef.current = viewer
+
+        if (pdbData) {
+          viewer.addModel(pdbData, 'pdb')
+        } else if (pdbUrl) {
+          const resp = await fetch(pdbUrl)
+          if (!resp.ok) throw new Error(`Failed to fetch PDB: ${resp.status}`)
+          const text = await resp.text()
+          viewer.addModel(text, 'pdb')
+        }
+
+        viewer.setStyle({}, { cartoon: { color: '#4a9eff' } })
+        viewer.zoomTo()
+        viewer.render()
+      } catch (err) {
+        if (!cancelled) setViewerError(err.message)
+      }
+    }
+
+    initViewer()
+    return () => { cancelled = true }
+  }, [pdbUrl, pdbData])
+
+  if (viewerError) {
+    return (
+      <div className="h-48 w-full rounded-xl bg-gray-50 border border-gray-200 flex items-center justify-center">
+        <p className="text-xs text-gray-400">3D viewer unavailable: {viewerError}</p>
+      </div>
+    )
+  }
+
+  return (
+    <div
+      ref={containerRef}
+      className="h-64 w-full rounded-xl overflow-hidden border border-gray-200 bg-[#f8fafc]"
+      style={{ position: 'relative' }}
+    />
+  )
+}
+
+// ---------------------------------------------------------------------------
+// TargetSetup — Interactive wizard
+// ---------------------------------------------------------------------------
+
+export default function TargetSetup() {
+  const { project, targetConfig, isTargetConfigured, refresh } = useProject()
+  const navigate = useNavigate()
+
+  // Input mode
+  const [inputMode, setInputMode] = useState('uniprot') // 'uniprot' | 'fasta'
+
+  // Form values
+  const [uniprotId, setUniprotId] = useState('')
+  const [fastaText, setFastaText] = useState('')
+
+  // Preview state
+  const [preview, setPreview] = useState(null)
+  const [loadingPreview, setLoadingPreview] = useState(false)
+  const [previewError, setPreviewError] = useState(null)
+
+  // Selection state
+  const [selectedStructureIdx, setSelectedStructureIdx] = useState(0)
+  const [selectedPocketIdx, setSelectedPocketIdx] = useState(0)
+
+  // Save state
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState(null)
+
+  // Pre-fill from existing config
+  useEffect(() => {
+    if (targetConfig?.uniprot_id) {
+      setUniprotId(targetConfig.uniprot_id)
+      setPreview(targetConfig)
+      setSelectedStructureIdx(targetConfig.selected_structure_idx || 0)
+      setSelectedPocketIdx(targetConfig.selected_pocket_idx || 0)
+    } else if (targetConfig?.sequence) {
+      // FASTA mode: uniprot_id is null but sequence is set
+      setInputMode('fasta')
+      setFastaText(targetConfig.sequence)
+      setPreview(targetConfig)
+      setSelectedStructureIdx(targetConfig.selected_structure_idx || 0)
+      setSelectedPocketIdx(targetConfig.selected_pocket_idx || 0)
+    } else if (project?.uniprot_id) {
+      setUniprotId(project.uniprot_id)
+    }
+  }, [targetConfig, project])
+
+  const handleValidateFasta = async () => {
+    const seq = parseFasta(fastaText)
+    if (!seq) {
+      setPreviewError('Invalid sequence. Only standard amino acid letters are accepted.')
+      return
+    }
+    setLoadingPreview(true)
+    setPreviewError(null)
+    setPreview(null)
+    try {
+      const data = await previewSequence(seq)
+      setPreview(data)
+      setSelectedStructureIdx(0)
+      setSelectedPocketIdx(0)
+    } catch (err) {
+      setPreviewError(err?.userMessage || err?.message || 'Failed to fold sequence.')
+    } finally {
+      setLoadingPreview(false)
+    }
+  }
+
+  const handleValidateUniprot = async () => {
+    if (!uniprotId.trim()) return
+    setLoadingPreview(true)
+    setPreviewError(null)
+    setPreview(null)
+    try {
+      const data = await previewTarget(uniprotId.trim().toUpperCase())
+      setPreview(data)
+      setSelectedStructureIdx(0)
+      setSelectedPocketIdx(0)
+    } catch (err) {
+      setPreviewError(err?.userMessage || err?.message || 'Failed to validate target.')
+    } finally {
+      setLoadingPreview(false)
+    }
+  }
+
+  const handleSave = async () => {
+    if (!preview || !project) return
+    setSaving(true)
+    setSaveError(null)
+    const config = {
+      ...preview,
+      selected_structure_idx: selectedStructureIdx,
+      selected_pocket_idx: selectedPocketIdx,
+      configured_at: new Date().toISOString(),
+    }
+    try {
+      await updateProject(project.id, { target_preview_json: config })
+      await refresh()
+      navigate(`/project/${project.id}/runs`)
+    } catch (err) {
+      setSaveError(err?.userMessage || err?.message || 'Failed to save target configuration.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  // Normalise: prefer preview.structures (array), fall back to [preview.structure]
+  const structures = preview?.structures || (preview?.structure ? [preview.structure] : [])
+  const pockets = preview?.pockets || []
+  const chembl = preview?.chembl_info || null
+  const hasPreview = !!preview && !loadingPreview
+  const hasStructures = structures.length > 0
+  const hasPockets = pockets.length > 0
+  const fastaSeq = fastaText ? parseFasta(fastaText) : null
+
+  return (
+    <div className="space-y-6 max-w-3xl">
+      <div>
+        <h1 className="text-2xl font-bold text-[#1e3a5f]">Target Setup</h1>
+        <p className="text-sm text-gray-400 mt-1">
+          {isTargetConfigured
+            ? 'Reconfigure your target protein, structure, and binding pocket.'
+            : 'Validate a target protein, select a 3D structure, and choose a binding pocket.'}
+        </p>
+      </div>
+
+      {/* Step 1 — Enter Target */}
+      <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
+        <StepHeader number={1} title="Enter Target" done={hasPreview} active={!hasPreview} />
+
+        {/* Mode toggle */}
+        <div className="flex gap-1 p-1 bg-gray-100 rounded-lg mb-4 w-fit">
+          <button
+            type="button"
+            onClick={() => { setInputMode('uniprot'); setPreview(null); setPreviewError(null) }}
+            className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
+              inputMode === 'uniprot' ? 'bg-white text-[#1e3a5f] shadow-sm' : 'text-gray-500 hover:text-gray-700'
+            }`}
+          >
+            UniProt ID
+          </button>
+          <button
+            type="button"
+            onClick={() => { setInputMode('fasta'); setPreview(null); setPreviewError(null) }}
+            className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
+              inputMode === 'fasta' ? 'bg-white text-[#1e3a5f] shadow-sm' : 'text-gray-500 hover:text-gray-700'
+            }`}
+          >
+            FASTA / Sequence
+          </button>
+        </div>
+
+        {inputMode === 'uniprot' ? (
+          <div>
+            <div className="flex gap-3">
+              <input
+                type="text"
+                value={uniprotId}
+                onChange={(e) => setUniprotId(e.target.value.toUpperCase())}
+                onKeyDown={(e) => e.key === 'Enter' && handleValidateUniprot()}
+                placeholder="UniProt ID (e.g. P00533 for EGFR)"
+                className="flex-1 px-4 py-2.5 border border-gray-300 rounded-lg text-sm font-mono focus:ring-2 focus:ring-[#1e3a5f] focus:border-transparent outline-none"
+              />
+              <button
+                onClick={handleValidateUniprot}
+                disabled={loadingPreview || !uniprotId.trim()}
+                className="px-5 py-2.5 bg-[#1e3a5f] text-white font-semibold rounded-lg hover:bg-[#2a4f7c] disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2 text-sm whitespace-nowrap"
+              >
+                {loadingPreview ? (
+                  <>
+                    <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                    </svg>
+                    Validating...
+                  </>
+                ) : 'Validate'}
+              </button>
+            </div>
+            <p className="text-xs text-gray-400 mt-2">
+              Fetches structure from PDB / AlphaFold and detects binding pockets.
+            </p>
+          </div>
+        ) : (
+          <div>
+            <textarea
+              value={fastaText}
+              onChange={(e) => setFastaText(e.target.value)}
+              rows={5}
+              placeholder={">My_protein\nMTEYKLVVVGAGGVGKSALTIQLIQNHFVDE..."}
+              className="w-full px-4 py-3 border border-gray-300 rounded-lg text-sm font-mono focus:ring-2 focus:ring-[#1e3a5f] focus:border-transparent outline-none resize-none"
+            />
+            <div className="flex items-center justify-between mt-2">
+              <p className="text-xs text-gray-400">
+                {fastaSeq
+                  ? <span className="text-green-600 font-medium">{fastaSeq.length} amino acids detected</span>
+                  : 'Paste a FASTA sequence or raw amino acid sequence'}
+              </p>
+              <button
+                onClick={handleValidateFasta}
+                disabled={loadingPreview || !fastaText.trim()}
+                className="px-4 py-2 bg-[#1e3a5f] text-white font-semibold rounded-lg hover:bg-[#2a4f7c] disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm flex items-center gap-2"
+              >
+                {loadingPreview ? (
+                  <>
+                    <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                    </svg>
+                    Folding...
+                  </>
+                ) : 'Use this sequence'}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {previewError && (
+          <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700">
+            {previewError}
+          </div>
+        )}
+
+        {hasPreview && preview.protein_name && (
+          <div className="mt-3 flex items-center gap-2 p-3 bg-green-50 border border-green-200 rounded-lg">
+            <svg className="w-4 h-4 text-green-600 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+            </svg>
+            <p className="text-sm text-green-700 font-medium">{preview.protein_name}</p>
+          </div>
+        )}
+      </div>
+
+      {/* Step 2 — Structure selection (all available options) */}
+      {hasPreview && (
+        <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
+          <StepHeader number={2} title="Select Structure" done={hasStructures} active={hasPreview && !hasStructures} />
+          {hasStructures ? (
+            <div className="space-y-3">
+              {structures.map((s, idx) => (
+                <div
+                  key={idx}
+                  className={`rounded-xl border-2 p-4 cursor-pointer transition-all ${
+                    selectedStructureIdx === idx
+                      ? 'border-[#1e3a5f] bg-blue-50/50 shadow-sm'
+                      : 'border-gray-200 hover:border-gray-300'
+                  }`}
+                  onClick={() => setSelectedStructureIdx(idx)}
+                >
+                  <div className="flex items-start gap-3">
+                    <input
+                      type="radio"
+                      checked={selectedStructureIdx === idx}
+                      onChange={() => setSelectedStructureIdx(idx)}
+                      className="mt-1 accent-[#1e3a5f]"
+                    />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex flex-wrap items-center gap-2 mb-1">
+                        <StructureBadge source={s.source} />
+                        {s.pdb_id && (
+                          <a
+                            href={`https://www.rcsb.org/structure/${s.pdb_id}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-sm font-mono text-[#1e3a5f] underline underline-offset-2 hover:text-[#22c55e]"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            {s.pdb_id}
+                          </a>
+                        )}
+                        {s.recommended && (
+                          <span className="px-1.5 py-0.5 bg-[#22c55e]/10 text-[#22c55e] text-xs font-bold rounded">
+                            Recommended
+                          </span>
+                        )}
+                        <ConfidenceDot value={s.confidence} />
+                      </div>
+                      <div className="flex flex-wrap items-center gap-3 text-xs text-gray-500 mb-1">
+                        {s.resolution && <span>Resolution: {s.resolution} Å</span>}
+                        {s.method && <span>Method: {s.method}</span>}
+                        {s.ligand_id && (
+                          <span className="text-green-600 font-medium">
+                            Co-crystallized: {s.ligand_id}{s.ligand_name ? ` (${s.ligand_name})` : ''}
+                          </span>
+                        )}
+                      </div>
+                      {s.explanation && (
+                        <p className="text-xs text-gray-400 leading-relaxed">{s.explanation}</p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-sm text-gray-400">No structure available for this target.</p>
+          )}
+        </div>
+      )}
+
+      {/* 3D Protein Viewer — shown after structure is selected */}
+      {hasPreview && hasStructures && (() => {
+        const sel = structures[selectedStructureIdx] || structures[0]
+        if (!sel) return null
+        return (
+          <ProteinPreviewViewer
+            pdbUrl={sel.download_url || null}
+            pdbData={sel.pdb_data || null}
+          />
+        )
+      })()}
+
+      {/* Step 3 — Pocket selection */}
+      {hasPreview && (
+        <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
+          <StepHeader number={3} title="Select Binding Pocket" done={hasPockets} active={true} />
+          {hasPockets ? (
+            <>
+              <p className="text-xs text-gray-400 mb-3">
+                {pockets.length} pocket{pockets.length !== 1 ? 's' : ''} detected. Select the one to use for docking.
+              </p>
+              <div className="space-y-2">
+                {pockets.map((pocket, idx) => (
+                  <div
+                    key={idx}
+                    className={`rounded-xl border-2 p-4 cursor-pointer transition-all ${
+                      selectedPocketIdx === idx
+                        ? 'border-[#1e3a5f] bg-blue-50/50 shadow-sm'
+                        : 'border-gray-200 hover:border-gray-300'
+                    }`}
+                    onClick={() => setSelectedPocketIdx(idx)}
+                  >
+                    <div className="flex items-start gap-3">
+                      <input
+                        type="radio"
+                        checked={selectedPocketIdx === idx}
+                        onChange={() => setSelectedPocketIdx(idx)}
+                        className="mt-1 accent-[#1e3a5f]"
+                      />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-sm font-semibold text-[#1e3a5f]">
+                            Pocket {pocket.rank || idx + 1}
+                          </span>
+                          {idx === 0 && (
+                            <span className="px-1.5 py-0.5 bg-[#22c55e]/10 text-[#22c55e] text-xs font-bold rounded">
+                              Recommended
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-4 text-xs text-gray-500 mb-2">
+                          {pocket.n_residues != null && <span>{pocket.n_residues} residues</span>}
+                          {pocket.volume != null && <span>Volume: {Number(pocket.volume).toFixed(0)} Å³</span>}
+                        </div>
+                        {(pocket.probability != null || pocket.druggability != null) && (
+                          <DruggabilityBar value={pocket.probability ?? pocket.druggability} />
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <div className="p-4 bg-gray-50 border border-gray-200 rounded-lg">
+              <p className="text-sm text-gray-500">
+                {inputMode === 'fasta'
+                  ? 'Pockets will be detected automatically when the pipeline runs (structure must be predicted first).'
+                  : 'No pockets detected. The pipeline will attempt automatic pocket detection.'}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Step 4 — ChEMBL info */}
+      {hasPreview && chembl && (
+        <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
+          <StepHeader number={4} title="ChEMBL Data" done={true} active={false} />
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <p className="text-xs text-gray-500 mb-1">Known Actives</p>
+              <p className="text-lg font-bold text-[#1e3a5f]">
+                {chembl.has_data ? (chembl.n_actives || 0).toLocaleString() : '0'}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-500 mb-1">IC50 Data Available</p>
+              <p className="text-lg font-bold text-[#1e3a5f]">{chembl.has_data ? 'Yes' : 'No'}</p>
+            </div>
+          </div>
+          {!chembl.has_data && (
+            <p className="text-xs text-amber-600 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2 mt-3">
+              No ChEMBL data found. You can still screen using ZINC or custom SMILES.
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Step 5 — Save */}
+      {hasPreview && (
+        <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
+          <StepHeader number={5} title="Save Configuration" done={false} active={true} />
+          {saveError && (
+            <div className="mb-3 p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700">
+              {saveError}
+            </div>
+          )}
+          <div className="flex items-center gap-3">
+            <button
+              onClick={handleSave}
+              disabled={saving || !hasStructures}
+              className="flex items-center gap-2 px-6 py-3 bg-[#22c55e] hover:bg-[#16a34a] disabled:bg-gray-300 text-white font-bold rounded-xl shadow transition-colors text-sm"
+            >
+              {saving ? (
+                <>
+                  <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                  Saving...
+                </>
+              ) : (
+                <>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                  </svg>
+                  Save Target Configuration
+                </>
+              )}
+            </button>
+            {isTargetConfigured && (
+              <span className="text-xs text-gray-400">This will update the existing configuration.</span>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}

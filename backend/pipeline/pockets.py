@@ -148,7 +148,10 @@ def detect_pockets_p2rank(pdb_path: str, output_dir: str) -> list[dict]:
         ``rank``, ``residues``, ``volume``.
         Empty list if detection fails.
     """
+    # Check both known P2Rank install locations
     p2rank_bin = "/opt/p2rank/prank"
+    if not Path(p2rank_bin).exists():
+        p2rank_bin = "/opt/p2rank_2.4.2/prank"
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 

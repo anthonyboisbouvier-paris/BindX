@@ -49,6 +49,182 @@ KNOWN_FUNCTIONAL_RESIDUES: dict[str, dict] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# UniProt -> PDB numbering offset helpers
+# ---------------------------------------------------------------------------
+
+def _get_uniprot_pdb_offset(pdb_path: Path, uniprot_id: str) -> int:
+    """Parse PDB DBREF records to find numbering offset between UniProt and PDB.
+
+    The DBREF record maps PDB residue numbers to database (UniProt) residue
+    numbers.  The offset is ``pdb_start - db_start``, so that
+    ``uniprot_residue + offset == pdb_residue``.
+
+    Parameters
+    ----------
+    pdb_path : Path
+        Path to the protein PDB file.
+    uniprot_id : str
+        UniProt accession (e.g. ``"P00533"``).
+
+    Returns
+    -------
+    int
+        Offset to add to UniProt residue numbers to obtain PDB residue
+        numbers.  Returns 0 if no DBREF record is found.
+    """
+    try:
+        with open(pdb_path) as f:
+            for line in f:
+                if line.startswith("DBREF") and uniprot_id.upper() in line.upper():
+                    # DBREF format (PDB standard):
+                    #   cols 15-18 = PDB sequence begin
+                    #   cols 55-60 = database sequence begin
+                    try:
+                        pdb_start = int(line[14:18].strip())
+                        db_start = int(line[55:60].strip())
+                        offset = pdb_start - db_start
+                        logger.info(
+                            "DBREF offset for %s: pdb_start=%d, db_start=%d, offset=%d",
+                            uniprot_id, pdb_start, db_start, offset,
+                        )
+                        return offset
+                    except (ValueError, IndexError):
+                        continue
+    except Exception as exc:
+        logger.debug("Could not read DBREF from %s: %s", pdb_path, exc)
+    return 0  # No offset found, assume same numbering
+
+
+def _map_functional_residues(known_residues: list[int], offset: int) -> set[int]:
+    """Map UniProt residue numbers to PDB numbering.
+
+    Parameters
+    ----------
+    known_residues : list[int]
+        Residue numbers in UniProt numbering.
+    offset : int
+        Offset to add (``pdb_start - db_start``).
+
+    Returns
+    -------
+    set[int]
+        Residue numbers in PDB numbering.
+    """
+    return {r + offset for r in known_residues}
+
+
+def _compute_quality_metrics(
+    interactions: list[dict],
+    uniprot_id: str,
+    pdb_path: Optional[str] = None,
+) -> dict:
+    """Compute interaction quality metrics with offset mapping and fuzzy matching.
+
+    This is the shared quality computation used by all three analysis
+    strategies.  It handles:
+
+    1. UniProt -> PDB numbering offset via DBREF parsing.
+    2. Exact residue matching against mapped functional residues.
+    3. Fuzzy matching (+-2 residues) if exact matching yields 0.
+    4. Safety net: if there are interactions but no functional contacts,
+       assign a floor quality proportional to the number of interactions.
+    5. Re-tagging ``is_functional`` on each interaction dict.
+
+    Parameters
+    ----------
+    interactions : list[dict]
+        Interaction dicts, each containing at least ``residue_number``.
+    uniprot_id : str
+        UniProt accession for functional residue lookup.
+    pdb_path : str | None
+        Path to the protein PDB file (for DBREF offset).  May be ``None``
+        for the mock strategy.
+
+    Returns
+    -------
+    dict
+        Keys: ``functional_contacts``, ``total_functional``,
+        ``interaction_quality``, ``key_hbonds``.
+    """
+    functional = KNOWN_FUNCTIONAL_RESIDUES.get(uniprot_id, {})
+    known_res_uniprot: list[int] = functional.get("residues", [])
+    key_hbond_uniprot: list[int] = functional.get("key_hbond_residues", [])
+
+    # --- Compute offset ---
+    offset = 0
+    if pdb_path:
+        offset = _get_uniprot_pdb_offset(Path(pdb_path), uniprot_id)
+
+    # --- Map residues to PDB numbering ---
+    mapped_residues = _map_functional_residues(known_res_uniprot, offset)
+    mapped_key_hbond = _map_functional_residues(key_hbond_uniprot, offset)
+
+    # --- Build fuzzy set (+-2 around each mapped residue) ---
+    fuzzy_residues: set[int] = set()
+    for r in mapped_residues:
+        for delta in range(-2, 3):
+            fuzzy_residues.add(r + delta)
+
+    # --- Detected residue numbers ---
+    detected_residue_numbers = set(i["residue_number"] for i in interactions)
+
+    # --- Exact matching ---
+    func_contacted = len(detected_residue_numbers & mapped_residues)
+
+    # --- Fuzzy fallback ---
+    if func_contacted == 0 and mapped_residues:
+        func_contacted = len(detected_residue_numbers & fuzzy_residues)
+        if func_contacted > 0:
+            logger.info(
+                "Fuzzy matching found %d functional contacts (exact was 0)",
+                func_contacted,
+            )
+
+    total_func = len(mapped_residues) if mapped_residues else 1
+    quality = func_contacted / total_func if total_func > 0 else 0.5
+
+    # --- Safety net ---
+    n_interactions = len(interactions)
+    if quality == 0.0 and n_interactions > 0:
+        quality = min(n_interactions / 10.0, 0.5)
+        logger.info(
+            "Safety net: %d interactions but 0 functional contacts -> quality=%.2f",
+            n_interactions, quality,
+        )
+
+    # --- Key H-bonds ---
+    key_hb = sum(
+        1 for i in interactions
+        if i["residue_number"] in mapped_key_hbond and "HB" in i.get("type", "")
+    )
+
+    # Also count via fuzzy key H-bond set
+    if key_hb == 0 and mapped_key_hbond:
+        fuzzy_key_hbond: set[int] = set()
+        for r in mapped_key_hbond:
+            for delta in range(-2, 3):
+                fuzzy_key_hbond.add(r + delta)
+        key_hb = sum(
+            1 for i in interactions
+            if i["residue_number"] in fuzzy_key_hbond and "HB" in i.get("type", "")
+        )
+
+    # --- Re-tag is_functional on interactions ---
+    for i in interactions:
+        i["is_functional"] = (
+            i["residue_number"] in mapped_residues
+            or i["residue_number"] in fuzzy_residues
+        )
+
+    return {
+        "functional_contacts": func_contacted,
+        "total_functional": len(known_res_uniprot),
+        "interaction_quality": round(quality, 3),
+        "key_hbonds": key_hb,
+    }
+
+
 # =====================================================================
 # PUBLIC API
 # =====================================================================
@@ -153,22 +329,88 @@ def _analyze_prolif(
     import prolif  # type: ignore[import-untyped]
     import MDAnalysis as mda  # type: ignore[import-untyped]
 
-    # Load protein and ligand
-    prot = mda.Universe(protein_path)
-    lig = mda.Universe(ligand_path)
+    # GNINA output files may have .pdbqt extension but contain SDF/MOL or
+    # real PDBQT data.  MDAnalysis cannot parse either format directly for
+    # ProLIF, so convert to standard PDB via Open Babel first.
+    import subprocess as _sp
 
-    prot_mol = prolif.Molecule.from_mda(prot)
-    lig_mol = prolif.Molecule.from_mda(lig)
+    actual_ligand_path = ligand_path
+    needs_conversion = Path(ligand_path).suffix.lower() in (".pdbqt", ".sdf", ".mol2")
+
+    if needs_conversion or Path(ligand_path).suffix.lower() == ".pdb":
+        # Detect actual format by inspecting first line
+        try:
+            with open(ligand_path, "r") as _fh:
+                first_lines = _fh.read(500)
+        except Exception:
+            first_lines = ""
+
+        if "V2000" in first_lines or "V3000" in first_lines or "$$$$" in first_lines:
+            in_fmt = "sdf"
+        elif "BRANCH" in first_lines or "ENDROOT" in first_lines or "TORSDOF" in first_lines:
+            in_fmt = "pdbqt"
+        elif "ATOM" in first_lines or "HETATM" in first_lines:
+            in_fmt = "pdb"
+            needs_conversion = False  # already PDB
+        else:
+            in_fmt = "pdbqt"  # default guess
+
+    if needs_conversion:
+        pdb_tmp = Path(ligand_path).with_suffix(".prolif.pdb")
+        try:
+            _sp.run(
+                ["obabel", f"-i{in_fmt}", ligand_path, "-opdb", "-O", str(pdb_tmp), "-h"],
+                capture_output=True, text=True, timeout=30, check=True,
+            )
+            if pdb_tmp.stat().st_size > 0:
+                actual_ligand_path = str(pdb_tmp)
+                logger.info("Converted %s -> PDB for ProLIF: %s", in_fmt.upper(), pdb_tmp)
+            else:
+                logger.warning("Conversion produced empty file, trying generic detection")
+                _sp.run(
+                    ["obabel", ligand_path, "-opdb", "-O", str(pdb_tmp), "-h"],
+                    capture_output=True, text=True, timeout=30, check=True,
+                )
+                if pdb_tmp.stat().st_size > 0:
+                    actual_ligand_path = str(pdb_tmp)
+                    logger.info("Generic obabel conversion succeeded: %s", pdb_tmp)
+                else:
+                    raise RuntimeError("obabel produced empty PDB")
+        except Exception as conv_exc:
+            logger.warning("Ligand->PDB conversion failed: %s", conv_exc)
+            raise
+
+    # Ensure protein PDB has hydrogens (ProLIF requires explicit H)
+    protein_h_path = protein_path
+    prot_pdb = Path(protein_path)
+    if prot_pdb.suffix.lower() == ".pdb":
+        prot_h_tmp = prot_pdb.with_suffix(".prolif_h.pdb")
+        if not prot_h_tmp.exists():
+            try:
+                _sp.run(
+                    ["obabel", "-ipdb", protein_path, "-opdb", "-O", str(prot_h_tmp), "-h"],
+                    capture_output=True, text=True, timeout=60, check=True,
+                )
+                if prot_h_tmp.stat().st_size > 0:
+                    protein_h_path = str(prot_h_tmp)
+                    logger.info("Added H to protein for ProLIF: %s", prot_h_tmp)
+            except Exception:
+                logger.warning("Could not add H to protein, using original")
+        elif prot_h_tmp.stat().st_size > 0:
+            protein_h_path = str(prot_h_tmp)
+
+    # Load protein and ligand
+    prot = mda.Universe(protein_h_path)
+    lig = mda.Universe(actual_ligand_path)
+
+    prot_mol = prolif.Molecule.from_mda(prot, force=True)
+    lig_mol = prolif.Molecule.from_mda(lig, force=True)
 
     # Compute interaction fingerprint
     fp = prolif.Fingerprint()
     fp.run_from_iterable([lig_mol], prot_mol)
 
-    # Extract interactions
-    functional = KNOWN_FUNCTIONAL_RESIDUES.get(uniprot_id, {})
-    known_res = set(functional.get("residues", []))
-    key_hbond_res = set(functional.get("key_hbond_residues", []))
-
+    # Extract interactions (is_functional will be re-tagged by _compute_quality_metrics)
     interactions: list[dict] = []
     ifp = fp.ifp[0]  # First (only) frame
 
@@ -182,29 +424,20 @@ def _analyze_prolif(
                     "residue": res_name,
                     "residue_number": res_num,
                     "type": int_type,
-                    "is_functional": res_num in known_res,
+                    "is_functional": False,  # re-tagged below
                 })
 
-    func_contacted = len(set(
-        i["residue_number"] for i in interactions if i["is_functional"]
-    ))
-    total_func = len(known_res) if known_res else 1
-    quality = func_contacted / total_func if total_func > 0 else 0.5
-    key_hb = sum(
-        1 for i in interactions
-        if i["residue_number"] in key_hbond_res and "HB" in i["type"]
-    )
+    # Compute quality with offset mapping + fuzzy matching + safety net
+    metrics = _compute_quality_metrics(interactions, uniprot_id, pdb_path=protein_path)
 
     return {
         "interactions": interactions,
-        "functional_contacts": func_contacted,
-        "total_functional": len(known_res),
-        "interaction_quality": round(quality, 3),
-        "key_hbonds": key_hb,
+        **metrics,
         "method": "prolif",
         "summary": (
-            f"Functional contacts: {func_contacted}/{len(known_res)} key residues "
-            f"({quality:.0%}) - {key_hb} key H-bonds"
+            f"Functional contacts: {metrics['functional_contacts']}/{metrics['total_functional']} "
+            f"key residues ({metrics['interaction_quality']:.0%}) - "
+            f"{metrics['key_hbonds']} key H-bonds"
         ),
     }
 
@@ -238,10 +471,6 @@ def _analyze_rdkit_distance(
         Interaction analysis result.
     """
     from rdkit import Chem  # type: ignore[import-untyped]
-
-    functional = KNOWN_FUNCTIONAL_RESIDUES.get(uniprot_id, {})
-    known_res = set(functional.get("residues", []))
-    key_hbond_res = set(functional.get("key_hbond_residues", []))
 
     # Parse protein PDB to extract atom coordinates
     protein_atoms = _parse_pdb_atoms(protein_path)
@@ -279,7 +508,7 @@ def _analyze_rdkit_distance(
                     "residue_number": res_num,
                     "type": int_type,
                     "distance": round(dist, 2),
-                    "is_functional": res_num in known_res,
+                    "is_functional": False,  # re-tagged below
                 })
 
     # Deduplicate by residue (keep closest contact per residue)
@@ -290,26 +519,17 @@ def _analyze_rdkit_distance(
             residue_best[rn] = interaction
     interactions = list(residue_best.values())
 
-    func_contacted = len(set(
-        i["residue_number"] for i in interactions if i["is_functional"]
-    ))
-    total_func = len(known_res) if known_res else 1
-    quality = func_contacted / total_func if total_func > 0 else 0.5
-    key_hb = sum(
-        1 for i in interactions
-        if i["residue_number"] in key_hbond_res and "HB" in i["type"]
-    )
+    # Compute quality with offset mapping + fuzzy matching + safety net
+    metrics = _compute_quality_metrics(interactions, uniprot_id, pdb_path=protein_path)
 
     return {
         "interactions": interactions,
-        "functional_contacts": func_contacted,
-        "total_functional": len(known_res),
-        "interaction_quality": round(quality, 3),
-        "key_hbonds": key_hb,
+        **metrics,
         "method": "rdkit_distance",
         "summary": (
-            f"Functional contacts: {func_contacted}/{len(known_res)} key residues "
-            f"({quality:.0%}) - {key_hb} key H-bonds"
+            f"Functional contacts: {metrics['functional_contacts']}/{metrics['total_functional']} "
+            f"key residues ({metrics['interaction_quality']:.0%}) - "
+            f"{metrics['key_hbonds']} key H-bonds"
         ),
     }
 
@@ -481,7 +701,6 @@ def _mock_interactions(uniprot_id: str, smiles: str = "") -> dict:
     """
     functional = KNOWN_FUNCTIONAL_RESIDUES.get(uniprot_id, {})
     known_res = functional.get("residues", [718, 745, 793, 855])
-    key_hbond = functional.get("key_hbond_residues", [793])
 
     # Generate deterministic mock interactions based on smiles hash
     h = int(hashlib.md5((smiles or uniprot_id).encode()).hexdigest()[:8], 16)
@@ -497,35 +716,26 @@ def _mock_interactions(uniprot_id: str, smiles: str = "") -> dict:
         res_num = known_res[res_idx] if res_idx < len(known_res) else 700 + (h + i) % 200
         res_name = residue_names[(h + i) % len(residue_names)]
         int_type = interaction_types[(h + i * 3) % len(interaction_types)]
-        is_func = res_num in known_res
 
         interactions.append({
             "residue": f"{res_name}{res_num}",
             "residue_number": res_num,
             "type": int_type,
-            "is_functional": is_func,
+            "is_functional": False,  # re-tagged below
         })
 
-    func_contacted = len(set(
-        i["residue_number"] for i in interactions if i["is_functional"]
-    ))
-    total_func = len(known_res)
-    quality = func_contacted / total_func if total_func > 0 else 0.5
-    key_hb = sum(
-        1 for i in interactions
-        if i["residue_number"] in key_hbond and "HB" in i["type"]
-    )
+    # Mock has no PDB file, so no offset mapping -- use _compute_quality_metrics
+    # with pdb_path=None (offset will be 0, matching UniProt numbering directly)
+    metrics = _compute_quality_metrics(interactions, uniprot_id, pdb_path=None)
 
     return {
         "interactions": interactions,
-        "functional_contacts": func_contacted,
-        "total_functional": total_func,
-        "interaction_quality": round(quality, 3),
-        "key_hbonds": key_hb,
+        **metrics,
         "method": "mock",
         "summary": (
-            f"Functional contacts: {func_contacted}/{total_func} key residues "
-            f"({quality:.0%}) - {key_hb} key H-bonds"
+            f"Functional contacts: {metrics['functional_contacts']}/{metrics['total_functional']} "
+            f"key residues ({metrics['interaction_quality']:.0%}) - "
+            f"{metrics['key_hbonds']} key H-bonds"
         ),
     }
 

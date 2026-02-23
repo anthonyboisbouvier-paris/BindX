@@ -1,10 +1,248 @@
-import React, { useState } from 'react'
-import { createJob } from '../api.js'
+import React, { useState, useEffect, useRef } from 'react'
+import { createJob, previewTarget } from '../api.js'
 import InfoTip from './InfoTip.jsx'
 
 const EXAMPLE_UNIPROT = 'P00533'
 const VALID_AA = /^[ACDEFGHIKLMNPQRSTVWY]+$/
 
+// ---------------------------------------------------------------------------
+// TargetPreviewCard — purely informational, renders preview API response
+// ---------------------------------------------------------------------------
+function TargetPreviewCard({ preview, loading }) {
+  if (loading) {
+    return (
+      <div className="rounded-xl border border-blue-200 bg-blue-50 px-5 py-4 animate-pulse space-y-2">
+        <div className="h-4 bg-blue-200 rounded w-2/3" />
+        <div className="h-3 bg-blue-100 rounded w-1/2" />
+        <div className="h-3 bg-blue-100 rounded w-3/4" />
+      </div>
+    )
+  }
+
+  if (!preview) return null
+
+  const {
+    structure_source,
+    pdb_id,
+    resolution,
+    method,
+    cocrystal_ligand,
+    explanation,
+    pockets,
+    selected_pocket,
+    chembl_actives,
+    chembl_ic50,
+  } = preview
+
+  // Label for the structure source
+  const sourceLabel = structure_source === 'experimental'
+    ? 'PDB Experimental'
+    : structure_source === 'alphafold'
+    ? 'AlphaFold Predicted'
+    : structure_source === 'esmfold'
+    ? 'ESMFold Predicted'
+    : structure_source || 'Unknown'
+
+  const sourceColor = structure_source === 'experimental'
+    ? 'text-dockit-green'
+    : 'text-amber-600'
+
+  return (
+    <div className="rounded-xl border border-blue-200 bg-blue-50 px-5 py-4 space-y-3 text-sm">
+
+      {/* Structure row */}
+      <div className="flex items-start gap-2">
+        <span className="mt-0.5 text-base leading-none">🏗</span>
+        <div>
+          <span className="font-semibold text-dockit-blue">Structure: </span>
+          <span className={`font-medium ${sourceColor}`}>{sourceLabel}</span>
+          {pdb_id && (
+            <a
+              href={`https://www.rcsb.org/structure/${pdb_id}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="ml-1.5 font-mono text-xs text-dockit-blue underline hover:text-blue-700"
+            >
+              {pdb_id}
+            </a>
+          )}
+          <div className="text-xs text-gray-500 mt-0.5 space-x-2">
+            {resolution && <span>Resolution: {resolution} A</span>}
+            {method && <span>| Method: {method}</span>}
+            {cocrystal_ligand && (
+              <span>| Co-crystallized ligand: <strong>{cocrystal_ligand}</strong></span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Explanation */}
+      {explanation && (
+        <div className="flex items-start gap-2">
+          <span className="mt-0.5 text-base leading-none">📝</span>
+          <p className="text-xs text-gray-600 leading-relaxed">{explanation}</p>
+        </div>
+      )}
+
+      {/* Pockets */}
+      {pockets && pockets.length > 0 && (
+        <div className="flex items-start gap-2">
+          <span className="mt-0.5 text-base leading-none">📍</span>
+          <div>
+            <span className="font-semibold text-dockit-blue">
+              Pockets: {pockets.length} detected
+            </span>
+            {selected_pocket && (
+              <div className="mt-0.5 text-xs text-dockit-green font-medium">
+                Selected: #{selected_pocket.rank} {selected_pocket.source}
+                {selected_pocket.probability != null && (
+                  <span className="ml-1 text-gray-500">
+                    ({(selected_pocket.probability * 100).toFixed(0)}% probability
+                    {selected_pocket.residues ? `, ${selected_pocket.residues} residues` : ''})
+                  </span>
+                )}
+              </div>
+            )}
+            {pockets.length > 1 && (
+              <div className="mt-0.5 text-xs text-gray-400">
+                {'Others: '}
+                {pockets
+                  .filter((_, i) => i !== 0)
+                  .slice(0, 3)
+                  .map((p, i) => (
+                    <span key={i}>
+                      {i > 0 && ', '}
+                      #{p.rank} {p.method || p.source || 'P2Rank'}
+                      {p.probability != null && ` (${(p.probability * 100).toFixed(0)}%)`}
+                    </span>
+                  ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ChEMBL stats */}
+      {chembl_actives != null && (
+        <div className="flex items-center gap-2 text-xs text-gray-500 border-t border-blue-100 pt-2 mt-1">
+          <span className="text-base leading-none">💊</span>
+          <span>
+            ChEMBL: <strong className="text-dockit-blue">{chembl_actives.toLocaleString()}</strong> known actives
+            {chembl_ic50 != null && (
+              <>, <strong className="text-dockit-blue">{chembl_ic50.toLocaleString()}</strong> with IC50</>
+            )}
+          </span>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// CompoundLibrarySelector — radio group for compound source
+// ---------------------------------------------------------------------------
+function CompoundLibrarySelector({ value, onChange, preview, loading }) {
+  const chemblActives = preview?.chembl_actives ?? null
+  const chemblIc50    = preview?.chembl_ic50 ?? null
+  const uniprotId     = preview?.uniprot_id ?? ''
+
+  const options = [
+    {
+      id: 'auto',
+      label: 'Auto (Recommended)',
+      description: 'Let the system automatically choose the best strategy based on available data.',
+      tip: 'The system picks ChEMBL when the target has >10 known actives, otherwise falls back to ZINC.',
+      badge: 'Default',
+    },
+    {
+      id: 'chembl',
+      label: 'ChEMBL Known Actives',
+      description: 'Screen known active compounds from the ChEMBL database. Best when the target has known ligands.',
+      tip: 'Recommended when your target has >10 known active compounds in ChEMBL.',
+      meta: chemblActives != null
+        ? `${chemblActives.toLocaleString()} actives found${chemblIc50 != null ? ` (${chemblIc50.toLocaleString()} with IC50)` : ''}${uniprotId ? ` for ${uniprotId}` : ''}`
+        : loading ? 'Loading ChEMBL data...' : null,
+    },
+    {
+      id: 'zinc',
+      label: 'ZINC Drug-like',
+      description: 'Screen a diverse library of commercially available drug-like molecules from ZINC.',
+      tip: 'Good for targets with few or no known actives. Provides diverse chemical space.',
+    },
+    {
+      id: 'custom',
+      label: 'Custom SMILES',
+      description: 'Provide your own molecules to screen.',
+      tip: 'Enter one SMILES string per line. Only these molecules will be docked.',
+    },
+  ]
+
+  return (
+    <div className="space-y-2">
+      {options.map((opt) => (
+        <label
+          key={opt.id}
+          className={`flex items-start gap-3 p-3 rounded-lg cursor-pointer border transition-all ${
+            value === opt.id
+              ? 'border-dockit-blue bg-blue-50/50'
+              : 'border-gray-100 hover:border-gray-200'
+          }`}
+        >
+          <input
+            type="radio"
+            name="compound_source"
+            value={opt.id}
+            checked={value === opt.id}
+            onChange={() => onChange(opt.id)}
+            className="mt-0.5 text-dockit-blue shrink-0"
+          />
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-sm font-medium text-gray-700">{opt.label}</span>
+              {opt.badge && (
+                <span className="text-xs px-2 py-0.5 bg-dockit-blue text-white rounded-full">
+                  {opt.badge}
+                </span>
+              )}
+              <InfoTip text={opt.tip} />
+            </div>
+            <p className="text-xs text-gray-400 mt-0.5">{opt.description}</p>
+            {opt.meta && (
+              <p className="text-xs text-dockit-green font-medium mt-0.5">{opt.meta}</p>
+            )}
+          </div>
+        </label>
+      ))}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// CompoundSourceSummary — one-line badge shown below the accordion header
+// ---------------------------------------------------------------------------
+function CompoundSourceSummary({ source, preview }) {
+  const chemblActives = preview?.chembl_actives
+  const uniprotId     = preview?.uniprot_id ?? ''
+
+  const labels = {
+    auto:    'Auto (system decides)',
+    chembl:  chemblActives != null
+               ? `ChEMBL (${chemblActives.toLocaleString()} known actives${uniprotId ? ` for ${uniprotId}` : ''})`
+               : 'ChEMBL known actives',
+    zinc:    'ZINC drug-like library',
+    custom:  'Custom SMILES input',
+  }
+
+  return (
+    <span className="text-xs text-dockit-blue font-medium bg-blue-50 px-2 py-0.5 rounded-full">
+      Source: {labels[source] || source}
+    </span>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Main component
+// ---------------------------------------------------------------------------
 export default function InputForm({ onJobCreated }) {
   const [inputMode, setInputMode] = useState('uniprot')
   const [uniprotId, setUniprotId] = useState('')
@@ -12,8 +250,14 @@ export default function InputForm({ onJobCreated }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
 
+  // Target preview state
+  const [targetPreview, setTargetPreview] = useState(null)
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const debounceRef = useRef(null)
+
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [precision, setPrecision] = useState('standard')
+  const [compoundSource, setCompoundSource] = useState('auto')
   const [customSmiles, setCustomSmiles] = useState('')
   const [dockingEngine, setDockingEngine] = useState('auto')
   const [maxLigands, setMaxLigands] = useState(50)
@@ -23,9 +267,76 @@ export default function InputForm({ onJobCreated }) {
     ? { min: 10, max: 5000 }
     : { min: 10, max: 500 }
 
+  // ------------------------------------------------------------------
+  // Debounced preview fetch whenever uniprotId changes (uniprot mode)
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    if (inputMode !== 'uniprot') return
+
+    const trimmed = uniprotId.trim().toUpperCase()
+
+    // Clear stale preview immediately when input is too short
+    if (trimmed.length < 4) {
+      setTargetPreview(null)
+      setPreviewLoading(false)
+      if (debounceRef.current) clearTimeout(debounceRef.current)
+      return
+    }
+
+    // Show loading skeleton after a short delay so fast typers don't flicker
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+
+    debounceRef.current = setTimeout(async () => {
+      setPreviewLoading(true)
+      try {
+        const raw = await previewTarget(trimmed)
+        // Flatten nested backend response into the shape our components expect
+        const struct = raw.structure || {}
+        const chembl = raw.chembl_info || {}
+        const pocketsList = (raw.pockets || [])
+        const selected = pocketsList.find(p => p.selected) || null
+        setTargetPreview({
+          uniprot_id: raw.uniprot_id,
+          protein_name: raw.protein_name,
+          structure_source: struct.source?.replace('pdb_experimental', 'experimental') || null,
+          pdb_id: struct.pdb_id || null,
+          resolution: struct.resolution || null,
+          method: struct.method || null,
+          cocrystal_ligand: struct.ligand_id || struct.ligand_name || null,
+          explanation: struct.explanation || null,
+          pockets: pocketsList,
+          selected_pocket: selected ? {
+            rank: selected.rank,
+            source: selected.method || 'P2Rank',
+            probability: selected.probability,
+            residues: selected.residues_count || null,
+          } : null,
+          chembl_actives: chembl.has_data ? chembl.n_actives : null,
+          chembl_ic50: chembl.has_data ? chembl.n_with_ic50 : null,
+        })
+      } catch {
+        // Preview is non-critical — fail silently
+        setTargetPreview(null)
+      } finally {
+        setPreviewLoading(false)
+      }
+    }, 600)
+
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current)
+    }
+  }, [uniprotId, inputMode])
+
+  // Clear preview when switching to sequence mode
+  useEffect(() => {
+    if (inputMode === 'sequence') {
+      setTargetPreview(null)
+      setPreviewLoading(false)
+    }
+  }, [inputMode])
+
   const handlePrecisionChange = (value) => {
     setPrecision(value)
-    // Reset max_ligands to the default for the chosen mode
     if (value === 'deep') setMaxLigands(500)
     else setMaxLigands(50)
   }
@@ -56,6 +367,7 @@ export default function InputForm({ onJobCreated }) {
       submitSequence = sequence.replace(/^>.*\n?/gm, '').replace(/\s/g, '').toUpperCase()
     }
 
+    // Build compound source params
     const smilesLines = customSmiles.trim()
       ? customSmiles.split('\n').map(s => s.trim()).filter(s => s.length > 0)
       : null
@@ -66,12 +378,25 @@ export default function InputForm({ onJobCreated }) {
         mode: precision,
         docking_engine: dockingEngine,
       }
+
       if (precision !== 'rapid') {
         params.max_ligands = Number(maxLigands)
       }
       if (submitUniprotId) params.uniprot_id = submitUniprotId
-      if (submitSequence) params.sequence = submitSequence
-      if (smilesLines) params.smiles_list = smilesLines
+      if (submitSequence)  params.sequence   = submitSequence
+
+      // Compound source
+      if (compoundSource === 'chembl') {
+        params.use_chembl = true
+        params.use_zinc   = false
+      } else if (compoundSource === 'zinc') {
+        params.use_chembl = false
+        params.use_zinc   = true
+      } else if (compoundSource === 'custom') {
+        if (smilesLines) params.smiles_list = smilesLines
+      }
+      // 'auto': let backend decide — don't set use_chembl / use_zinc
+
       if (precision === 'deep' && notificationEmail.trim()) {
         params.notification_email = notificationEmail.trim()
       }
@@ -86,6 +411,9 @@ export default function InputForm({ onJobCreated }) {
   }
 
   const cleanSequence = sequence.replace(/^>.*\n?/gm, '').replace(/\s/g, '')
+
+  // Show preview section when: uniprot mode AND (loading OR we have data)
+  const showPreview = inputMode === 'uniprot' && (previewLoading || targetPreview !== null)
 
   return (
     <div className="max-w-2xl mx-auto">
@@ -173,6 +501,13 @@ export default function InputForm({ onJobCreated }) {
             </div>
           )}
 
+          {/* ----------------------------------------------------------------
+              Target Preview Card — shown between input and advanced options
+          ---------------------------------------------------------------- */}
+          {showPreview && (
+            <TargetPreviewCard preview={targetPreview} loading={previewLoading} />
+          )}
+
           {/* Advanced options accordion */}
           <div className="border border-gray-200 rounded-xl overflow-hidden">
             <button
@@ -181,14 +516,20 @@ export default function InputForm({ onJobCreated }) {
               className="w-full flex items-center justify-between px-4 py-3 text-sm text-gray-600 hover:bg-gray-50 transition-colors"
             >
               <span className="font-medium">Advanced Options</span>
-              <svg
-                className={`w-4 h-4 transition-transform ${showAdvanced ? 'rotate-180' : ''}`}
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-              </svg>
+              <div className="flex items-center gap-2">
+                {/* Source badge — visible even when accordion is collapsed */}
+                {!showAdvanced && (
+                  <CompoundSourceSummary source={compoundSource} preview={targetPreview} />
+                )}
+                <svg
+                  className={`w-4 h-4 transition-transform ${showAdvanced ? 'rotate-180' : ''}`}
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                </svg>
+              </div>
             </button>
 
             {showAdvanced && (
@@ -202,9 +543,9 @@ export default function InputForm({ onJobCreated }) {
                   </label>
                   <div className="space-y-2">
                     {[
-                      { value: 'rapid', label: 'Quick', desc: '50 molecules, ~5 min — docking + scoring', icon: '⚡' },
-                      { value: 'standard', label: 'Standard', desc: '500 molecules, ~15 min — docking + ADMET + retrosynthesis', icon: '🎯', recommended: true },
-                      { value: 'deep', label: 'Deep', desc: 'Full ChEMBL database 2.4M, ~3h — 5 passes + ADMET + retrosynthesis', icon: '🔬' },
+                      { value: 'rapid',    label: 'Quick',    desc: '50 molecules, ~5 min — docking + scoring', icon: 'Quick' },
+                      { value: 'standard', label: 'Standard', desc: '500 molecules, ~15 min — docking + ADMET + retrosynthesis', icon: 'Std', recommended: true },
+                      { value: 'deep',     label: 'Deep',     desc: 'Full ChEMBL database 2.4M, ~3h — 5 passes + ADMET + retrosynthesis', icon: 'Deep' },
                     ].map(opt => (
                       <label
                         key={opt.value}
@@ -224,7 +565,7 @@ export default function InputForm({ onJobCreated }) {
                         />
                         <div>
                           <span className="text-sm font-medium text-gray-700">
-                            {opt.icon} {opt.label}
+                            {opt.label}
                             {opt.recommended && (
                               <span className="ml-2 text-xs px-2 py-0.5 bg-dockit-blue text-white rounded-full">
                                 Recommended
@@ -258,19 +599,40 @@ export default function InputForm({ onJobCreated }) {
                   </div>
                 )}
 
-                {/* Custom SMILES */}
+                {/* Compound Library Selector */}
                 <div>
-                  <label className="text-sm font-medium text-gray-700 mb-1 block">
-                    Add your own molecules (SMILES, one per line)
+                  <label className="text-sm font-medium text-gray-700 mb-2 block flex items-center">
+                    Compound Library
+                    <InfoTip text="Choose the source of molecules to screen against your target. 'Auto' is recommended for most use cases." />
                   </label>
-                  <textarea
-                    value={customSmiles}
-                    onChange={(e) => setCustomSmiles(e.target.value)}
-                    placeholder={"CCO\nCCN\n..."}
-                    rows={3}
-                    disabled={loading}
-                    className="input-field font-mono text-xs resize-none w-full"
+                  <CompoundLibrarySelector
+                    value={compoundSource}
+                    onChange={setCompoundSource}
+                    preview={targetPreview}
+                    loading={previewLoading}
                   />
+
+                  {/* Custom SMILES textarea — only shown when custom is selected */}
+                  {compoundSource === 'custom' && (
+                    <div className="mt-3">
+                      <label className="text-xs font-medium text-gray-600 mb-1 block">
+                        SMILES — one molecule per line
+                      </label>
+                      <textarea
+                        value={customSmiles}
+                        onChange={(e) => setCustomSmiles(e.target.value)}
+                        placeholder={"CCO\nCCN\n..."}
+                        rows={4}
+                        disabled={loading}
+                        className="input-field font-mono text-xs resize-none w-full"
+                      />
+                      <p className="text-xs text-gray-400 mt-1">
+                        {customSmiles.trim()
+                          ? `${customSmiles.split('\n').filter(l => l.trim()).length} molecule(s) entered`
+                          : 'Enter at least one valid SMILES string.'}
+                      </p>
+                    </div>
+                  )}
                 </div>
 
                 {/* Docking engine + Max candidates — standard and deep only */}

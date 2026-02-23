@@ -217,7 +217,7 @@ export default function ProgressBar({ jobId, onComplete, onError }) {
       }
     } catch (err) {
       console.error('[ProgressBar] Polling error:', err)
-      if (err.response?.status >= 500) {
+      if (err.response?.status >= 400) {
         clearInterval(intervalRef.current)
         clearInterval(timerRef.current)
         const msg = err.userMessage || 'Communication error with the server.'

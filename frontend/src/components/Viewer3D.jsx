@@ -193,6 +193,7 @@ export default function Viewer3D({
   const [viewerReady, setViewerReady] = useState(false)
   const [currentStyle, setCurrentStyle] = useState('cartoon')
   const [ligandLoaded, setLigandLoaded] = useState(false)
+  const surfaceActiveRef = useRef(false)
 
   const topResults = results?.results?.slice(0, 10) || []
 
@@ -260,8 +261,11 @@ export default function Viewer3D({
       }
 
       const poseData = await response.text()
-      // PDBQT is PDB-compatible for coordinate reading; 3Dmol handles it as pdb
-      viewer.addModel(poseData, 'pdb')
+      // Detect SDF format first, then PDBQT, then fall back to PDB
+      const isSdf = /V2000|V3000|\$\$\$\$/.test(poseData)
+      const isPdbqt = /BRANCH|ENDROOT|TORSDOF/.test(poseData)
+      const format = isSdf ? 'sdf' : isPdbqt ? 'pdbqt' : 'pdb'
+      viewer.addModel(poseData, format)
 
       // Last model is the ligand
       const models2 = viewer.getModelList()
@@ -286,7 +290,10 @@ export default function Viewer3D({
         }
       }
 
-      viewer.zoomTo({ model: ligandModel })
+      // Zoom to fit all loaded models (protein + ligand) so the ligand
+      // appears in context rather than isolated
+      viewer.zoomTo()
+      viewer.zoom(1.2)
       viewer.render()
       setLigandLoaded(true)
     } catch (err) {
@@ -303,13 +310,38 @@ export default function Viewer3D({
     const proteinModel = models?.[0]
     if (!proteinModel) return
 
-    const styleObj = style === 'cartoon'
-      ? { cartoon: { color: '#4a9eff', opacity: 0.85 } }
-      : style === 'surface'
-      ? { surface: { opacity: 0.6, color: '#4a9eff' } }
-      : { stick: { colorscheme: 'default', radius: 0.15 } }
+    // Always remove any existing surface before applying a new style so we
+    // never accumulate stacked surfaces when the button is clicked repeatedly.
+    if (surfaceActiveRef.current) {
+      try { viewer.removeAllSurfaces() } catch (_) {}
+      surfaceActiveRef.current = false
+    }
 
-    viewer.setStyle({ model: proteinModel }, styleObj)
+    if (style === 'surface') {
+      // Show a translucent cartoon underneath the surface so the backbone
+      // silhouette is still readable, then overlay the VDW surface.
+      viewer.setStyle({ model: proteinModel }, {
+        cartoon: { color: '#4a9eff', opacity: 0.3 },
+      })
+      const $3Dmol = window.$3Dmol
+      const surfaceType = $3Dmol?.SurfaceType?.VDW ?? 1
+      viewer.addSurface(
+        surfaceType,
+        { opacity: 0.7, color: '#4a9eff' },
+        { model: proteinModel }
+      )
+      surfaceActiveRef.current = true
+    } else if (style === 'cartoon') {
+      viewer.setStyle({ model: proteinModel }, {
+        cartoon: { color: '#4a9eff', opacity: 0.85 },
+      })
+    } else {
+      // 'stick' style for protein backbone
+      viewer.setStyle({ model: proteinModel }, {
+        stick: { colorscheme: 'default', radius: 0.15 },
+      })
+    }
+
     viewer.render()
   }, [])
 

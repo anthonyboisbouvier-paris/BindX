@@ -19,6 +19,30 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# NaN-safe helpers
+# ---------------------------------------------------------------------------
+
+def _safe_float(val) -> float:
+    """Convert to float, treating NaN and None as 0.0."""
+    try:
+        v = float(val if val is not None else 0.0)
+        return v if not math.isnan(v) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _safe_zscore(val: float, mu: float, sd: float) -> float:
+    """Compute z-score safely, returning 0.0 on any edge case."""
+    if sd <= 0:
+        return 0.0
+    try:
+        z = (val - mu) / sd
+        return 0.0 if (math.isnan(z) or math.isinf(z)) else round(z, 3)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
 # PAINS SMARTS patterns (Pan-Assay INterference compoundS)
 # Simplified set of common PAINS substructure alerts
 # ---------------------------------------------------------------------------
@@ -615,9 +639,9 @@ def enrich_consensus_detail(molecules: list[dict]) -> list[dict]:
     cnn_aff_vals: list[float] = []
 
     for mol in molecules:
-        vina_vals.append(float(mol.get("vina_score", 0.0) or 0.0))
-        cnn_score_vals.append(float(mol.get("cnn_score", 0.0) or 0.0))
-        cnn_aff_vals.append(float(mol.get("cnn_affinity", 0.0) or 0.0))
+        vina_vals.append(_safe_float(mol.get("vina_score")))
+        cnn_score_vals.append(_safe_float(mol.get("cnn_score")))
+        cnn_aff_vals.append(_safe_float(mol.get("cnn_affinity")))
 
     # -- Compute mean and std for z-scores ---------------------------------
     def _mean_std(vals: list[float]) -> tuple[float, float]:
@@ -651,9 +675,9 @@ def enrich_consensus_detail(molecules: list[dict]) -> list[dict]:
     for i, mol in enumerate(molecules):
         # Z-scores: for vina, more negative is better so we negate
         # (z_vina > 0 means better than average)
-        z_vina = round(-((vina_vals[i] - vina_mu) / vina_sd), 3)
-        z_cnn_score = round((cnn_score_vals[i] - cnn_mu) / cnn_sd, 3)
-        z_cnn_aff = round((cnn_aff_vals[i] - aff_mu) / aff_sd, 3)
+        z_vina = -_safe_zscore(vina_vals[i], vina_mu, vina_sd)
+        z_cnn_score = _safe_zscore(cnn_score_vals[i], cnn_mu, cnn_sd)
+        z_cnn_aff = _safe_zscore(cnn_aff_vals[i], aff_mu, aff_sd)
 
         # Agreement: how many methods rank this in top 30%
         r_vina = vina_rank[i]
@@ -812,7 +836,7 @@ def _extract_pareto_objectives(mol: dict, n_molecules: int) -> dict[str, float]:
     else:
         # Fallback to vina_score: more negative is better.
         # Min-max normalize assuming range [-12, 0].
-        vina = float(mol.get("vina_score", 0.0) or mol.get("affinity", 0.0) or 0.0)
+        vina = _safe_float(mol.get("vina_score")) or _safe_float(mol.get("affinity"))
         affinity = max(0.0, min(1.0, vina / -12.0)) if vina < 0 else 0.0
 
     # --- Safety ---
