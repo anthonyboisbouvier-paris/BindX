@@ -302,15 +302,15 @@ def _map_mode_to_params(mode: str, body: JobCreate) -> dict:
         })
 
     elif mode == "standard" or mode == "advanced":
-        # Advanced pipeline: GNINA is ~15s/molecule, so default to 50 (not 500)
+        # Hit Discovery pipeline: ChEMBL + ZINC, ADMET, no AI generation (reserved for Optimization phase)
         base_params.update({
             "max_ligands": body.max_ligands or 50,
             "use_chembl": True,
             "use_zinc": True,
-            "enable_generation": True,
+            "enable_generation": False,
             "enable_diffdock": body.enable_diffdock if body.enable_diffdock is not None else False,
-            "enable_retrosynthesis": True,
-            "n_generated_molecules": body.n_generated_molecules or 20,
+            "enable_retrosynthesis": False,
+            "n_generated_molecules": 0,
             "auto_strategy": True,
         })
 
@@ -1415,6 +1415,23 @@ async def create_docking_job(
 
     # Build pipeline parameters based on mode
     task_params = _map_mode_to_params(mode, body)
+
+    # V8: inject target_config to skip structure+pockets recomputation
+    target_config_raw: Optional[str] = body.target_config_json
+    if not target_config_raw and body.project_id:
+        from database import get_project as _get_project
+        proj = _get_project(body.project_id)
+        if proj and getattr(proj, "target_preview_json", None):
+            target_config_raw = proj.target_preview_json
+    if target_config_raw:
+        try:
+            task_params["target_config"] = (
+                json.loads(target_config_raw)
+                if isinstance(target_config_raw, str)
+                else target_config_raw
+            )
+        except Exception:
+            pass  # malformed JSON — pipeline will re-compute
 
     # Determine effective boolean flags for DB storage
     use_chembl = task_params.get("use_chembl", True)

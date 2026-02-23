@@ -145,7 +145,7 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
         audit = AuditLog(job_id)
         audit.log("pipeline", "Pipeline started", {"params": {
             k: v for k, v in params.items()
-            if k not in ("smiles_list",)  # exclude potentially large data
+            if k not in ("smiles_list", "target_config")  # exclude potentially large data
         }})
 
         uniprot_id: str = params.get("uniprot_id", "") or ""
@@ -167,49 +167,88 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
         notification_email: Optional[str] = params.get("notification_email")
         auto_strategy: bool = params.get("auto_strategy", False)
 
+        # V8: pre-computed target config from Target Setup (skips structure+pockets)
+        target_config: Optional[dict] = params.get("target_config")
+
         is_standard = mode in ("standard", "advanced")
 
         # ------------------------------------------------------------------
-        # Step 1: Fetch protein structure (0% -> 8%)
+        # Step 1: Fetch / restore protein structure (0% -> 8%)
         # ------------------------------------------------------------------
-        _update_progress(job_id, 3, "Fetching protein structure")
-
         structure_source = "unknown"
-        if sequence and not uniprot_id:
-            # V3: direct sequence input
-            from pipeline.structure import fetch_structure_from_sequence
-            pdb_path, structure_source = fetch_structure_from_sequence(sequence, work_dir)
-            _update_progress(
-                job_id, 8, "Structure retrieved",
-                step_details=f"Folded from sequence ({len(sequence)} residues) via {structure_source}",
-            )
-        else:
-            from pipeline.structure import fetch_structure
-            pdb_path, structure_source = fetch_structure(uniprot_id, work_dir)
-            _update_progress(
-                job_id, 8, "Structure retrieved",
-                step_details=f"Source: {structure_source}",
-            )
+        pdb_info: Optional[dict] = None
+        ligand_id: Optional[str] = None
+
+        # V8: reuse pre-computed structure from Target Setup when available
+        _target_config_used = False
+        if target_config:
+            try:
+                structures_list = target_config.get("structures") or []
+                sel_idx = int(target_config.get("selected_structure_idx", 0))
+                sel_structure = (
+                    structures_list[sel_idx] if structures_list and sel_idx < len(structures_list)
+                    else structures_list[0] if structures_list
+                    else target_config.get("structure") or {}
+                )
+                pdb_data_inline: Optional[str] = sel_structure.get("pdb_data")
+                download_url: Optional[str] = sel_structure.get("download_url")
+                structure_source = sel_structure.get("source", "cached")
+
+                pdb_path = work_dir / "protein.pdb"
+                if pdb_data_inline:
+                    pdb_path.write_text(pdb_data_inline)
+                    _target_config_used = True
+                    logger.info("[%s] Step 1 skipped — using inline pdb_data from Target Setup", job_id)
+                elif download_url:
+                    _update_progress(job_id, 3, "Downloading structure from Target Setup")
+                    resp = http_requests.get(download_url, timeout=30)
+                    resp.raise_for_status()
+                    pdb_path.write_bytes(resp.content)
+                    _target_config_used = True
+                    logger.info("[%s] Step 1 skipped — downloaded structure from %s", job_id, download_url)
+                else:
+                    logger.warning("[%s] target_config has no pdb_data or download_url — re-fetching", job_id)
+            except Exception as exc:
+                logger.warning("[%s] Failed to restore structure from target_config: %s — re-fetching", job_id, exc)
+                _target_config_used = False
+
+        if not _target_config_used:
+            _update_progress(job_id, 3, "Fetching protein structure")
+            if sequence and not uniprot_id:
+                # V3: direct sequence input
+                from pipeline.structure import fetch_structure_from_sequence
+                pdb_path, structure_source = fetch_structure_from_sequence(sequence, work_dir)
+                _update_progress(
+                    job_id, 8, "Structure retrieved",
+                    step_details=f"Folded from sequence ({len(sequence)} residues) via {structure_source}",
+                )
+            else:
+                from pipeline.structure import fetch_structure
+                pdb_path, structure_source = fetch_structure(uniprot_id, work_dir)
+                _update_progress(
+                    job_id, 8, "Structure retrieved",
+                    step_details=f"Source: {structure_source}",
+                )
+
+            # V5bis: Retrieve PDB experimental metadata (ligand_id, resolution, etc.)
+            if uniprot_id and structure_source == "pdb_experimental":
+                try:
+                    from pipeline.structure import get_pdb_info
+                    pdb_info = get_pdb_info(work_dir, uniprot_id)
+                    if pdb_info:
+                        ligand_id = pdb_info.get("ligand_id")
+                        pipeline_summary["pdb_info"] = pdb_info
+                        logger.info("[%s] PDB info: %s (ligand=%s)", job_id,
+                                    pdb_info.get("pdb_id", "?"), ligand_id or "none")
+                except Exception as exc:
+                    logger.warning("[%s] Failed to retrieve PDB info: %s", job_id, exc)
+
+        _update_progress(job_id, 8, "Structure ready", step_details=f"Source: {structure_source}")
 
         # Store structure source and PDB path
         update_job(job_id, pdb_path=str(pdb_path), structure_source=structure_source)
         pipeline_summary["structure_source"] = structure_source
         pipeline_summary["steps_completed"].append("structure")
-
-        # V5bis: Retrieve PDB experimental metadata (ligand_id, resolution, etc.)
-        pdb_info: Optional[dict] = None
-        ligand_id: Optional[str] = None
-        if uniprot_id and structure_source == "pdb_experimental":
-            try:
-                from pipeline.structure import get_pdb_info
-                pdb_info = get_pdb_info(work_dir, uniprot_id)
-                if pdb_info:
-                    ligand_id = pdb_info.get("ligand_id")
-                    pipeline_summary["pdb_info"] = pdb_info
-                    logger.info("[%s] PDB info: %s (ligand=%s)", job_id,
-                                pdb_info.get("pdb_id", "?"), ligand_id or "none")
-            except Exception as exc:
-                logger.warning("[%s] Failed to retrieve PDB info: %s", job_id, exc)
 
         # --- A1: Compute effective_structure_source early ---
         effective_structure_source = structure_source
@@ -217,10 +256,10 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
             effective_structure_source = "pdb_holo"
         pipeline_summary["effective_structure_source"] = effective_structure_source
 
-        audit.log("structure", f"Structure retrieved from {structure_source}", {
+        audit.log("structure", f"Structure ready from {structure_source}", {
             "source": structure_source,
             "pdb_path": str(pdb_path),
-            "pdb_info": pdb_info,
+            "reused_from_target_setup": _target_config_used,
         })
 
         # ------------------------------------------------------------------
@@ -260,28 +299,56 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
             logger.warning("[%s] Disorder prediction failed: %s", job_id, exc)
 
         # ------------------------------------------------------------------
-        # Step 2: Detect binding pockets (8% -> 15%)
+        # Step 2: Detect / restore binding pockets (8% -> 15%)
         # ------------------------------------------------------------------
-        _update_progress(job_id, 10, "Detecting binding pockets")
-        from pipeline.pockets import detect_pockets
-        pockets = detect_pockets(pdb_path, work_dir, ligand_id=ligand_id)
-        best_pocket = pockets[0]
-        center = tuple(best_pocket["center"])
+        _update_progress(job_id, 10, "Restoring binding site from Target Setup" if target_config else "Detecting binding pockets")
+
+        pockets = []
         pocket_size = (25.0, 25.0, 25.0)
-        pocket_method = best_pocket.get("method", "unknown")
+        _pocket_reused = False
+
+        if target_config:
+            try:
+                pockets_raw = target_config.get("pockets") or []
+                sel_pocket_idx = int(target_config.get("selected_pocket_idx", 0))
+                sel_pocket = (
+                    pockets_raw[sel_pocket_idx] if pockets_raw and sel_pocket_idx < len(pockets_raw)
+                    else pockets_raw[0] if pockets_raw
+                    else None
+                )
+                if sel_pocket and sel_pocket.get("center"):
+                    center_raw = sel_pocket["center"]
+                    center = tuple(float(c) for c in center_raw[:3])
+                    pocket_method = sel_pocket.get("method", "cached")
+                    pockets = pockets_raw
+                    best_pocket = sel_pocket
+                    _pocket_reused = True
+                    logger.info("[%s] Step 2 skipped — using pocket from Target Setup center=%s", job_id, center)
+                else:
+                    logger.warning("[%s] target_config pocket has no center — re-detecting", job_id)
+            except Exception as exc:
+                logger.warning("[%s] Failed to restore pocket from target_config: %s — re-detecting", job_id, exc)
+
+        if not _pocket_reused:
+            from pipeline.pockets import detect_pockets
+            pockets = detect_pockets(pdb_path, work_dir, ligand_id=ligand_id)
+            best_pocket = pockets[0]
+            center = tuple(best_pocket["center"])
+            pocket_method = best_pocket.get("method", "unknown")
+
         _update_progress(
             job_id, 15,
-            f"Best pocket at ({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f})",
-            step_details=f"{len(pockets)} pocket(s) detected via {pocket_method}",
+            f"Binding site: ({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f})",
+            step_details=f"{'Reused from Target Setup' if _pocket_reused else str(len(pockets)) + ' pocket(s) detected'} via {pocket_method}",
         )
         pipeline_summary["n_pockets"] = len(pockets)
         pipeline_summary["best_pocket_center"] = list(center)
         pipeline_summary["best_pocket_method"] = pocket_method
         pipeline_summary["steps_completed"].append("pockets")
-        audit.log("pockets", f"Detected {len(pockets)} pocket(s)", {
+        audit.log("pockets", f"Pocket ready via {pocket_method}", {
             "n_pockets": len(pockets),
             "best_center": list(center),
-            "pocket_method": pocket_method,
+            "reused_from_target_setup": _pocket_reused,
         })
 
         # V6: Check if pocket center falls within an IDR

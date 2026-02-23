@@ -76,21 +76,29 @@ export default function RunsList() {
   // Active run tracking (inline progress)
   const [activeJobId, setActiveJobId] = useState(null)
 
-  const uniprotId = targetConfig?.uniprot_id || project?.uniprot_id || ''
+  const canCreateRun = !!(project && isTargetConfigured && (targetConfig?.uniprot_id || targetConfig?.sequence))
 
   const handleCreateRun = useCallback(async () => {
-    if (!uniprotId || !project) return
+    if (!canCreateRun) return
     setCreating(true)
     setCreateError(null)
 
     const params = {
-      uniprot_id: uniprotId,
       mode,
       max_ligands: maxLigands,
       use_chembl: ligandSource === 'chembl',
       use_zinc: ligandSource === 'zinc',
       project_id: project.id,
       docking_engine: engine === 'auto' ? undefined : engine,
+      // Pass target config so backend can skip structure+pockets recomputation
+      target_config_json: targetConfig ? JSON.stringify(targetConfig) : undefined,
+    }
+
+    // Set uniprot_id or sequence based on target mode
+    if (targetConfig?.uniprot_id) {
+      params.uniprot_id = targetConfig.uniprot_id
+    } else if (targetConfig?.sequence) {
+      params.sequence = targetConfig.sequence
     }
 
     if (ligandSource === 'custom' && customSmiles.trim()) {
@@ -109,7 +117,7 @@ export default function RunsList() {
     } finally {
       setCreating(false)
     }
-  }, [uniprotId, mode, maxLigands, ligandSource, customSmiles, engine, project, refresh])
+  }, [canCreateRun, targetConfig, mode, maxLigands, ligandSource, customSmiles, engine, project, refresh])
 
   const handleRunComplete = useCallback((results) => {
     setActiveJobId(null)
@@ -172,7 +180,7 @@ export default function RunsList() {
         <div>
           <h1 className="text-2xl font-bold text-[#1e3a5f]">Runs</h1>
           <p className="text-sm text-gray-400 mt-1">
-            {sortedJobs.length} run{sortedJobs.length !== 1 ? 's' : ''} for {uniprotId}
+            {sortedJobs.length} run{sortedJobs.length !== 1 ? 's' : ''} for {targetConfig?.uniprot_id || targetConfig?.protein_name || 'this target'}
           </p>
         </div>
         <button
@@ -209,7 +217,9 @@ export default function RunsList() {
           <div>
             <label className="block text-xs font-medium text-gray-500 mb-1">Target</label>
             <div className="flex items-center gap-2 px-3 py-2 bg-gray-50 rounded-lg border border-gray-200">
-              <span className="text-sm font-mono font-semibold text-[#1e3a5f]">{uniprotId}</span>
+              <span className="text-sm font-mono font-semibold text-[#1e3a5f]">
+                {targetConfig?.uniprot_id || `Sequence (${targetConfig?.sequence?.length || 0} aa)`}
+              </span>
               {targetConfig?.protein_name && (
                 <span className="text-xs text-gray-400">{targetConfig.protein_name}</span>
               )}
@@ -346,7 +356,7 @@ export default function RunsList() {
           <div className="flex items-center gap-3">
             <button
               onClick={handleCreateRun}
-              disabled={creating || (ligandSource === 'custom' && !customSmiles.trim())}
+              disabled={creating || !canCreateRun || (ligandSource === 'custom' && !customSmiles.trim())}
               className="flex items-center gap-2 px-6 py-3 bg-[#22c55e] hover:bg-[#16a34a] disabled:bg-gray-300 text-white font-bold rounded-xl shadow transition-colors text-sm"
             >
               {creating ? (

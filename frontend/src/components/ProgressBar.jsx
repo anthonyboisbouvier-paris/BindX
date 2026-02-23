@@ -7,24 +7,54 @@ const POLL_INTERVAL_MS = 2000
 
 // Pipeline step definitions in display order
 const PIPELINE_STEPS = [
-  { key: 'structure',      label: '3D Structure',          pctRange: [0, 15] },
-  { key: 'pockets',        label: 'Binding Site',          pctRange: [15, 30] },
-  { key: 'ligands',        label: 'Candidate Molecules',   pctRange: [30, 45] },
-  { key: 'docking',        label: 'Docking',               pctRange: [45, 85] },
-  { key: 'admet',          label: 'ADMET Analysis',        pctRange: [85, 90] },
-  { key: 'retrosynthesis', label: 'Retrosynthesis',        pctRange: [90, 95] },
-  { key: 'report',         label: 'Final Report',          pctRange: [95, 100] },
+  { key: 'ligands',  label: 'Candidate Molecules',  pctRange: [0,  15] },
+  { key: 'docking',  label: 'Molecular Docking',    pctRange: [15, 65] },
+  { key: 'admet',    label: 'ADMET Profiling',       pctRange: [65, 80] },
+  { key: 'scoring',  label: 'Scoring & Ranking',    pctRange: [80, 95] },
+  { key: 'report',   label: 'Final Report',         pctRange: [95, 100] },
 ]
 
 // Step tooltips explaining what each step does
 const STEP_TIPS = {
-  structure: 'Predicting the 3D structure of your protein using AlphaFold or ESMFold.',
-  pockets: 'Detecting binding cavities on the protein surface where small molecules can dock.',
   ligands: 'Retrieving candidate molecules from chemical databases (ChEMBL, ZINC).',
   docking: 'Simulating how each molecule fits into the binding pocket and scoring the interaction.',
   admet: 'Evaluating Absorption, Distribution, Metabolism, Excretion, and Toxicity of top candidates.',
-  retrosynthesis: 'Planning the synthesis route for top candidates from commercially available reagents.',
+  scoring: 'Combining docking score, drug-likeness, and ADMET profile into a composite ranking.',
   report: 'Compiling all results, structures, and scores into the final PDF report.',
+}
+
+// Scientific storytelling cards shown while each step is active
+const SCIENCE_CARDS = {
+  ligands: {
+    icon: '🧪',
+    title: 'Gathering Candidate Molecules',
+    body: "Querying ChEMBL — the world's largest open-access bioactivity database (>2M compounds) — for molecules previously tested against this target family. Each candidate is filtered by Lipinski's Rule of Five to ensure drug-likeness before docking.",
+    ref: 'Mendez et al., ChEMBL: towards direct deposition of bioassay data, NAR 2019',
+  },
+  docking: {
+    icon: '⚡',
+    title: 'AutoDock Vina — Simulating Molecular Binding',
+    body: 'AutoDock Vina uses a gradient-based optimizer and an empirical scoring function to predict how each molecule fits into the binding pocket. For each candidate it explores millions of conformational poses and reports the lowest-energy binding mode as a kcal/mol affinity score.',
+    ref: 'Trott & Olson, AutoDock Vina: improving speed and accuracy, J Comput Chem 2010',
+  },
+  admet: {
+    icon: '🔬',
+    title: 'ADMET Profiling — Beyond Affinity',
+    body: '90% of drug candidates that enter clinical trials fail — mostly due to ADMET issues, not lack of potency. We screen each top hit for Absorption, Distribution, Metabolism, Excretion, and Toxicity — including CYP inhibition, hERG cardiotoxicity, and blood-brain barrier penetration.',
+    ref: 'Lipinski et al., Experimental and computational approaches to estimate solubility, Adv Drug Deliv Rev 1997',
+  },
+  scoring: {
+    icon: '📊',
+    title: 'Composite Scoring — Ranking the Best Hits',
+    body: "Binding affinity alone doesn't make a drug. We combine docking score, drug-likeness (QED), synthetic accessibility (SA score), and ADMET profile into a composite score to identify the most promising starting points for medicinal chemistry.",
+    ref: 'Bickerton et al., Quantifying the chemical beauty of drugs, Nature Chem 2012',
+  },
+  report: {
+    icon: '📄',
+    title: 'Generating Your Scientific Report',
+    body: 'Compiling docking poses, scores, ADMET flags, and molecular structures into a downloadable PDF report — ready to share with your team or guide your next experiment.',
+    ref: null,
+  },
 }
 
 // Derive which step is active/done/pending from progress percentage and backend current_step string
@@ -37,13 +67,11 @@ function resolveStepStatuses(progress, currentStepName) {
     if (currentStepName) {
       const name = currentStepName.toLowerCase()
       if (
-        (step.key === 'structure'      && (name.includes('structure') || name.includes('alphafold') || name.includes('esmfold'))) ||
-        (step.key === 'pockets'        && (name.includes('poche') || name.includes('pocket'))) ||
-        (step.key === 'ligands'        && (name.includes('ligand') || name.includes('molecule') || name.includes('chembl'))) ||
-        (step.key === 'docking'        && (name.includes('dock'))) ||
-        (step.key === 'admet'          && (name.includes('admet') || name.includes('scoring') || name.includes('score'))) ||
-        (step.key === 'retrosynthesis' && (name.includes('retro') || name.includes('synthes'))) ||
-        (step.key === 'report'         && (name.includes('rapport') || name.includes('report') || name.includes('pdf')))
+        (step.key === 'ligands'  && (name.includes('ligand') || name.includes('molecule') || name.includes('chembl'))) ||
+        (step.key === 'docking'  && name.includes('dock')) ||
+        (step.key === 'admet'    && (name.includes('admet') || name.includes('score'))) ||
+        (step.key === 'scoring'  && (name.includes('scoring') || name.includes('rank') || name.includes('composite'))) ||
+        (step.key === 'report'   && (name.includes('rapport') || name.includes('report') || name.includes('pdf')))
       ) {
         return { ...step, status: 'active' }
       }
@@ -84,6 +112,21 @@ function StepIcon({ status }) {
     <span className="flex-shrink-0 w-6 h-6 flex items-center justify-center">
       <span className="w-3 h-3 rounded-full border-2 border-gray-300" />
     </span>
+  )
+}
+
+// Scientific story card shown while a step is active
+function ScienceCard({ stepKey }) {
+  const card = SCIENCE_CARDS[stepKey]
+  if (!card) return null
+  return (
+    <div className="mt-2 ml-9 p-3 bg-blue-50/60 border border-blue-100 rounded-xl text-xs leading-relaxed">
+      <p className="font-semibold text-dockit-blue mb-1">{card.icon} {card.title}</p>
+      <p className="text-gray-600">{card.body}</p>
+      {card.ref && (
+        <p className="mt-1.5 text-gray-400 italic text-[10px]">Ref: {card.ref}</p>
+      )}
+    </div>
   )
 }
 
@@ -145,6 +188,9 @@ function StepRow({ step, stepDetail, isActive, progress }) {
             </div>
           </div>
         )}
+
+        {/* Science card — shown only for the active step */}
+        {isActive && <ScienceCard stepKey={step.key} />}
       </div>
     </div>
   )

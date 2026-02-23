@@ -176,6 +176,12 @@ class JobCreate(BaseModel):
         default=None, description="Project ID to associate this job with",
     )
 
+    # V8: Pre-computed target config (skips structure+pockets recomputation)
+    target_config_json: Optional[str] = Field(
+        default=None,
+        description="JSON-encoded target_preview_json to skip structure+pockets recomputation.",
+    )
+
     # V2 fields kept for backward compat but no longer required
     enable_generation: Optional[bool] = Field(default=None, description="(V2 compat) Enable AI molecule generation")
     enable_diffdock: Optional[bool] = Field(default=None, description="(V2 compat) Enable DiffDock")
