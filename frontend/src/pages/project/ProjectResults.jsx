@@ -1,61 +1,307 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useMemo } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useProject } from '../../contexts/ProjectContext.jsx'
 import { HitSelectionProvider, useHitSelection } from '../../contexts/HitSelectionContext.jsx'
 import { getJobResults } from '../../api.js'
 
-import ResultsDashboard from '../../components/ResultsDashboard.jsx'
 import Viewer3D from '../../components/Viewer3D.jsx'
-import ResultsTable from '../../components/ResultsTable.jsx'
 import MoleculeCard from '../../components/MoleculeCard.jsx'
 import DownloadButtons from '../../components/DownloadButtons.jsx'
-import GeneratedMols from '../../components/GeneratedMols.jsx'
-
-// Lazy-load optional components
-let ScoringWeights = null
-let HitSelector = null
-try { ScoringWeights = require('../../components/ScoringWeights.jsx').default } catch {}
-try { HitSelector = require('../../components/HitSelector.jsx').default } catch {}
+import ParetoFront from '../../components/ParetoFront.jsx'
+import InfoTip from '../../components/InfoTip.jsx'
+import Badge from '../../components/Badge.jsx'
 
 // ---------------------------------------------------------------------------
-// Hit selection bar
+// Filter bar with configurable criteria
 // ---------------------------------------------------------------------------
-function HitSelectionBar({ onSendToOptimization }) {
-  const { getTagCount } = useHitSelection()
-  const counts = getTagCount()
-  const hasHits = counts.hit > 0
+
+const DEFAULT_CUTOFFS = {
+  minScore: 0,
+  maxAffinity: 0,
+  minQED: 0,
+  maxLogP: 10,
+  maxMW: 2000,
+  safetyLevels: [],
+  sources: [],
+  showEliminated: false,
+}
+
+function FilterBar({ filters, setFilters, counts, hasAdmet, hasSources }) {
+  const [open, setOpen] = useState(false)
+  const hasActive = filters.minScore > 0 || filters.maxAffinity < 0 || filters.minQED > 0 ||
+    filters.maxLogP < 10 || filters.maxMW < 2000 ||
+    filters.safetyLevels.length > 0 || filters.sources.length > 0
 
   return (
-    <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 p-4 bg-white rounded-xl border border-gray-100 shadow-sm">
+    <div className="bg-white rounded-xl border border-gray-100 shadow-sm">
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="w-full flex items-center justify-between px-5 py-3 hover:bg-gray-50 transition-colors"
+      >
+        <div className="flex items-center gap-3">
+          <svg className="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+              d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2a1 1 0 01-.293.707l-6.414 6.414A1 1 0 0014 13.414V19a1 1 0 01-.553.894l-4 2A1 1 0 018 21v-7.586a1 1 0 00-.293-.707L1.293 6.707A1 1 0 011 6V4z" />
+          </svg>
+          <span className="text-sm font-semibold text-gray-700">Filters & Cutoffs</span>
+          {hasActive && (
+            <span className="px-2 py-0.5 bg-[#1e3a5f] text-white text-xs font-bold rounded-full">Active</span>
+          )}
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-gray-400">
+            {counts.shown}/{counts.total} molecules
+          </span>
+          <svg className={`w-4 h-4 text-gray-400 transition-transform ${open ? 'rotate-180' : ''}`}
+            fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+          </svg>
+        </div>
+      </button>
+
+      {open && (
+        <div className="px-5 pb-4 pt-2 border-t border-gray-100 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+          <div>
+            <label className="text-xs font-semibold text-gray-500 mb-1.5 flex items-center gap-1">
+              Min Score
+              <span className="ml-auto font-mono text-[#1e3a5f]">{filters.minScore || 'Off'}</span>
+            </label>
+            <input type="range" min="0" max="100" step="5" value={filters.minScore}
+              onChange={e => setFilters(f => ({ ...f, minScore: +e.target.value }))}
+              className="w-full accent-[#1e3a5f]" />
+          </div>
+          <div>
+            <label className="text-xs font-semibold text-gray-500 mb-1.5 block">Max Affinity (kcal/mol)</label>
+            <input type="number" step="0.5" value={filters.maxAffinity < 0 ? filters.maxAffinity : ''}
+              placeholder="e.g. -7.0"
+              onChange={e => setFilters(f => ({ ...f, maxAffinity: +e.target.value || 0 }))}
+              className="w-full border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/30" />
+            <p className="text-[10px] text-gray-300 mt-0.5">More negative = stronger</p>
+          </div>
+          <div>
+            <label className="text-xs font-semibold text-gray-500 mb-1.5 flex items-center gap-1">
+              Min QED
+              <span className="ml-auto font-mono text-[#1e3a5f]">{filters.minQED > 0 ? filters.minQED.toFixed(2) : 'Off'}</span>
+            </label>
+            <input type="range" min="0" max="1" step="0.05" value={filters.minQED}
+              onChange={e => setFilters(f => ({ ...f, minQED: +e.target.value }))}
+              className="w-full accent-[#1e3a5f]" />
+          </div>
+          <div>
+            <label className="text-xs font-semibold text-gray-500 mb-1.5 flex items-center gap-1">
+              Max LogP
+              <span className="ml-auto font-mono text-[#1e3a5f]">{filters.maxLogP < 10 ? filters.maxLogP : 'Off'}</span>
+            </label>
+            <input type="range" min="0" max="10" step="0.5" value={filters.maxLogP}
+              onChange={e => setFilters(f => ({ ...f, maxLogP: +e.target.value }))}
+              className="w-full accent-[#1e3a5f]" />
+          </div>
+          <div>
+            <label className="text-xs font-semibold text-gray-500 mb-1.5 flex items-center gap-1">
+              Max MW (Da)
+              <span className="ml-auto font-mono text-[#1e3a5f]">{filters.maxMW < 2000 ? filters.maxMW : 'Off'}</span>
+            </label>
+            <input type="range" min="100" max="2000" step="50" value={filters.maxMW}
+              onChange={e => setFilters(f => ({ ...f, maxMW: +e.target.value }))}
+              className="w-full accent-[#1e3a5f]" />
+          </div>
+          {hasAdmet && (
+            <div>
+              <label className="text-xs font-semibold text-gray-500 mb-1.5 block">Toxicity Level</label>
+              <div className="flex flex-wrap gap-1">
+                {[
+                  { label: 'Low', cls: 'bg-[#22c55e] border-[#22c55e] text-white' },
+                  { label: 'Medium', cls: 'bg-yellow-500 border-yellow-500 text-white' },
+                  { label: 'High', cls: 'bg-red-500 border-red-500 text-white' },
+                ].map(({ label, cls }) => {
+                  const on = filters.safetyLevels.includes(label)
+                  return (
+                    <button key={label}
+                      onClick={() => setFilters(f => ({
+                        ...f, safetyLevels: on ? f.safetyLevels.filter(l => l !== label) : [...f.safetyLevels, label]
+                      }))}
+                      className={`px-2 py-0.5 text-xs rounded border font-medium transition-colors ${
+                        on ? cls : 'bg-white text-gray-500 border-gray-200 hover:border-gray-400'}`}>
+                      {label}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+          {hasSources && (
+            <div>
+              <label className="text-xs font-semibold text-gray-500 mb-1.5 block">Source</label>
+              <div className="flex flex-wrap gap-1">
+                {['ChEMBL', 'ZINC', 'AI'].map(label => {
+                  const on = filters.sources.includes(label)
+                  return (
+                    <button key={label}
+                      onClick={() => setFilters(f => ({
+                        ...f, sources: on ? f.sources.filter(s => s !== label) : [...f.sources, label]
+                      }))}
+                      className={`px-2 py-0.5 text-xs rounded border font-medium transition-colors ${
+                        on ? 'bg-[#1e3a5f] border-[#1e3a5f] text-white' : 'bg-white text-gray-500 border-gray-200 hover:border-gray-400'}`}>
+                      {label}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+          <div className="flex items-end">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" checked={filters.showEliminated}
+                onChange={e => setFilters(f => ({ ...f, showEliminated: e.target.checked }))}
+                className="accent-[#1e3a5f]" />
+              <span className="text-xs text-gray-600 font-medium">Show eliminated</span>
+            </label>
+          </div>
+          {hasActive && (
+            <div className="flex items-end">
+              <button onClick={() => setFilters({ ...DEFAULT_CUTOFFS })}
+                className="text-xs text-red-500 hover:text-red-700 font-medium underline underline-offset-2">
+                Reset all
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Auto-hit criteria dialog
+// ---------------------------------------------------------------------------
+
+function AutoHitDialog({ onApply, onClose, molecules }) {
+  const [criteria, setCriteria] = useState({
+    minScore: 60,
+    maxAffinity: -7.0,
+    minQED: 0.4,
+    maxLogP: 5,
+    maxMW: 500,
+    lowToxicityOnly: false,
+  })
+
+  const preview = useMemo(() => {
+    return molecules.filter(mol => {
+      const score = (mol.composite_score || 0) * 100
+      if (score < criteria.minScore) return false
+      if (criteria.maxAffinity < 0 && (mol.affinity || 0) > criteria.maxAffinity) return false
+      if ((mol.qed || 0) < criteria.minQED) return false
+      if ((mol.logp || 0) > criteria.maxLogP) return false
+      if ((mol.mw || 0) > criteria.maxMW) return false
+      if (criteria.lowToxicityOnly && mol.admet?.color_code !== 'green') return false
+      return !mol.eliminated
+    }).length
+  }, [molecules, criteria])
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md">
+        <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100">
+          <h2 className="font-bold text-[#1e3a5f]">Auto-Select Hits</h2>
+          <button onClick={onClose}
+            className="w-8 h-8 rounded-lg hover:bg-gray-100 flex items-center justify-center text-gray-400 hover:text-gray-700">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+        <div className="p-5 space-y-4">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs font-semibold text-gray-500 mb-1 block">Min Score (/100)</label>
+              <input type="number" value={criteria.minScore} min={0} max={100}
+                onChange={e => setCriteria(c => ({ ...c, minScore: +e.target.value }))}
+                className="w-full border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/30" />
+            </div>
+            <div>
+              <label className="text-xs font-semibold text-gray-500 mb-1 block">Max Affinity (kcal/mol)</label>
+              <input type="number" step="0.5" value={criteria.maxAffinity}
+                onChange={e => setCriteria(c => ({ ...c, maxAffinity: +e.target.value }))}
+                className="w-full border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/30" />
+            </div>
+            <div>
+              <label className="text-xs font-semibold text-gray-500 mb-1 block">Min QED</label>
+              <input type="number" step="0.05" value={criteria.minQED} min={0} max={1}
+                onChange={e => setCriteria(c => ({ ...c, minQED: +e.target.value }))}
+                className="w-full border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/30" />
+            </div>
+            <div>
+              <label className="text-xs font-semibold text-gray-500 mb-1 block">Max LogP</label>
+              <input type="number" step="0.5" value={criteria.maxLogP}
+                onChange={e => setCriteria(c => ({ ...c, maxLogP: +e.target.value }))}
+                className="w-full border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/30" />
+            </div>
+            <div>
+              <label className="text-xs font-semibold text-gray-500 mb-1 block">Max MW (Da)</label>
+              <input type="number" step="50" value={criteria.maxMW}
+                onChange={e => setCriteria(c => ({ ...c, maxMW: +e.target.value }))}
+                className="w-full border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/30" />
+            </div>
+            <div className="flex items-end">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" checked={criteria.lowToxicityOnly}
+                  onChange={e => setCriteria(c => ({ ...c, lowToxicityOnly: e.target.checked }))}
+                  className="accent-[#22c55e]" />
+                <span className="text-xs text-gray-600 font-medium">Low toxicity only</span>
+              </label>
+            </div>
+          </div>
+          <div className="flex items-center justify-between p-3 bg-blue-50 rounded-lg">
+            <span className="text-sm text-[#1e3a5f] font-semibold">{preview} molecules match</span>
+            <button onClick={() => onApply(criteria)}
+              disabled={preview === 0}
+              className="px-4 py-2 bg-[#22c55e] hover:bg-[#16a34a] disabled:bg-gray-300 text-white text-sm font-bold rounded-lg transition-colors">
+              Tag as Hits
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Hit selection bar (compact)
+// ---------------------------------------------------------------------------
+
+function HitBar() {
+  const { getTagCount } = useHitSelection()
+  const counts = getTagCount()
+
+  return (
+    <div className="flex items-center justify-between gap-3 px-5 py-3 bg-white rounded-xl border border-gray-100 shadow-sm">
       <div className="flex items-center gap-5 flex-wrap">
         <span className="flex items-center gap-1.5 text-sm font-semibold text-[#22c55e]">
-          <span className="w-2 h-2 rounded-full bg-[#22c55e] inline-block" />
+          <span className="w-2 h-2 rounded-full bg-[#22c55e]" />
           {counts.hit} {counts.hit === 1 ? 'hit' : 'hits'}
         </span>
         <span className="flex items-center gap-1.5 text-sm font-semibold text-yellow-600">
-          <span className="w-2 h-2 rounded-full bg-yellow-400 inline-block" />
+          <span className="w-2 h-2 rounded-full bg-yellow-400" />
           {counts.investigate} investigating
         </span>
         <span className="flex items-center gap-1.5 text-sm font-semibold text-gray-400">
-          <span className="w-2 h-2 rounded-full bg-gray-300 inline-block" />
+          <span className="w-2 h-2 rounded-full bg-gray-300" />
           {counts.discard} discarded
         </span>
       </div>
       <Link
-        to="../optimization"
-        relative="path"
+        to="../optimization" relative="path"
         className={`flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-lg transition-colors ${
-          hasHits
+          counts.hit > 0
             ? 'bg-purple-600 hover:bg-purple-700 text-white shadow-sm'
             : 'bg-gray-100 text-gray-400 pointer-events-none'
         }`}
       >
         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-            d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
         </svg>
         Send to Optimization
-        {hasHits && (
+        {counts.hit > 0 && (
           <span className="ml-1 px-1.5 py-0.5 bg-white/20 rounded text-xs font-bold">{counts.hit}</span>
         )}
       </Link>
@@ -64,89 +310,293 @@ function HitSelectionBar({ onSendToOptimization }) {
 }
 
 // ---------------------------------------------------------------------------
-// Inline hit tagger
+// Enhanced results table with inline hit tagging
 // ---------------------------------------------------------------------------
-function InlineHitTagger({ molecules }) {
-  const { selections, setTag, setNote, removeSelection } = useHitSelection()
-  const [search, setSearch] = useState('')
 
-  if (!molecules || molecules.length === 0) return null
+function TagButton({ tag, activeTag, onClick }) {
+  const configs = {
+    hit: { label: 'Hit', active: 'bg-[#22c55e] text-white border-[#22c55e]', inactive: 'text-gray-400 border-gray-200 hover:border-[#22c55e] hover:text-[#22c55e]' },
+    investigate: { label: 'Inv', active: 'bg-yellow-400 text-white border-yellow-400', inactive: 'text-gray-400 border-gray-200 hover:border-yellow-400 hover:text-yellow-600' },
+    discard: { label: 'X', active: 'bg-gray-400 text-white border-gray-400', inactive: 'text-gray-400 border-gray-200 hover:border-gray-400' },
+  }
+  const cfg = configs[tag]
+  const isActive = activeTag === tag
+  return (
+    <button
+      onClick={(e) => { e.stopPropagation(); onClick() }}
+      className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border transition-colors ${isActive ? cfg.active : cfg.inactive}`}
+      title={tag}
+    >
+      {cfg.label}
+    </button>
+  )
+}
 
-  const filtered = molecules.filter((m, i) => {
-    const name = (m.name || m.ligand_name || `Mol ${i + 1}`).toLowerCase()
-    return !search || name.includes(search.toLowerCase())
-  })
+function EnhancedResultsTable({ allMols, selectedPoseIndex, setSelectedPoseIndex, generatedMolCount }) {
+  const { selections, setTag, removeSelection } = useHitSelection()
+  const [sortKey, setSortKey] = useState('composite_score')
+  const [sortDir, setSortDir] = useState('desc')
+
+  const handleSort = (key) => {
+    if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    else { setSortKey(key); setSortDir(['composite_score', 'qed'].includes(key) ? 'desc' : 'asc') }
+  }
+
+  const sorted = useMemo(() => {
+    return [...allMols].map((mol, origIdx) => ({ mol, origIdx })).sort((a, b) => {
+      const va = a.mol[sortKey] ?? -Infinity
+      const vb = b.mol[sortKey] ?? -Infinity
+      return sortDir === 'asc' ? va - vb : vb - va
+    })
+  }, [allMols, sortKey, sortDir])
+
+  const hasAdmet = allMols.some(m => m.admet)
+  const hasSource = allMols.some(m => m.source) || generatedMolCount > 0
+
+  const SortIcon = ({ k }) => {
+    if (sortKey !== k) return <svg className="w-3 h-3 text-gray-300 inline ml-0.5" fill="currentColor" viewBox="0 0 20 20"><path d="M5 10l5-5 5 5H5z" /></svg>
+    return sortDir === 'asc'
+      ? <svg className="w-3 h-3 text-[#1e3a5f] inline ml-0.5" fill="currentColor" viewBox="0 0 20 20"><path d="M5 10l5-5 5 5H5z" /></svg>
+      : <svg className="w-3 h-3 text-[#1e3a5f] inline ml-0.5" fill="currentColor" viewBox="0 0 20 20"><path d="M15 10l-5 5-5-5h10z" /></svg>
+  }
+
+  const getName = (r) => r.name || r.molecule_name || r.smiles?.slice(0, 20) || 'Unknown'
+
+  const deriveToxLevel = (mol) => {
+    const code = mol.admet?.color_code
+    if (code === 'green') return 'Low'
+    if (code === 'red') return 'High'
+    if (code === 'yellow') return 'Medium'
+    return null
+  }
 
   return (
     <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
-      <div className="px-5 py-3.5 bg-[#1e3a5f] flex items-center gap-3">
-        <svg className="w-4 h-4 text-white opacity-80" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-            d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A2 2 0 013 12V7a2 2 0 012-2z" />
-        </svg>
-        <h3 className="text-sm font-semibold text-white">Hit Tagging</h3>
+      <div className="px-5 py-3 bg-[#1e3a5f] flex items-center justify-between">
+        <h3 className="text-white font-semibold text-sm flex items-center gap-2">
+          <svg className="w-4 h-4 text-[#22c55e]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+              d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+          </svg>
+          All Results
+          {generatedMolCount > 0 && (
+            <span className="ml-1 text-purple-300 text-xs font-normal">(incl. {generatedMolCount} AI-generated)</span>
+          )}
+        </h3>
+        <span className="text-white/60 text-xs">{allMols.length} molecules</span>
       </div>
-      <div className="p-4">
-        <input
-          type="text"
-          placeholder="Search molecule name..."
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          className="w-full mb-3 px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/30 focus:border-[#1e3a5f]"
-        />
-        <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
-          {filtered.map((mol) => {
-            const realIdx = molecules.indexOf(mol)
-            const molName = mol.name || mol.ligand_name || `Molecule ${realIdx + 1}`
-            const sel = selections[realIdx]
-            const tag = sel?.tag || null
-            const note = sel?.note || ''
 
-            const tagBtnCls = (t) => {
-              const isActive = tag === t
-              if (t === 'hit') return isActive ? 'bg-[#22c55e] text-white border-[#22c55e]' : 'bg-white text-gray-500 border-gray-200 hover:border-[#22c55e] hover:text-[#22c55e]'
-              if (t === 'investigate') return isActive ? 'bg-yellow-400 text-white border-yellow-400' : 'bg-white text-gray-500 border-gray-200 hover:border-yellow-400 hover:text-yellow-600'
-              if (t === 'discard') return isActive ? 'bg-gray-400 text-white border-gray-400' : 'bg-white text-gray-500 border-gray-200 hover:border-gray-400'
-              return ''
-            }
-
-            return (
-              <div key={realIdx} className={`rounded-lg border p-3 transition-colors ${
-                tag === 'hit' ? 'border-green-200 bg-green-50/40' :
-                tag === 'investigate' ? 'border-yellow-200 bg-yellow-50/30' :
-                tag === 'discard' ? 'border-gray-200 bg-gray-50/40' :
-                'border-gray-100 bg-white'
-              }`}>
-                <div className="flex items-center justify-between gap-3 mb-2">
-                  <div className="flex items-center gap-2 min-w-0">
-                    <span className="flex-shrink-0 w-5 h-5 rounded-full bg-[#1e3a5f] text-white text-xs font-bold flex items-center justify-center">
-                      {realIdx + 1}
-                    </span>
-                    <span className="text-sm font-medium text-gray-700 truncate" title={molName}>{molName}</span>
-                    {mol.composite_score != null && (
-                      <span className="text-xs font-mono text-gray-400">{Math.round(mol.composite_score * 100)}/100</span>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-1 flex-shrink-0">
-                    {['hit', 'investigate', 'discard'].map((t) => (
-                      <button key={t}
-                        onClick={() => tag === t ? removeSelection(realIdx) : setTag(realIdx, t)}
-                        className={`px-2 py-0.5 rounded text-xs font-semibold border transition-colors ${tagBtnCls(t)}`}
-                      >
-                        {t === 'hit' ? 'Hit' : t === 'investigate' ? 'Inv.' : 'X'}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                {(tag === 'hit' || tag === 'investigate') && (
-                  <input type="text" placeholder="Add a note..." value={note}
-                    onChange={(e) => setNote(realIdx, e.target.value)}
-                    className="w-full px-2.5 py-1.5 text-xs border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-[#1e3a5f]/30 focus:border-[#1e3a5f] text-gray-600 placeholder-gray-300"
-                  />
+      <div className="overflow-x-auto">
+        <div className="max-h-[600px] overflow-y-auto">
+          <table className="w-full">
+            <thead className="sticky top-0 z-20 bg-gray-50">
+              <tr className="border-b border-gray-100">
+                <th className="px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase w-8">Tag</th>
+                <th className="px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase w-12">#</th>
+                <th className="px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase">Name</th>
+                <th className="px-1 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase w-12">2D</th>
+                <th className="px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase cursor-pointer hover:text-[#1e3a5f] select-none"
+                  onClick={() => handleSort('affinity')}>
+                  Affinity <SortIcon k="affinity" />
+                </th>
+                <th className="px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase cursor-pointer hover:text-[#1e3a5f] select-none"
+                  onClick={() => handleSort('composite_score')}>
+                  Score <SortIcon k="composite_score" />
+                </th>
+                <th className="px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase cursor-pointer hover:text-[#1e3a5f] select-none"
+                  onClick={() => handleSort('qed')}>
+                  QED <SortIcon k="qed" />
+                </th>
+                <th className="px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase cursor-pointer hover:text-[#1e3a5f] select-none hidden sm:table-cell"
+                  onClick={() => handleSort('logp')}>
+                  LogP <SortIcon k="logp" />
+                </th>
+                <th className="px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase cursor-pointer hover:text-[#1e3a5f] select-none hidden sm:table-cell"
+                  onClick={() => handleSort('mw')}>
+                  MW <SortIcon k="mw" />
+                </th>
+                {hasAdmet && (
+                  <th className="px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase hidden md:table-cell">ADMET</th>
                 )}
-              </div>
-            )
-          })}
+                {hasSource && (
+                  <th className="px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase hidden md:table-cell">Source</th>
+                )}
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map(({ mol, origIdx }, displayIdx) => {
+                const isSelected = selectedPoseIndex === origIdx
+                const sel = selections[origIdx]
+                const tag = sel?.tag || null
+                const isEliminated = mol.eliminated === true
+                const isGenerated = mol._isGeneratedMol
+
+                const rowBg = isSelected
+                  ? 'bg-blue-50/80 border-l-4 border-l-[#1e3a5f]'
+                  : tag === 'hit' ? 'bg-green-50/50'
+                  : tag === 'investigate' ? 'bg-yellow-50/50'
+                  : tag === 'discard' ? 'bg-gray-50/80'
+                  : isGenerated ? 'bg-purple-50/30 hover:bg-purple-50/60'
+                  : isEliminated ? 'bg-red-50/30'
+                  : 'hover:bg-blue-50/50'
+
+                return (
+                  <tr key={`${isGenerated ? 'gen' : 'dock'}-${origIdx}`}
+                    onClick={() => setSelectedPoseIndex(origIdx)}
+                    className={`border-b border-gray-50 cursor-pointer transition-colors ${rowBg}`}>
+                    {/* Tag buttons */}
+                    <td className="px-1 py-2" onClick={e => e.stopPropagation()}>
+                      <div className="flex gap-0.5">
+                        {['hit', 'investigate', 'discard'].map(t => (
+                          <TagButton key={t} tag={t} activeTag={tag}
+                            onClick={() => tag === t ? removeSelection(origIdx) : setTag(origIdx, t)} />
+                        ))}
+                      </div>
+                    </td>
+                    {/* Rank */}
+                    <td className="px-2 py-2">
+                      <span className={`w-6 h-6 text-xs font-medium rounded-full flex items-center justify-center ${
+                        displayIdx === 0 && !isGenerated ? 'bg-[#22c55e] text-white font-bold' : 'bg-gray-100 text-gray-500'
+                      }`}>{displayIdx + 1}</span>
+                    </td>
+                    {/* Name */}
+                    <td className="px-2 py-2 max-w-[200px]">
+                      <span className={`text-sm font-medium break-words ${
+                        isEliminated ? 'text-red-400 line-through' : isGenerated ? 'text-purple-700' : 'text-gray-800'
+                      }`} title={getName(mol)}>
+                        {getName(mol)}
+                      </span>
+                      {isEliminated && mol.elimination_reason && (
+                        <span className="block text-[10px] text-red-500">{mol.elimination_reason}</span>
+                      )}
+                    </td>
+                    {/* 2D SVG */}
+                    <td className="px-1 py-1">
+                      {mol.svg ? (
+                        <div className="w-9 h-9 [&>svg]:w-full [&>svg]:h-full" dangerouslySetInnerHTML={{ __html: mol.svg }} />
+                      ) : <div className="w-9 h-9 bg-gray-100 rounded flex items-center justify-center text-xs text-gray-400">-</div>}
+                    </td>
+                    {/* Affinity */}
+                    <td className="px-2 py-2">
+                      <span className={`text-sm font-mono font-semibold ${
+                        (mol.affinity || 0) < -9 ? 'text-green-600' : (mol.affinity || 0) < -7 ? 'text-blue-600' : 'text-gray-600'
+                      }`}>
+                        {mol.affinity != null ? Number(mol.affinity).toFixed(1) : 'N/A'}
+                      </span>
+                    </td>
+                    {/* Score */}
+                    <td className="px-2 py-2">
+                      {mol.composite_score != null ? (
+                        <span className={`inline-block px-2 py-0.5 rounded text-xs font-semibold ${
+                          mol.composite_score >= 0.7 ? 'text-green-700 bg-green-100' :
+                          mol.composite_score >= 0.4 ? 'text-yellow-700 bg-yellow-100' : 'text-red-700 bg-red-100'
+                        }`}>{Number(mol.composite_score).toFixed(2)}</span>
+                      ) : <span className="text-xs text-gray-400">N/A</span>}
+                    </td>
+                    {/* QED */}
+                    <td className="px-2 py-2">
+                      {mol.qed != null ? (
+                        <span className={`inline-block px-2 py-0.5 rounded text-xs font-semibold ${
+                          mol.qed >= 0.6 ? 'text-green-700 bg-green-100' :
+                          mol.qed >= 0.3 ? 'text-yellow-700 bg-yellow-100' : 'text-red-700 bg-red-100'
+                        }`}>{Number(mol.qed).toFixed(2)}</span>
+                      ) : <span className="text-xs text-gray-400">N/A</span>}
+                    </td>
+                    {/* LogP */}
+                    <td className="px-2 py-2 hidden sm:table-cell">
+                      <span className="text-sm text-gray-600 font-mono">{mol.logp != null ? Number(mol.logp).toFixed(1) : 'N/A'}</span>
+                    </td>
+                    {/* MW */}
+                    <td className="px-2 py-2 hidden sm:table-cell">
+                      <span className="text-sm text-gray-600">{mol.mw != null ? Math.round(mol.mw) : 'N/A'}</span>
+                    </td>
+                    {/* ADMET */}
+                    {hasAdmet && (
+                      <td className="px-2 py-2 hidden md:table-cell">
+                        {mol.admet ? (
+                          <span className="flex items-center gap-1">
+                            <span className={`w-2.5 h-2.5 rounded-full ${
+                              mol.admet.color_code === 'green' ? 'bg-green-500' :
+                              mol.admet.color_code === 'red' ? 'bg-red-500' : 'bg-yellow-400'
+                            }`} />
+                            <span className="text-xs text-gray-500 font-mono">
+                              {mol.admet.composite_score != null ? Number(mol.admet.composite_score).toFixed(2) : ''}
+                            </span>
+                          </span>
+                        ) : <span className="text-xs text-gray-300">-</span>}
+                      </td>
+                    )}
+                    {/* Source */}
+                    {hasSource && (
+                      <td className="px-2 py-2 hidden md:table-cell">
+                        {isGenerated ? <Badge variant="purple">AI</Badge>
+                          : mol.source?.toLowerCase().includes('zinc') ? <Badge variant="blue">ZINC</Badge>
+                          : mol.source ? <Badge variant="green">ChEMBL</Badge>
+                          : <span className="text-xs text-gray-400">-</span>}
+                      </td>
+                    )}
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="px-4 py-2 bg-gray-50 border-t border-gray-100 flex items-center gap-4 text-xs text-gray-400">
+        <span>Click a row to view 3D pose</span>
+        <span className="ml-auto">Tag molecules directly using Hit / Inv / X buttons</span>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Summary strip
+// ---------------------------------------------------------------------------
+
+function SummaryStrip({ results }) {
+  const allMols = [...(results.results || []), ...(results.generated_molecules || [])]
+  const bestScore = allMols.length > 0
+    ? Math.max(...allMols.map(m => (m.composite_score || 0) * 100))
+    : null
+  const bestAffinity = allMols.length > 0
+    ? Math.min(...allMols.filter(m => m.affinity != null).map(m => m.affinity))
+    : null
+  const pipelineSummary = results.pipeline_summary || {}
+  const hardCutoffs = pipelineSummary.hard_cutoffs || {}
+
+  return (
+    <div className="bg-[#1e3a5f] rounded-xl p-5 text-white">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <h2 className="text-xl font-bold mb-1">
+            Screening Results
+            <span className="ml-2 text-[#22c55e] font-mono text-lg">{results.uniprot_id}</span>
+          </h2>
+          <p className="text-white/60 text-sm">
+            {(results.results || []).length} ligands tested
+            {(results.generated_molecules || []).length > 0 && ` + ${results.generated_molecules.length} AI-generated`}
+            {hardCutoffs.passed != null && hardCutoffs.eliminated != null && (
+              <span className="ml-1">
+                &mdash; {hardCutoffs.passed}/{hardCutoffs.passed + hardCutoffs.eliminated} passed cutoffs
+              </span>
+            )}
+          </p>
+        </div>
+        <div className="flex gap-6 flex-shrink-0">
+          {bestScore != null && (
+            <div className="text-center">
+              <div className="text-3xl font-extrabold text-[#22c55e] leading-none">{Math.round(bestScore)}</div>
+              <div className="text-xs text-white/50 mt-0.5">Best Score</div>
+            </div>
+          )}
+          {bestAffinity != null && isFinite(bestAffinity) && (
+            <div className="text-center">
+              <div className="text-3xl font-extrabold text-[#22c55e] leading-none font-mono">{Number(bestAffinity).toFixed(1)}</div>
+              <div className="text-xs text-white/50 mt-0.5">kcal/mol</div>
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -154,74 +604,141 @@ function InlineHitTagger({ molecules }) {
 }
 
 // ---------------------------------------------------------------------------
-// ProjectResults inner (needs HitSelectionProvider wrapping per jobId)
+// Inner component — needs HitSelectionProvider wrapping
 // ---------------------------------------------------------------------------
+
 function ProjectResultsInner({ selectedJobId, results }) {
+  const { selections, setTag, clearAll } = useHitSelection()
   const [selectedPoseIndex, setSelectedPoseIndex] = useState(0)
-  const [showAllResults, setShowAllResults] = useState(false)
+  const [filters, setFilters] = useState({ ...DEFAULT_CUTOFFS })
+  const [showAutoHit, setShowAutoHit] = useState(false)
 
-  const allMols = results?.results || []
-  const selectedMol = allMols[selectedPoseIndex] || allMols[0] || null
+  // Merge all molecules (docking + generated)
+  const rawResults = results?.results || []
+  const generatedMols = (results?.generated_molecules || []).map(m => ({ ...m, _isGeneratedMol: true }))
+  const allMolsUnfiltered = useMemo(() => [...rawResults, ...generatedMols], [rawResults, generatedMols])
 
-  const handleSelect3D = useCallback((nameOrSmiles, mol) => {
-    if (!mol) return
-    const idx = results?.results?.findIndex(
-      (m) => m.name === mol.name || m.smiles === mol.smiles
-    ) ?? 0
-    setSelectedPoseIndex(Math.max(0, idx))
-    setShowAllResults(true)
-  }, [results])
+  // Apply filters
+  const allMols = useMemo(() => {
+    return allMolsUnfiltered.filter(mol => {
+      if (!filters.showEliminated && mol.eliminated) return false
+      const score = (mol.composite_score || 0) * 100
+      if (filters.minScore > 0 && score < filters.minScore) return false
+      if (filters.maxAffinity < 0 && (mol.affinity || 0) > filters.maxAffinity) return false
+      if (filters.minQED > 0 && (mol.qed || 0) < filters.minQED) return false
+      if (filters.maxLogP < 10 && (mol.logp || 0) > filters.maxLogP) return false
+      if (filters.maxMW < 2000 && (mol.mw || 0) > filters.maxMW) return false
+      if (filters.safetyLevels.length > 0) {
+        const code = mol.admet?.color_code
+        let level = code === 'green' ? 'Low' : code === 'red' ? 'High' : code === 'yellow' ? 'Medium' : 'Low'
+        if (!filters.safetyLevels.includes(level)) return false
+      }
+      if (filters.sources.length > 0) {
+        const src = (mol.source || '').toLowerCase()
+        const matched = filters.sources.some(s => {
+          if (s === 'AI') return src.includes('reinvent') || src.includes('generated') || src.includes('ai') || mol._isGeneratedMol
+          return src.includes(s.toLowerCase())
+        })
+        if (!matched) return false
+      }
+      return true
+    })
+  }, [allMolsUnfiltered, filters])
+
+  const selectedMol = allMolsUnfiltered[selectedPoseIndex] || allMolsUnfiltered[0] || null
+
+  const handleAutoHit = useCallback((criteria) => {
+    allMolsUnfiltered.forEach((mol, idx) => {
+      const score = (mol.composite_score || 0) * 100
+      if (score < criteria.minScore) return
+      if (criteria.maxAffinity < 0 && (mol.affinity || 0) > criteria.maxAffinity) return
+      if ((mol.qed || 0) < criteria.minQED) return
+      if ((mol.logp || 0) > criteria.maxLogP) return
+      if ((mol.mw || 0) > criteria.maxMW) return
+      if (criteria.lowToxicityOnly && mol.admet?.color_code !== 'green') return
+      if (mol.eliminated) return
+      setTag(idx, 'hit')
+    })
+    setShowAutoHit(false)
+  }, [allMolsUnfiltered, setTag])
+
+  const hasAdmet = allMolsUnfiltered.some(m => m.admet)
+  const hasSources = allMolsUnfiltered.some(m => m.source) || generatedMols.length > 0
 
   return (
-    <div className="space-y-6">
-      <HitSelectionBar />
+    <div className="space-y-5">
+      <SummaryStrip results={results} />
+      <HitBar />
 
-      {!showAllResults && (
-        <ResultsDashboard
-          results={results}
-          onSelect3D={handleSelect3D}
-          onShowAll={() => setShowAllResults(true)}
-          onOptimize={() => {}}
-        />
+      {/* Action buttons */}
+      <div className="flex items-center gap-3 flex-wrap">
+        <button onClick={() => setShowAutoHit(true)}
+          className="flex items-center gap-2 px-4 py-2 bg-[#22c55e] hover:bg-[#16a34a] text-white text-sm font-semibold rounded-lg transition-colors shadow-sm">
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+          </svg>
+          Auto-Select Hits
+        </button>
+        <button onClick={clearAll}
+          className="flex items-center gap-2 px-4 py-2 bg-white hover:bg-gray-50 text-gray-600 text-sm font-medium rounded-lg border border-gray-200 transition-colors">
+          Clear All Tags
+        </button>
+      </div>
+
+      <FilterBar
+        filters={filters} setFilters={setFilters}
+        counts={{ shown: allMols.length, total: allMolsUnfiltered.length }}
+        hasAdmet={hasAdmet} hasSources={hasSources}
+      />
+
+      {/* 3D Viewer + Molecule Card */}
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
+        <div className="xl:col-span-2">
+          <Viewer3D
+            jobId={selectedJobId}
+            results={results}
+            selectedPoseIndex={selectedPoseIndex}
+            onPoseSelect={setSelectedPoseIndex}
+          />
+        </div>
+        <div>
+          {selectedMol && (
+            <MoleculeCard molecule={selectedMol} rank={selectedPoseIndex + 1} jobId={selectedJobId} />
+          )}
+        </div>
+      </div>
+
+      {/* Full results table with inline tagging */}
+      <EnhancedResultsTable
+        allMols={allMols}
+        selectedPoseIndex={selectedPoseIndex}
+        setSelectedPoseIndex={setSelectedPoseIndex}
+        generatedMolCount={generatedMols.length}
+      />
+
+      {/* Pareto Front */}
+      {allMolsUnfiltered.some(m => m.pareto_objectives) && (
+        <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
+          <div className="px-5 py-3.5 bg-[#1e3a5f]">
+            <h3 className="text-white font-semibold text-sm">Multi-Objective Trade-Off (Pareto Front)</h3>
+          </div>
+          <div className="p-5">
+            <ParetoFront molecules={allMolsUnfiltered} onSelect={(mol) => {
+              const idx = allMolsUnfiltered.findIndex(m => m.name === mol.name || m.smiles === mol.smiles)
+              if (idx >= 0) setSelectedPoseIndex(idx)
+            }} />
+          </div>
+        </div>
       )}
 
-      {showAllResults && (
-        <div className="space-y-6">
-          <button
-            onClick={() => setShowAllResults(false)}
-            className="flex items-center gap-2 text-sm font-medium text-gray-500 hover:text-[#1e3a5f] transition-colors"
-          >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
-            </svg>
-            Back to Dashboard
-          </button>
+      <DownloadButtons jobId={selectedJobId} results={results} />
 
-          <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
-            <div className="xl:col-span-2">
-              <Viewer3D
-                jobId={selectedJobId}
-                results={results}
-                selectedIndex={selectedPoseIndex}
-                onSelectIndex={setSelectedPoseIndex}
-              />
-            </div>
-            <div>
-              {selectedMol && (
-                <MoleculeCard molecule={selectedMol} rank={selectedPoseIndex + 1} jobId={selectedJobId} />
-              )}
-            </div>
-          </div>
-
-          <ResultsTable results={results} onSelectMolecule={setSelectedPoseIndex} />
-          <InlineHitTagger molecules={allMols} />
-
-          {results.generated_molecules?.length > 0 && (
-            <GeneratedMols molecules={results.generated_molecules} />
-          )}
-
-          <DownloadButtons jobId={selectedJobId} results={results} />
-        </div>
+      {showAutoHit && (
+        <AutoHitDialog
+          molecules={allMolsUnfiltered}
+          onApply={handleAutoHit}
+          onClose={() => setShowAutoHit(false)}
+        />
       )}
     </div>
   )
@@ -243,12 +760,8 @@ export default function ProjectResults() {
   const runParam = searchParams.get('run')
   const selectedJobId = runParam || (completedJobs.length > 0 ? (completedJobs[0].id || completedJobs[0].job_id) : null)
 
-  // Fetch results when selectedJobId changes
   useEffect(() => {
-    if (!selectedJobId) {
-      setResults(null)
-      return
-    }
+    if (!selectedJobId) { setResults(null); return }
     setLoadingResults(true)
     setResultsError(null)
     getJobResults(selectedJobId)
@@ -257,7 +770,6 @@ export default function ProjectResults() {
       .finally(() => setLoadingResults(false))
   }, [selectedJobId])
 
-  // Guard: target not configured
   if (!loading && !isTargetConfigured) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
@@ -290,10 +802,6 @@ export default function ProjectResults() {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
         <div className="bg-gray-50 border border-gray-200 rounded-xl p-10 max-w-sm text-center">
-          <svg className="w-12 h-12 text-gray-300 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
-              d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-          </svg>
           <p className="text-sm font-semibold text-gray-600 mb-1">No completed runs</p>
           <p className="text-xs text-gray-400 mb-4">Results appear here once a run completes.</p>
           <Link to="../runs" relative="path"
@@ -306,7 +814,7 @@ export default function ProjectResults() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <div className="flex items-center justify-between gap-4">
         <h1 className="text-2xl font-bold text-[#1e3a5f]">Results</h1>
       </div>
@@ -319,15 +827,13 @@ export default function ProjectResults() {
             const jid = job.id || job.job_id
             const isSelected = jid === selectedJobId
             return (
-              <button
-                key={jid}
+              <button key={jid}
                 onClick={() => setSearchParams({ run: jid })}
                 className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
                   isSelected
                     ? 'border-[#1e3a5f] bg-[#1e3a5f] text-white'
                     : 'border-gray-200 text-gray-600 hover:border-gray-300 bg-white'
-                }`}
-              >
+                }`}>
                 {jid.slice(0, 8)}... <span className="text-xs opacity-60 capitalize">{job.mode || 'standard'}</span>
               </button>
             )
@@ -335,7 +841,6 @@ export default function ProjectResults() {
         </div>
       )}
 
-      {/* Results content */}
       {loadingResults && (
         <div className="flex items-center justify-center py-10">
           <svg className="w-6 h-6 animate-spin text-gray-400" fill="none" viewBox="0 0 24 24">

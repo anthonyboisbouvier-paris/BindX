@@ -83,6 +83,271 @@ function parseFasta(text) {
 }
 
 // ---------------------------------------------------------------------------
+// UniProt enrichment — fetch rich protein info for druggability context
+// ---------------------------------------------------------------------------
+
+function UniProtInfoCard({ uniprotId }) {
+  const [info, setInfo] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    if (!uniprotId) return
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+
+    fetch(`https://rest.uniprot.org/uniprotkb/${uniprotId}.json`)
+      .then(r => { if (!r.ok) throw new Error(`UniProt ${r.status}`); return r.json() })
+      .then(data => {
+        if (cancelled) return
+
+        // Extract key fields
+        const proteinName = data.proteinDescription?.recommendedName?.fullName?.value
+          || data.proteinDescription?.submittedName?.[0]?.fullName?.value || ''
+        const geneName = data.genes?.[0]?.geneName?.value || ''
+        const organism = data.organism?.scientificName || ''
+        const seqLength = data.sequence?.length || 0
+
+        // Function description
+        const functionComment = data.comments?.find(c => c.commentType === 'FUNCTION')
+        const functionText = functionComment?.texts?.[0]?.value || ''
+
+        // Subcellular location
+        const subCell = data.comments?.find(c => c.commentType === 'SUBCELLULAR LOCATION')
+        const locations = subCell?.subcellularLocations?.map(l => l.location?.value).filter(Boolean) || []
+
+        // Disease associations (druggability signal)
+        const diseaseComments = data.comments?.filter(c => c.commentType === 'DISEASE') || []
+        const diseases = diseaseComments.map(d => ({
+          name: d.disease?.diseaseId || d.disease?.description || '',
+          acronym: d.disease?.acronym || '',
+        })).filter(d => d.name)
+
+        // Protein families
+        const families = data.comments?.filter(c => c.commentType === 'SIMILARITY')
+          ?.map(c => c.texts?.[0]?.value)?.filter(Boolean) || []
+
+        // Keywords for druggability signals
+        const keywords = data.keywords?.map(k => ({ name: k.name, category: k.category })) || []
+        const druggabilityKeywords = keywords.filter(k =>
+          ['Disease', 'Molecular function', 'Biological process', 'Ligand'].includes(k.category)
+        )
+
+        // Cross-references for drug/clinical info
+        const xrefs = data.uniProtKBCrossReferences || []
+        const pdbCount = xrefs.filter(x => x.database === 'PDB').length
+        const drugBankRefs = xrefs.filter(x => x.database === 'DrugBank')
+        const openTargetsRefs = xrefs.filter(x => x.database === 'OpenTargets')
+        const chemblRefs = xrefs.filter(x => x.database === 'ChEMBL')
+
+        // Tissue specificity
+        const tissueComment = data.comments?.find(c => c.commentType === 'TISSUE SPECIFICITY')
+        const tissueText = tissueComment?.texts?.[0]?.value || ''
+
+        // PTMs
+        const ptmComment = data.comments?.find(c => c.commentType === 'PTM')
+        const ptmText = ptmComment?.texts?.[0]?.value || ''
+
+        // Pharmaceutical use
+        const pharmaComment = data.comments?.find(c => c.commentType === 'PHARMACEUTICAL')
+        const pharmaText = pharmaComment?.texts?.[0]?.value || ''
+
+        // Involvement in disease (strong druggability signal)
+        const involvementComment = data.comments?.find(c => c.commentType === 'INVOLVEMENT IN DISEASE')
+        const involvementText = involvementComment?.texts?.[0]?.value || ''
+
+        setInfo({
+          proteinName, geneName, organism, seqLength,
+          functionText, locations, diseases, families,
+          druggabilityKeywords, pdbCount, drugBankRefs,
+          openTargetsRefs, chemblRefs, tissueText,
+          ptmText, pharmaText, involvementText,
+        })
+      })
+      .catch(err => { if (!cancelled) setError(err.message) })
+      .finally(() => { if (!cancelled) setLoading(false) })
+
+    return () => { cancelled = true }
+  }, [uniprotId])
+
+  if (loading) {
+    return (
+      <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
+        <div className="flex items-center gap-3 text-gray-400">
+          <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+          </svg>
+          <span className="text-sm">Fetching UniProt data...</span>
+        </div>
+      </div>
+    )
+  }
+
+  if (error || !info) return null
+
+  const hasDrugs = info.drugBankRefs.length > 0
+  const hasOpenTargets = info.openTargetsRefs.length > 0
+  const hasDiseases = info.diseases.length > 0
+
+  // Druggability assessment
+  let druggabilityLevel = 'Unknown'
+  let druggabilityColor = 'bg-gray-100 text-gray-600 border-gray-200'
+  if (hasDrugs) {
+    druggabilityLevel = 'Validated Target'
+    druggabilityColor = 'bg-green-100 text-green-700 border-green-200'
+  } else if (hasDiseases && info.pdbCount > 0) {
+    druggabilityLevel = 'High Potential'
+    druggabilityColor = 'bg-blue-100 text-blue-700 border-blue-200'
+  } else if (hasDiseases) {
+    druggabilityLevel = 'Emerging Target'
+    druggabilityColor = 'bg-yellow-100 text-yellow-700 border-yellow-200'
+  } else if (info.pdbCount > 0) {
+    druggabilityLevel = 'Structurally Characterized'
+    druggabilityColor = 'bg-gray-100 text-gray-600 border-gray-200'
+  }
+
+  // Innovation assessment
+  let innovationLevel = 'Standard'
+  let innovationColor = 'bg-gray-100 text-gray-600 border-gray-200'
+  if (!hasDrugs && hasDiseases) {
+    innovationLevel = 'Novel — No approved drugs'
+    innovationColor = 'bg-purple-100 text-purple-700 border-purple-200'
+  } else if (hasDrugs && info.drugBankRefs.length <= 2) {
+    innovationLevel = 'Underexplored — Few drugs'
+    innovationColor = 'bg-indigo-100 text-indigo-700 border-indigo-200'
+  } else if (hasDrugs && info.drugBankRefs.length > 5) {
+    innovationLevel = 'Well-established'
+    innovationColor = 'bg-green-100 text-green-700 border-green-200'
+  }
+
+  return (
+    <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5 space-y-4">
+      <div className="flex items-center justify-between">
+        <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">UniProt Intelligence</h3>
+        <a
+          href={`https://www.uniprot.org/uniprot/${uniprotId}`}
+          target="_blank" rel="noopener noreferrer"
+          className="text-xs text-[#1e3a5f] hover:underline font-medium"
+          onClick={(e) => e.stopPropagation()}
+        >
+          View on UniProt
+        </a>
+      </div>
+
+      {/* Header info */}
+      <div className="flex items-start gap-4">
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap mb-1">
+            {info.geneName && (
+              <span className="text-sm font-bold text-[#1e3a5f]">{info.geneName}</span>
+            )}
+            <span className="text-xs text-gray-400 font-mono">{uniprotId}</span>
+            <span className="text-xs text-gray-400">{info.organism}</span>
+            <span className="text-xs text-gray-400">{info.seqLength} aa</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Assessment badges */}
+      <div className="flex flex-wrap gap-2">
+        <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold border ${druggabilityColor}`}>
+          {druggabilityLevel}
+        </span>
+        <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold border ${innovationColor}`}>
+          {innovationLevel}
+        </span>
+        {info.pdbCount > 0 && (
+          <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold border bg-blue-50 text-blue-700 border-blue-200">
+            {info.pdbCount} PDB structures
+          </span>
+        )}
+        {hasDrugs && (
+          <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold border bg-green-50 text-green-700 border-green-200">
+            {info.drugBankRefs.length} DrugBank {info.drugBankRefs.length === 1 ? 'entry' : 'entries'}
+          </span>
+        )}
+      </div>
+
+      {/* Function */}
+      {info.functionText && (
+        <div>
+          <p className="text-xs font-semibold text-gray-500 mb-1">Function</p>
+          <p className="text-xs text-gray-600 leading-relaxed line-clamp-4">{info.functionText}</p>
+        </div>
+      )}
+
+      {/* Grid of details */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        {/* Disease associations */}
+        {hasDiseases && (
+          <div className="bg-red-50/50 rounded-lg p-3">
+            <p className="text-xs font-semibold text-red-700 mb-1.5">Disease Associations</p>
+            <div className="space-y-1">
+              {info.diseases.slice(0, 5).map((d, i) => (
+                <p key={i} className="text-xs text-red-600">
+                  {d.acronym ? `${d.acronym} — ` : ''}{d.name}
+                </p>
+              ))}
+              {info.diseases.length > 5 && (
+                <p className="text-xs text-red-400">+{info.diseases.length - 5} more</p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Subcellular location */}
+        {info.locations.length > 0 && (
+          <div className="bg-blue-50/50 rounded-lg p-3">
+            <p className="text-xs font-semibold text-blue-700 mb-1.5">Subcellular Location</p>
+            <p className="text-xs text-blue-600">{info.locations.slice(0, 4).join(', ')}</p>
+          </div>
+        )}
+
+        {/* Tissue specificity */}
+        {info.tissueText && (
+          <div className="bg-purple-50/50 rounded-lg p-3">
+            <p className="text-xs font-semibold text-purple-700 mb-1.5">Tissue Expression</p>
+            <p className="text-xs text-purple-600 leading-relaxed line-clamp-3">{info.tissueText}</p>
+          </div>
+        )}
+
+        {/* Pharmaceutical use */}
+        {info.pharmaText && (
+          <div className="bg-green-50/50 rounded-lg p-3">
+            <p className="text-xs font-semibold text-green-700 mb-1.5">Pharmaceutical Use</p>
+            <p className="text-xs text-green-600 leading-relaxed line-clamp-3">{info.pharmaText}</p>
+          </div>
+        )}
+      </div>
+
+      {/* Keywords / molecular function tags */}
+      {info.druggabilityKeywords.length > 0 && (
+        <div>
+          <p className="text-xs font-semibold text-gray-500 mb-1.5">Functional Keywords</p>
+          <div className="flex flex-wrap gap-1">
+            {info.druggabilityKeywords.slice(0, 12).map((kw, i) => (
+              <span key={i} className="px-2 py-0.5 bg-gray-100 text-gray-600 text-[10px] font-medium rounded-full">
+                {kw.name}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Protein family */}
+      {info.families.length > 0 && (
+        <div>
+          <p className="text-xs font-semibold text-gray-500 mb-1">Protein Family</p>
+          <p className="text-xs text-gray-600 leading-relaxed">{info.families[0]}</p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // ProteinPreviewViewer — lightweight 3D viewer for Target Setup
 // ---------------------------------------------------------------------------
 
@@ -402,6 +667,11 @@ export default function TargetSetup() {
           </div>
         )}
       </div>
+
+      {/* UniProt Intelligence — shown after UniProt validation */}
+      {hasPreview && inputMode === 'uniprot' && uniprotId && (
+        <UniProtInfoCard uniprotId={uniprotId} />
+      )}
 
       {/* Step 2 — Structure selection (all available options) */}
       {hasPreview && (

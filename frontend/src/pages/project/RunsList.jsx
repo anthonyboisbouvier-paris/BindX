@@ -24,8 +24,9 @@ function StatusBadge({ status }) {
 }
 
 function TypeLabel({ mode }) {
-  if (mode === 'rapid') return <span className="text-xs font-medium text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded">HTS Screening</span>
-  if (mode === 'standard' || mode === 'deep') return <span className="text-xs font-medium text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded">Optimization (AI)</span>
+  if (mode === 'rapid') return <span className="text-xs font-medium text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded">Rapid Screening</span>
+  if (mode === 'standard') return <span className="text-xs font-medium text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded">Standard + ADMET</span>
+  if (mode === 'deep') return <span className="text-xs font-medium text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded">Deep Screening</span>
   return <span className="text-xs text-gray-400">{mode || '—'}</span>
 }
 
@@ -102,7 +103,7 @@ export default function RunsList() {
     }
 
     if (ligandSource === 'custom' && customSmiles.trim()) {
-      params.custom_smiles = customSmiles.split('\n').map(s => s.trim()).filter(Boolean)
+      params.smiles_list = customSmiles.split('\n').map(s => s.trim()).filter(Boolean)
     }
 
     try {
