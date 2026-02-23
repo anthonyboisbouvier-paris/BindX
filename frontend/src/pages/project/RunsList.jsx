@@ -23,9 +23,13 @@ function StatusBadge({ status }) {
   )
 }
 
-function TypeLabel({ mode }) {
+function TypeLabel({ mode, enableGeneration, hasCustomSmiles }) {
+  // Optimization runs: standard mode with custom SMILES seed
+  if (hasCustomSmiles && (mode === 'standard' || mode === 'deep')) {
+    return <span className="text-xs font-medium text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded">Optimization</span>
+  }
   if (mode === 'rapid') return <span className="text-xs font-medium text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded">Rapid Screening</span>
-  if (mode === 'standard') return <span className="text-xs font-medium text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded">Standard + ADMET</span>
+  if (mode === 'standard') return <span className="text-xs font-medium text-teal-700 bg-teal-50 px-1.5 py-0.5 rounded">Standard + ADMET</span>
   if (mode === 'deep') return <span className="text-xs font-medium text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded">Deep Screening</span>
   return <span className="text-xs text-gray-400">{mode || '—'}</span>
 }
@@ -416,7 +420,7 @@ export default function RunsList() {
                       </span>
                     </td>
                     <td className="py-3.5 px-4 hidden sm:table-cell">
-                      <TypeLabel mode={row.mode} />
+                      <TypeLabel mode={row.mode} enableGeneration={row.enable_generation} hasCustomSmiles={row.has_custom_smiles} />
                     </td>
                     <td className="py-3.5 px-4 hidden md:table-cell">
                       <span className="text-xs text-gray-500 capitalize">{row.mode || '—'}</span>

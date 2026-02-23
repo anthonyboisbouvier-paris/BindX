@@ -780,7 +780,7 @@ export default function TargetSetup() {
                         className="mt-1 accent-[#1e3a5f]"
                       />
                       <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1">
+                        <div className="flex items-center gap-2 mb-1 flex-wrap">
                           <span className="text-sm font-semibold text-[#1e3a5f]">
                             Pocket {pocket.rank || idx + 1}
                           </span>
@@ -789,13 +789,43 @@ export default function TargetSetup() {
                               Recommended
                             </span>
                           )}
+                          {pocket.method && (
+                            <span className={`px-1.5 py-0.5 text-xs font-medium rounded ${
+                              pocket.method === 'co-crystallized_ligand' ? 'bg-green-100 text-green-700' :
+                              pocket.method === 'p2rank' ? 'bg-blue-100 text-blue-700' :
+                              'bg-gray-100 text-gray-600'
+                            }`}>
+                              {pocket.method === 'co-crystallized_ligand' ? 'Experimental' :
+                               pocket.method === 'p2rank' || pocket.method === 'p2rank_mock' ? 'P2Rank ML' :
+                               pocket.method === 'fpocket' ? 'fpocket' : pocket.method}
+                            </span>
+                          )}
                         </div>
-                        <div className="flex items-center gap-4 text-xs text-gray-500 mb-2">
-                          {pocket.n_residues != null && <span>{pocket.n_residues} residues</span>}
-                          {pocket.volume != null && <span>Volume: {Number(pocket.volume).toFixed(0)} Å³</span>}
+                        <div className="flex items-center gap-4 text-xs text-gray-500 mb-2 flex-wrap">
+                          {(pocket.residues_count || pocket.n_residues) != null && (
+                            <span>{pocket.residues_count || pocket.n_residues} residues</span>
+                          )}
+                          {pocket.volume > 0 && <span>Volume: {Number(pocket.volume).toFixed(0)} Å³</span>}
+                          {pocket.center && Array.isArray(pocket.center) && (
+                            <span className="text-gray-400 font-mono text-[10px]">
+                              ({pocket.center.map(c => Number(c).toFixed(1)).join(', ')})
+                            </span>
+                          )}
                         </div>
                         {(pocket.probability != null || pocket.druggability != null) && (
                           <DruggabilityBar value={pocket.probability ?? pocket.druggability} />
+                        )}
+                        {pocket.explanation && (
+                          <p className="text-xs text-gray-400 mt-2 leading-relaxed">{pocket.explanation}</p>
+                        )}
+                        {pocket.residues && pocket.residues.length > 0 && selectedPocketIdx === idx && (
+                          <div className="mt-2 p-2 bg-gray-50 rounded-lg">
+                            <p className="text-[10px] text-gray-400 font-semibold uppercase mb-1">Key Residues</p>
+                            <p className="text-xs text-gray-600 font-mono leading-relaxed break-all">
+                              {pocket.residues.slice(0, 20).join(', ')}
+                              {pocket.residues.length > 20 && <span className="text-gray-400"> +{pocket.residues.length - 20} more</span>}
+                            </p>
+                          </div>
                         )}
                       </div>
                     </div>
@@ -836,6 +866,95 @@ export default function TargetSetup() {
               No ChEMBL data found. You can still screen using ZINC or custom SMILES.
             </p>
           )}
+        </div>
+      )}
+
+      {/* Druggability Assessment — computed from all available data */}
+      {hasPreview && (
+        <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <div className="w-7 h-7 rounded-full bg-[#1e3a5f] flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+              </svg>
+            </div>
+            <h3 className="text-sm font-bold text-[#1e3a5f]">Druggability Assessment</h3>
+          </div>
+          {(() => {
+            // Compute druggability score from available data
+            const factors = []
+            let score = 0
+            let maxScore = 0
+
+            // Structure quality
+            const structSrc = structures?.[0]?.source
+            if (structSrc === 'pdb_experimental') { factors.push({ label: 'Experimental structure (PDB)', status: 'green', points: 3 }); score += 3 }
+            else if (structSrc === 'alphafold') { factors.push({ label: 'AlphaFold predicted structure', status: 'yellow', points: 2 }); score += 2 }
+            else if (structSrc) { factors.push({ label: 'Predicted structure (ESMFold)', status: 'yellow', points: 1 }); score += 1 }
+            maxScore += 3
+
+            // Pocket quality
+            const topPocket = pockets[0]
+            if (topPocket) {
+              const prob = topPocket.probability ?? 0
+              if (topPocket.method === 'co-crystallized_ligand') { factors.push({ label: 'Experimentally validated pocket', status: 'green', points: 3 }); score += 3 }
+              else if (prob >= 0.7) { factors.push({ label: `High-confidence pocket (${(prob * 100).toFixed(0)}%)`, status: 'green', points: 2 }); score += 2 }
+              else if (prob >= 0.4) { factors.push({ label: `Moderate pocket confidence (${(prob * 100).toFixed(0)}%)`, status: 'yellow', points: 1 }); score += 1 }
+              else { factors.push({ label: `Low pocket confidence (${(prob * 100).toFixed(0)}%)`, status: 'red', points: 0 }) }
+            } else {
+              factors.push({ label: 'No pocket detected', status: 'red', points: 0 })
+            }
+            maxScore += 3
+
+            // Known actives
+            if (chembl?.has_data && chembl.n_actives > 100) { factors.push({ label: `${chembl.n_actives} known actives (ChEMBL)`, status: 'green', points: 2 }); score += 2 }
+            else if (chembl?.has_data && chembl.n_actives > 0) { factors.push({ label: `${chembl.n_actives} known actives (ChEMBL)`, status: 'yellow', points: 1 }); score += 1 }
+            else { factors.push({ label: 'No known actives in ChEMBL', status: 'red', points: 0 }) }
+            maxScore += 2
+
+            // Resolution (if PDB)
+            const resolution = structures?.[0]?.resolution
+            if (resolution && resolution <= 2.5) { factors.push({ label: `High resolution (${resolution} Å)`, status: 'green', points: 1 }); score += 1 }
+            else if (resolution && resolution <= 3.5) { factors.push({ label: `Moderate resolution (${resolution} Å)`, status: 'yellow', points: 0.5 }); score += 0.5 }
+            maxScore += 1
+
+            const pct = Math.round((score / maxScore) * 100)
+            const level = pct >= 75 ? 'High' : pct >= 50 ? 'Moderate' : pct >= 25 ? 'Low' : 'Very Low'
+            const levelColor = pct >= 75 ? 'text-green-700 bg-green-100' : pct >= 50 ? 'text-yellow-700 bg-yellow-100' : 'text-red-700 bg-red-100'
+
+            return (
+              <div>
+                <div className="flex items-center gap-3 mb-4">
+                  <div className="flex-1">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className={`px-2 py-0.5 rounded text-xs font-bold ${levelColor}`}>{level} Druggability</span>
+                      <span className="text-sm font-bold text-[#1e3a5f]">{pct}%</span>
+                    </div>
+                    <div className="w-full h-2 bg-gray-100 rounded-full overflow-hidden">
+                      <div className={`h-full rounded-full transition-all ${
+                        pct >= 75 ? 'bg-green-500' : pct >= 50 ? 'bg-yellow-400' : 'bg-red-400'
+                      }`} style={{ width: `${pct}%` }} />
+                    </div>
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  {factors.map((f, i) => (
+                    <div key={i} className="flex items-center gap-2 text-xs">
+                      <span className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                        f.status === 'green' ? 'bg-green-500' : f.status === 'yellow' ? 'bg-yellow-400' : 'bg-red-400'
+                      }`} />
+                      <span className="text-gray-600">{f.label}</span>
+                    </div>
+                  ))}
+                </div>
+                {pct < 50 && (
+                  <p className="text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-2 mt-3">
+                    Low druggability score suggests this target may be challenging. Consider experimental validation before investing in large-scale screening.
+                  </p>
+                )}
+              </div>
+            )
+          })()}
         </div>
       )}
 

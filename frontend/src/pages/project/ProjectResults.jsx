@@ -10,6 +10,8 @@ import DownloadButtons from '../../components/DownloadButtons.jsx'
 import ParetoFront from '../../components/ParetoFront.jsx'
 import InfoTip from '../../components/InfoTip.jsx'
 import Badge from '../../components/Badge.jsx'
+import SafetyReport from '../../components/SafetyReport.jsx'
+import ConfidenceBreakdown from '../../components/ConfidenceBreakdown.jsx'
 
 // ---------------------------------------------------------------------------
 // Filter bar with configurable criteria
@@ -310,6 +312,206 @@ function HitBar() {
 }
 
 // ---------------------------------------------------------------------------
+// Modal overlay
+// ---------------------------------------------------------------------------
+
+function Modal({ title, onClose, children }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 backdrop-blur-sm pt-8 pb-8 px-4 overflow-y-auto">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl">
+        <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100">
+          <h2 className="font-bold text-[#1e3a5f] text-base">{title}</h2>
+          <button onClick={onClose}
+            className="w-8 h-8 rounded-lg hover:bg-gray-100 flex items-center justify-center text-gray-400 hover:text-gray-700 transition-colors">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+        <div className="p-5">{children}</div>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Safety & Selectivity panel for selected molecule
+// ---------------------------------------------------------------------------
+
+function SafetyConfidencePanel({ mol, pipelineSummary, onSafetyReport, onConfidenceBreakdown }) {
+  if (!mol) return null
+
+  const offTarget = mol.off_target
+  const confidence = mol.confidence
+  const herg = mol.herg_specialized
+  const seaResults = offTarget?.sea_results
+  const admetDomain = mol.admet_domain?.status ?? mol.admet?.applicability_domain?.status ?? null
+  const cnnScore = mol.cnn_score ?? mol.gnina_cnn_score ?? null
+  const clusterId = mol.cluster_id ?? null
+  const interactions = mol.interactions
+  const synthCost = mol.synthesis_route?.cost_estimate?.total_cost_usd
+
+  const hasAny = offTarget || confidence || herg || seaResults || admetDomain || cnnScore != null || interactions || synthCost != null
+
+  if (!hasAny) return null
+
+  return (
+    <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-4 space-y-3">
+      <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Safety & Advanced Metrics</h3>
+
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+        {/* Off-target selectivity */}
+        {offTarget && offTarget.n_total > 0 && (
+          <div className="p-2.5 bg-gray-50 rounded-lg">
+            <p className="text-[10px] text-gray-400 font-semibold uppercase mb-1">Selectivity</p>
+            <div className="flex items-center gap-1.5">
+              <span className={`w-2.5 h-2.5 rounded-full ${
+                (offTarget.n_safe / offTarget.n_total) >= 0.9 ? 'bg-green-500' :
+                (offTarget.n_safe / offTarget.n_total) >= 0.7 ? 'bg-yellow-400' : 'bg-red-500'
+              }`} />
+              <span className="text-sm font-semibold text-gray-700">{offTarget.n_safe}/{offTarget.n_total} safe</span>
+            </div>
+          </div>
+        )}
+
+        {/* Confidence */}
+        {confidence?.overall != null && (
+          <div className="p-2.5 bg-gray-50 rounded-lg cursor-pointer hover:bg-blue-50 transition-colors"
+            onClick={onConfidenceBreakdown}>
+            <p className="text-[10px] text-gray-400 font-semibold uppercase mb-1">Confidence</p>
+            <span className={`text-sm font-bold ${
+              confidence.overall >= 0.7 ? 'text-green-600' : confidence.overall >= 0.5 ? 'text-yellow-600' : 'text-red-500'
+            }`}>{Math.round(confidence.overall * 100)}%</span>
+            <span className="text-[10px] text-blue-500 ml-1">details</span>
+          </div>
+        )}
+
+        {/* hERG risk */}
+        {herg?.risk_level && (
+          <div className="p-2.5 bg-gray-50 rounded-lg">
+            <p className="text-[10px] text-gray-400 font-semibold uppercase mb-1">hERG Risk</p>
+            <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold border ${
+              herg.risk_level.toUpperCase() === 'LOW' ? 'bg-green-100 text-green-700 border-green-200' :
+              herg.risk_level.toUpperCase() === 'MODERATE' ? 'bg-yellow-100 text-yellow-700 border-yellow-200' :
+              'bg-red-100 text-red-700 border-red-200'
+            }`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${
+                herg.risk_level.toUpperCase() === 'LOW' ? 'bg-green-500' :
+                herg.risk_level.toUpperCase() === 'MODERATE' ? 'bg-yellow-400' : 'bg-red-500'
+              }`} />
+              {herg.risk_level.toUpperCase()}
+            </span>
+          </div>
+        )}
+
+        {/* SEA screening */}
+        {seaResults && (
+          <div className="p-2.5 bg-gray-50 rounded-lg">
+            <p className="text-[10px] text-gray-400 font-semibold uppercase mb-1">SEA Screening</p>
+            {(() => {
+              const nHits = seaResults.targets_hit?.length ?? 0
+              const nScreened = seaResults.n_targets_screened
+              return (
+                <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold border ${
+                  nHits === 0 ? 'bg-green-100 text-green-700 border-green-200' :
+                  nHits <= 3 ? 'bg-yellow-100 text-yellow-700 border-yellow-200' :
+                  'bg-red-100 text-red-700 border-red-200'
+                }`}>
+                  {nHits} target{nHits !== 1 ? 's' : ''}
+                  {nScreened != null && <span className="font-normal opacity-70">/ {nScreened.toLocaleString()}</span>}
+                </span>
+              )
+            })()}
+          </div>
+        )}
+
+        {/* CNN Score */}
+        {cnnScore != null && (
+          <div className="p-2.5 bg-gray-50 rounded-lg">
+            <p className="text-[10px] text-gray-400 font-semibold uppercase mb-1">CNN Score</p>
+            <span className="text-sm font-bold text-[#1e3a5f]">{Number(cnnScore).toFixed(3)}</span>
+          </div>
+        )}
+
+        {/* ADMET Domain */}
+        {admetDomain && (
+          <div className="p-2.5 bg-gray-50 rounded-lg">
+            <p className="text-[10px] text-gray-400 font-semibold uppercase mb-1">ADMET Domain</p>
+            <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold border ${
+              admetDomain === 'in_domain' ? 'bg-green-100 text-green-700 border-green-200' :
+              admetDomain === 'partial' ? 'bg-yellow-100 text-yellow-700 border-yellow-200' :
+              'bg-red-100 text-red-700 border-red-200'
+            }`}>
+              {admetDomain === 'in_domain' ? 'In Domain' : admetDomain === 'partial' ? 'Partial' : 'Out of Domain'}
+            </span>
+          </div>
+        )}
+
+        {/* Interactions quality */}
+        {interactions && (
+          <div className="p-2.5 bg-gray-50 rounded-lg">
+            <p className="text-[10px] text-gray-400 font-semibold uppercase mb-1">Interactions</p>
+            <div className="flex items-center gap-2">
+              <div className="flex-1 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                <div className={`h-full rounded-full ${
+                  (interactions.interaction_quality ?? 0) >= 0.6 ? 'bg-green-500' :
+                  (interactions.interaction_quality ?? 0) >= 0.3 ? 'bg-yellow-400' : 'bg-red-400'
+                }`} style={{ width: `${Math.round((interactions.interaction_quality ?? 0) * 100)}%` }} />
+              </div>
+              <span className="text-xs font-semibold text-gray-600">
+                {interactions.functional_contacts ?? 0}/{interactions.total_functional ?? 0}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* Cluster/family */}
+        {clusterId != null && (
+          <div className="p-2.5 bg-gray-50 rounded-lg">
+            <p className="text-[10px] text-gray-400 font-semibold uppercase mb-1">Chemical Family</p>
+            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-indigo-100 text-indigo-700 border border-indigo-200">
+              Family {clusterId + 1}
+            </span>
+          </div>
+        )}
+
+        {/* Synthesis cost */}
+        {synthCost != null && (
+          <div className="p-2.5 bg-gray-50 rounded-lg">
+            <p className="text-[10px] text-gray-400 font-semibold uppercase mb-1">Synth. Cost</p>
+            <span className="text-sm font-semibold text-gray-700 font-mono">
+              ${Number(synthCost).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Action buttons */}
+      <div className="flex gap-2 pt-1">
+        {offTarget && (
+          <button onClick={onSafetyReport}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#1e3a5f] bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg transition-colors">
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+            </svg>
+            Full Safety Report
+          </button>
+        )}
+        {confidence && (
+          <button onClick={onConfidenceBreakdown}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#1e3a5f] bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg transition-colors">
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+            </svg>
+            Confidence Breakdown
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Enhanced results table with inline hit tagging
 // ---------------------------------------------------------------------------
 
@@ -352,6 +554,8 @@ function EnhancedResultsTable({ allMols, selectedPoseIndex, setSelectedPoseIndex
 
   const hasAdmet = allMols.some(m => m.admet)
   const hasSource = allMols.some(m => m.source) || generatedMolCount > 0
+  const hasOffTarget = allMols.some(m => m.off_target?.n_total > 0)
+  const hasConfidence = allMols.some(m => m.confidence?.overall != null)
 
   const SortIcon = ({ k }) => {
     if (sortKey !== k) return <svg className="w-3 h-3 text-gray-300 inline ml-0.5" fill="currentColor" viewBox="0 0 20 20"><path d="M5 10l5-5 5 5H5z" /></svg>
@@ -420,6 +624,12 @@ function EnhancedResultsTable({ allMols, selectedPoseIndex, setSelectedPoseIndex
                 )}
                 {hasSource && (
                   <th className="px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase hidden md:table-cell">Source</th>
+                )}
+                {hasOffTarget && (
+                  <th className="px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase hidden lg:table-cell">Safety</th>
+                )}
+                {hasConfidence && (
+                  <th className="px-2 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase hidden lg:table-cell">Conf.</th>
                 )}
               </tr>
             </thead>
@@ -535,6 +745,31 @@ function EnhancedResultsTable({ allMols, selectedPoseIndex, setSelectedPoseIndex
                           : <span className="text-xs text-gray-400">-</span>}
                       </td>
                     )}
+                    {/* Off-target safety */}
+                    {hasOffTarget && (
+                      <td className="px-2 py-2 hidden lg:table-cell">
+                        {mol.off_target?.n_total > 0 ? (
+                          <span className="flex items-center gap-1">
+                            <span className={`w-2 h-2 rounded-full ${
+                              (mol.off_target.n_safe / mol.off_target.n_total) >= 0.9 ? 'bg-green-500' :
+                              (mol.off_target.n_safe / mol.off_target.n_total) >= 0.7 ? 'bg-yellow-400' : 'bg-red-500'
+                            }`} />
+                            <span className="text-xs text-gray-500">{mol.off_target.n_safe}/{mol.off_target.n_total}</span>
+                          </span>
+                        ) : <span className="text-xs text-gray-300">-</span>}
+                      </td>
+                    )}
+                    {/* Confidence */}
+                    {hasConfidence && (
+                      <td className="px-2 py-2 hidden lg:table-cell">
+                        {mol.confidence?.overall != null ? (
+                          <span className={`text-xs font-semibold ${
+                            mol.confidence.overall >= 0.7 ? 'text-green-600' :
+                            mol.confidence.overall >= 0.5 ? 'text-yellow-600' : 'text-red-500'
+                          }`}>{Math.round(mol.confidence.overall * 100)}%</span>
+                        ) : <span className="text-xs text-gray-300">-</span>}
+                      </td>
+                    )}
                   </tr>
                 )
               })}
@@ -607,11 +842,13 @@ function SummaryStrip({ results }) {
 // Inner component — needs HitSelectionProvider wrapping
 // ---------------------------------------------------------------------------
 
-function ProjectResultsInner({ selectedJobId, results }) {
+function ProjectResultsInner({ selectedJobId, results, targetConfig }) {
   const { selections, setTag, clearAll } = useHitSelection()
   const [selectedPoseIndex, setSelectedPoseIndex] = useState(0)
   const [filters, setFilters] = useState({ ...DEFAULT_CUTOFFS })
   const [showAutoHit, setShowAutoHit] = useState(false)
+  const [safetyMol, setSafetyMol] = useState(null)
+  const [confidenceMol, setConfidenceMol] = useState(null)
 
   // Merge all molecules (docking + generated)
   const rawResults = results?.results || []
@@ -699,11 +936,31 @@ function ProjectResultsInner({ selectedJobId, results }) {
             results={results}
             selectedPoseIndex={selectedPoseIndex}
             onPoseSelect={setSelectedPoseIndex}
+            pocketCenter={(() => {
+              const pockets = targetConfig?.pockets
+              const selIdx = targetConfig?.selected_pocket_idx ?? 0
+              const pocket = pockets?.[selIdx] || pockets?.[0]
+              return pocket?.center || null
+            })()}
+            pocketResidues={(() => {
+              const pockets = targetConfig?.pockets
+              const selIdx = targetConfig?.selected_pocket_idx ?? 0
+              const pocket = pockets?.[selIdx] || pockets?.[0]
+              return pocket?.residues || null
+            })()}
           />
         </div>
-        <div>
+        <div className="space-y-4">
           {selectedMol && (
             <MoleculeCard molecule={selectedMol} rank={selectedPoseIndex + 1} jobId={selectedJobId} />
+          )}
+          {selectedMol && (
+            <SafetyConfidencePanel
+              mol={selectedMol}
+              pipelineSummary={results?.pipeline_summary}
+              onSafetyReport={() => setSafetyMol(selectedMol)}
+              onConfidenceBreakdown={() => setConfidenceMol(selectedMol)}
+            />
           )}
         </div>
       </div>
@@ -740,6 +997,27 @@ function ProjectResultsInner({ selectedJobId, results }) {
           onClose={() => setShowAutoHit(false)}
         />
       )}
+
+      {/* Safety Report modal */}
+      {safetyMol && (
+        <Modal title="Off-Target Safety Report" onClose={() => setSafetyMol(null)}>
+          <SafetyReport
+            offTargetResults={{ ...safetyMol.off_target, ...safetyMol.combined_off_target }}
+            moleculeName={safetyMol.name || safetyMol.ligand_name}
+          />
+        </Modal>
+      )}
+
+      {/* Confidence Breakdown modal */}
+      {confidenceMol && (
+        <Modal title="Confidence Breakdown" onClose={() => setConfidenceMol(null)}>
+          <ConfidenceBreakdown
+            confidence={confidenceMol.confidence}
+            moleculeName={confidenceMol.name || confidenceMol.ligand_name}
+            pipeline_summary={results?.pipeline_summary || {}}
+          />
+        </Modal>
+      )}
     </div>
   )
 }
@@ -749,7 +1027,7 @@ function ProjectResultsInner({ selectedJobId, results }) {
 // ---------------------------------------------------------------------------
 
 export default function ProjectResults() {
-  const { jobs, loading, error, isTargetConfigured } = useProject()
+  const { jobs, loading, error, isTargetConfigured, targetConfig } = useProject()
   const [searchParams, setSearchParams] = useSearchParams()
 
   const [results, setResults] = useState(null)
@@ -856,7 +1134,7 @@ export default function ProjectResults() {
 
       {selectedJobId && results && !loadingResults && (
         <HitSelectionProvider jobId={selectedJobId}>
-          <ProjectResultsInner selectedJobId={selectedJobId} results={results} />
+          <ProjectResultsInner selectedJobId={selectedJobId} results={results} targetConfig={targetConfig} />
         </HitSelectionProvider>
       )}
     </div>

@@ -717,6 +717,8 @@ async def get_project_endpoint(
             "protein_name": j.protein_name,
             "created_at": j.created_at.isoformat() if j.created_at else None,
             "completed_at": j.completed_at.isoformat() if j.completed_at else None,
+            "enable_generation": bool(j.enable_generation) if hasattr(j, 'enable_generation') else False,
+            "has_custom_smiles": bool(j.smiles_list) if hasattr(j, 'smiles_list') else False,
         } for j in jobs],
     }
 
@@ -1205,9 +1207,11 @@ def _build_pockets_info(
                     "method": method,
                     "probability": round(probability, 4),
                     "residues_count": len(residues) if isinstance(residues, list) else 0,
+                    "residues": residues[:50] if isinstance(residues, list) else [],
                     "center": list(center) if isinstance(center, tuple) else center,
                     "selected": (i == 0),  # First pocket is the selected one
                     "explanation": explanation,
+                    "volume": round(pocket.get("volume", 0.0), 1),
                 })
 
             return formatted

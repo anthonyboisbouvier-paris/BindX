@@ -185,6 +185,8 @@ export default function Viewer3D({
   onBack,
   onPrev,
   onNext,
+  pocketCenter = null,
+  pocketResidues = null,
 }) {
   const containerRef = useRef(null)
   const viewerRef = useRef(null)
@@ -193,7 +195,9 @@ export default function Viewer3D({
   const [viewerReady, setViewerReady] = useState(false)
   const [currentStyle, setCurrentStyle] = useState('cartoon')
   const [ligandLoaded, setLigandLoaded] = useState(false)
+  const [showPocket, setShowPocket] = useState(true)
   const surfaceActiveRef = useRef(false)
+  const pocketSphereRef = useRef(null)
 
   const topResults = results?.results?.slice(0, 10) || []
 
@@ -349,6 +353,47 @@ export default function Viewer3D({
     initViewer()
   }, [initViewer])
 
+  // Pocket center overlay
+  useEffect(() => {
+    const viewer = viewerRef.current
+    if (!viewer || !viewerReady) return
+
+    // Remove previous pocket sphere
+    if (pocketSphereRef.current) {
+      try { viewer.removeShape(pocketSphereRef.current) } catch (_) {}
+      pocketSphereRef.current = null
+    }
+
+    if (showPocket && pocketCenter && Array.isArray(pocketCenter) && pocketCenter.length === 3) {
+      const [x, y, z] = pocketCenter
+      const sphere = viewer.addSphere({
+        center: { x, y, z },
+        radius: 6,
+        color: '#f59e0b',
+        opacity: 0.25,
+        wireframe: false,
+      })
+      pocketSphereRef.current = sphere
+
+      // Highlight pocket residues if available
+      if (pocketResidues && pocketResidues.length > 0) {
+        const resSels = pocketResidues.map(r => {
+          const parts = r.split('_')
+          return parts.length >= 2 ? parseInt(parts[parts.length - 1]) : null
+        }).filter(n => n != null)
+
+        if (resSels.length > 0) {
+          viewer.addStyle(
+            { resi: resSels, model: viewer.getModelList()[0] },
+            { stick: { color: '#f59e0b', radius: 0.12, opacity: 0.7 } }
+          )
+        }
+      }
+
+      viewer.render()
+    }
+  }, [viewerReady, pocketCenter, pocketResidues, showPocket])
+
   useEffect(() => {
     if (viewerReady && selectedPoseIndex !== null && selectedPoseIndex !== undefined) {
       loadPose(selectedPoseIndex)
@@ -422,17 +467,30 @@ export default function Viewer3D({
       </div>
 
       {/* Legend */}
-      <div className="flex items-center gap-6 px-4 py-2 bg-gray-50 border-t border-gray-100 text-xs text-gray-500">
+      <div className="flex items-center gap-4 px-4 py-2 bg-gray-50 border-t border-gray-100 text-xs text-gray-500 flex-wrap">
         <span className="flex items-center gap-1.5">
           <span className="w-3 h-3 rounded-full bg-blue-400 inline-block" />
-          Protein (receptor)
+          Protein
         </span>
         <span className="flex items-center gap-1.5">
           <span className="w-3 h-3 rounded-full bg-dockit-green inline-block" />
-          Ligand (docking pose)
+          Ligand
         </span>
-        <span className="ml-auto text-gray-400">
-          Left click: rotate | Scroll: zoom | Right click: translate
+        {pocketCenter && (
+          <button
+            onClick={() => setShowPocket(v => !v)}
+            className={`flex items-center gap-1.5 px-2 py-0.5 rounded border transition-colors ${
+              showPocket
+                ? 'bg-amber-50 border-amber-300 text-amber-700'
+                : 'bg-white border-gray-200 text-gray-400 hover:border-gray-300'
+            }`}
+          >
+            <span className="w-3 h-3 rounded-full bg-amber-400 inline-block" style={{ opacity: showPocket ? 1 : 0.3 }} />
+            Pocket {showPocket ? 'ON' : 'OFF'}
+          </button>
+        )}
+        <span className="ml-auto text-gray-400 hidden sm:inline">
+          Rotate | Scroll: zoom | Right: pan
         </span>
       </div>
     </div>
