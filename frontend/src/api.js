@@ -142,12 +142,12 @@ export async function checkHealth() {
  * @returns {Promise<Object>} Preview data
  */
 export async function previewTarget(uniprotId) {
-  const response = await apiClient.post('/preview-target', { uniprot_id: uniprotId })
+  const response = await apiClient.post('/preview-target', { uniprot_id: uniprotId }, { timeout: 120000 })
   return response.data
 }
 
 export async function previewSequence(sequence) {
-  const response = await apiClient.post('/preview-sequence', { sequence })
+  const response = await apiClient.post('/preview-sequence', { sequence }, { timeout: 120000 })
   return response.data
 }
 
