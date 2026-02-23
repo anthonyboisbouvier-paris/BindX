@@ -38,6 +38,7 @@ from database import (
 from models import (
     ADMETResult, DockingResult, JobCreate, JobResults, JobStatus,
     OffTargetResult, OptimizationRequest, OptimizationStatus,
+    ScaffoldAnalysisResponse,
     SynthesisRoute, SynthesisStep,
     UserCreate, UserLogin, UserResponse,
     ProjectCreate, ProjectUpdate, ProjectResponse,
@@ -680,6 +681,18 @@ async def list_projects_endpoint(
     return result
 
 
+def _job_best_score(job) -> float | None:
+    """Extract best composite_score from a completed job's results_json."""
+    if job.status != "completed" or not job.results_json:
+        return None
+    try:
+        results = json.loads(job.results_json)
+        scores = [r.get("composite_score", 0.0) for r in results if isinstance(r, dict)]
+        return round(max(scores), 4) if scores else None
+    except Exception:
+        return None
+
+
 @app.get("/api/projects/{project_id}", response_model=dict)
 async def get_project_endpoint(
     project_id: str,
@@ -722,6 +735,7 @@ async def get_project_endpoint(
             "completed_at": j.completed_at.isoformat() if j.completed_at else None,
             "enable_generation": bool(j.enable_generation) if hasattr(j, 'enable_generation') else False,
             "has_custom_smiles": bool(j.smiles_list) if hasattr(j, 'smiles_list') else False,
+            "best_score": _job_best_score(j),
         } for j in jobs],
     }
 
@@ -1811,6 +1825,32 @@ async def get_audit_log(job_id: str) -> dict:
         )
 
 
+@app.post("/api/molecule/analyze-scaffold")
+async def analyze_scaffold_endpoint(body: dict) -> ScaffoldAnalysisResponse:
+    """Analyze a molecule's scaffold, R-groups, and return annotated SVG.
+
+    Parameters
+    ----------
+    body : dict
+        Must contain ``smiles`` key.
+
+    Returns
+    -------
+    ScaffoldAnalysisResponse
+    """
+    smiles = body.get("smiles", "")
+    if not smiles:
+        raise HTTPException(status_code=422, detail="smiles field is required")
+
+    try:
+        from pipeline.scaffold_analysis import analyze_scaffold
+        result = analyze_scaffold(smiles)
+        return ScaffoldAnalysisResponse(**result)
+    except Exception as exc:
+        logger.error("Scaffold analysis failed for %s: %s", smiles[:60], exc)
+        raise HTTPException(status_code=500, detail=f"Scaffold analysis failed: {exc}")
+
+
 @app.post("/api/jobs/{job_id}/optimize")
 async def start_optimization(job_id: str, body: OptimizationRequest) -> dict:
     """Start a lead optimization task for a molecule from a completed job.
@@ -1852,6 +1892,7 @@ async def start_optimization(job_id: str, body: OptimizationRequest) -> dict:
         "weights": body.weights,
         "n_iterations": body.n_iterations,
         "variants_per_iter": body.variants_per_iter,
+        "structural_rules": body.modification_rules.model_dump() if body.modification_rules else None,
     }
 
     # Store initial status
@@ -2032,6 +2073,7 @@ def _run_optimization_sync(opt_id: str, params: dict) -> None:
             variants_per_iter=params.get("variants_per_iter", 50),
             work_dir=work_dir / "optimization" / opt_id,
             progress_callback=progress_cb,
+            structural_rules=params.get("structural_rules"),
         )
 
         _optimization_results[opt_id].update({

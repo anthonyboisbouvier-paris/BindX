@@ -461,6 +461,24 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
             )
             logger.info("Added %d ChEMBL ligands", len(chembl_ligs))
 
+        # V9: PubChem ligands (when gene name is available from strategy)
+        if auto_strategy and strategy_message and uniprot_id:
+            try:
+                strategy_data = pipeline_summary.get("ligand_strategy", {})
+                gene_name = strategy_data.get("gene_name")
+                if gene_name and strategy_data.get("use_pubchem", False):
+                    _update_progress(job_id, 27, f"Querying PubChem for {gene_name}")
+                    from pipeline.ligands import fetch_pubchem_ligands
+                    pubchem_ligs = fetch_pubchem_ligands(gene_name, max_count=min(30, max_ligands))
+                    all_ligands.extend(pubchem_ligs)
+                    logger.info("Added %d PubChem ligands for %s", len(pubchem_ligs), gene_name)
+                    audit.log("ligands_pubchem", f"PubChem: {len(pubchem_ligs)} ligands for {gene_name}", {
+                        "n_pubchem": len(pubchem_ligs),
+                        "gene_name": gene_name,
+                    })
+            except Exception as exc:
+                logger.warning("[%s] PubChem ligand fetch failed: %s", job_id, exc)
+
         if use_zinc:
             _update_progress(job_id, 28, "Loading ZINC molecules")
             from pipeline.ligands import fetch_zinc_ligands
@@ -1228,6 +1246,18 @@ def run_deep_screening(self, job_id: str, params: dict) -> dict:
         zinc_ligs = fetch_zinc_ligands(max_count=min(100, max_ligands))
         all_ligands.extend(zinc_ligs)
 
+        # V9: PubChem for deep screening
+        try:
+            from pipeline.ligands import resolve_gene_name, fetch_pubchem_ligands
+            gene_name_deep = resolve_gene_name(uniprot_id) if uniprot_id else None
+            if gene_name_deep:
+                _update_progress(job_id, 16, f"Querying PubChem for {gene_name_deep}")
+                pubchem_ligs = fetch_pubchem_ligands(gene_name_deep, max_count=min(50, max_ligands))
+                all_ligands.extend(pubchem_ligs)
+                logger.info("Deep: added %d PubChem ligands for %s", len(pubchem_ligs), gene_name_deep)
+        except Exception as exc:
+            logger.warning("[%s] Deep PubChem fetch failed: %s", job_id, exc)
+
         if not all_ligands:
             raise RuntimeError("No ligands found for deep screening.")
 
@@ -1668,6 +1698,7 @@ def run_lead_optimization(self, opt_id: str, params: dict) -> dict:
             variants_per_iter=params.get("variants_per_iter", 50),
             work_dir=opt_work_dir,
             progress_callback=progress_cb,
+            structural_rules=params.get("structural_rules"),
         )
 
         # Store result as JSON file for retrieval

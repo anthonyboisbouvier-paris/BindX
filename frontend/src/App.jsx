@@ -10,6 +10,7 @@ import MoleculeCard from './components/MoleculeCard.jsx'
 import DownloadButtons from './components/DownloadButtons.jsx'
 import GeneratedMols from './components/GeneratedMols.jsx'
 import MethodologyPage from './components/MethodologyPage.jsx'
+import ReferencesPage from './pages/ReferencesPage.jsx'
 import OptimizationView from './components/OptimizationView.jsx'
 import InteractionView from './components/InteractionView.jsx'
 import ClusterView from './components/ClusterView.jsx'
@@ -61,6 +62,8 @@ function Header({ currentView, onReset, onMethodology }) {
   // Determine if we are on a route-based page (not the main flow)
   const isRoutePage = ['/login', '/register', '/projects'].includes(location.pathname)
     || location.pathname.startsWith('/project/')
+
+  const isAuthPage = ['/login', '/register'].includes(location.pathname)
 
   const handleLogoClick = () => {
     if (isRoutePage) {
@@ -126,18 +129,15 @@ function Header({ currentView, onReset, onMethodology }) {
               </button>
             )}
 
-            {/* Pipeline steps dots — only in main flow */}
-            {!isRoutePage && (
-              <div className="flex items-center gap-1.5 text-white/60 text-sm">
-                <span className={`w-2 h-2 rounded-full ${currentView === 'input' ? 'bg-dockit-green' : 'bg-white/20'}`} />
-                <span className={`w-2 h-2 rounded-full ${currentView === 'progress' ? 'bg-dockit-green animate-pulse' : 'bg-white/20'}`} />
-                <span className={`w-2 h-2 rounded-full ${currentView === 'summary' ? 'bg-dockit-green animate-pulse' : 'bg-white/20'}`} />
-                <span className={`w-2 h-2 rounded-full ${currentView === 'results' ? 'bg-dockit-green' : 'bg-white/20'}`} />
-              </div>
+            {/* Pipeline status text — only in main flow, not on input screen */}
+            {!isRoutePage && currentView !== 'input' && (
+              <span className="text-xs text-white/40 hidden sm:block">
+                {currentView === 'progress' ? 'Running...' : currentView === 'summary' ? 'Complete' : currentView === 'results' ? 'Results' : ''}
+              </span>
             )}
 
-            {/* User section */}
-            <div className="flex items-center gap-2 ml-2 pl-2 border-l border-white/10">
+            {/* User section — hidden on auth pages */}
+            {!isAuthPage && <div className="flex items-center gap-2 ml-2 pl-2 border-l border-white/10">
               {isAuthenticated ? (
                 <div className="flex items-center gap-2">
                   <Link
@@ -148,7 +148,7 @@ function Header({ currentView, onReset, onMethodology }) {
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
                     </svg>
-                    <span className="max-w-[100px] truncate">{user?.username}</span>
+                    <span className="max-w-[140px] truncate">{user?.username}</span>
                   </Link>
                   <button
                     onClick={handleLogout}
@@ -166,7 +166,7 @@ function Header({ currentView, onReset, onMethodology }) {
                   Sign In
                 </Link>
               )}
-            </div>
+            </div>}
           </div>
         </div>
       </div>
@@ -532,6 +532,9 @@ export default function App() {
           <Route path="/project/:projectId/results" element={<ProjectResults />} />
           <Route path="/project/:projectId/optimization" element={<ProjectOptimization />} />
           <Route path="/project/:projectId/reports" element={<ProjectReports />} />
+
+          {/* V9: References / Methodology page */}
+          <Route path="/references" element={<ReferencesPage />} />
 
           {/* Legacy routes (anonymous, backward compat) */}
           <Route path="/run" element={<RunPageWrapper flow={flow} />} />

@@ -161,6 +161,16 @@ export const getSynthesisRoute = (jobId, molIndex) =>
   apiClient.get(`/jobs/${jobId}/synthesis/${molIndex}`).then(r => r.data)
 
 /**
+ * Analyze a molecule's scaffold and R-group positions.
+ * @param {string} smiles - SMILES string of the molecule
+ * @returns {Promise<Object>} Scaffold analysis with positions, SVG, core indices
+ */
+export async function analyzeScaffold(smiles) {
+  const response = await apiClient.post('/molecule/analyze-scaffold', { smiles })
+  return response.data
+}
+
+/**
  * Start a lead optimization run for a given molecule in a job.
  * @param {string} jobId
  * @param {Object} params - Optimization parameters

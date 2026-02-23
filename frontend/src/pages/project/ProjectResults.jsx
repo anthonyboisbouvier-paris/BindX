@@ -1087,7 +1087,7 @@ function ProjectResultsInner({ selectedJobId, results, targetConfig }) {
 // ---------------------------------------------------------------------------
 
 export default function ProjectResults() {
-  const { jobs, loading, error, isTargetConfigured, targetConfig } = useProject()
+  const { project, jobs, loading, error, isTargetConfigured, targetConfig } = useProject()
   const [searchParams, setSearchParams] = useSearchParams()
 
   const [results, setResults] = useState(null)
@@ -1111,12 +1111,33 @@ export default function ProjectResults() {
   if (!loading && !isTargetConfigured) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
-        <div className="bg-amber-50 border border-amber-200 rounded-xl p-8 max-w-sm text-center">
-          <p className="text-sm font-semibold text-amber-800 mb-2">Target not configured</p>
-          <Link to="../target" relative="path"
-            className="inline-flex items-center gap-2 px-4 py-2 bg-[#1e3a5f] text-white text-sm font-semibold rounded-lg hover:bg-[#2a4f7c] transition-colors">
+        <div className="text-center max-w-md">
+          <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-amber-50 flex items-center justify-center">
+            <svg className="w-8 h-8 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="9" strokeWidth={1.8} />
+              <circle cx="12" cy="12" r="5" strokeWidth={1.8} />
+              <circle cx="12" cy="12" r="1.5" fill="currentColor" strokeWidth={0} />
+            </svg>
+          </div>
+          <h3 className="text-lg font-bold text-gray-700 mb-2">Target not configured</h3>
+          <p className="text-sm text-gray-400 mb-6">You must configure a target protein before running screenings.</p>
+          <Link
+            to={`/project/${project?.id}/target`}
+            className="inline-flex items-center gap-2 px-5 py-2.5 bg-[#22c55e] text-white font-semibold rounded-xl hover:bg-[#16a34a] transition-colors"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="9" strokeWidth={2} />
+              <circle cx="12" cy="12" r="5" strokeWidth={2} />
+            </svg>
             Go to Target Setup
           </Link>
+          <div className="mt-8 flex items-center gap-3 text-xs text-gray-300 justify-center">
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-[#22c55e]"></span> 1. Setup target</span>
+            <span className="w-4 h-px bg-gray-200"></span>
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-gray-200"></span> 2. Run screening</span>
+            <span className="w-4 h-px bg-gray-200"></span>
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-gray-200"></span> 3. View results</span>
+          </div>
         </div>
       </div>
     )

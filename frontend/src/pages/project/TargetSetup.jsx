@@ -505,6 +505,54 @@ function ProteinPreviewViewer({ pdbUrl, pdbData, uniprotFeatures }) {
 }
 
 // ---------------------------------------------------------------------------
+// Normalize assessment to the format AssessmentCard expects.
+// Handles both the full BindX format and the simplified legacy format
+// with flat integer scores (overall_score, druggability_score, etc.)
+// ---------------------------------------------------------------------------
+
+function normalizeAssessment(raw) {
+  if (!raw) return null
+
+  // Already in the correct format (composite_score as 0-1 float with scores object)
+  if (raw.composite_score != null && raw.composite_score <= 1 && raw.scores) {
+    return raw
+  }
+
+  const toFloat = (v) => (v != null ? v / 100 : 0)
+
+  const scores = {
+    evidence:     { score: toFloat(raw.data_score     ?? raw.evidence_score) },
+    druggability: { score: toFloat(raw.druggability_score) },
+    novelty:      { score: toFloat(raw.novelty_score) },
+    safety:       { score: toFloat(raw.safety_score) },
+    feasibility:  { score: toFloat(raw.structural_score ?? raw.feasibility_score) },
+  }
+
+  let composite
+  if (raw.overall_score != null) {
+    composite = raw.overall_score / 100
+  } else {
+    const vals = Object.values(scores).map(s => s.score).filter(v => v > 0)
+    composite = vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : 0
+  }
+
+  let recommendation = raw.recommendation
+  if (!recommendation) {
+    if (composite >= 0.65) recommendation = 'GO'
+    else if (composite >= 0.40) recommendation = 'CAUTION'
+    else recommendation = 'NO-GO'
+  }
+
+  return {
+    ...raw,
+    composite_score: composite,
+    scores,
+    recommendation,
+    rationale: raw.rationale || raw.summary || '',
+  }
+}
+
+// ---------------------------------------------------------------------------
 // TargetSetup — Interactive wizard
 // ---------------------------------------------------------------------------
 
@@ -670,6 +718,38 @@ export default function TargetSetup() {
         </p>
       </div>
 
+      {/* Progress stepper */}
+      <div className="flex items-center gap-1 mb-8">
+        {[
+          { num: 1, label: 'Protein' },
+          { num: 2, label: 'Structure' },
+          { num: 3, label: 'Pocket' },
+          { num: 4, label: 'ChEMBL' },
+          { num: 5, label: 'Save' },
+        ].map((s, i) => {
+          const currentStep = !hasPreview ? 1 : !hasStructures ? 2 : !hasPockets ? 3 : !chembl ? 4 : 5
+          const isActive = s.num === currentStep
+          const isDone = s.num < currentStep
+          return (
+            <React.Fragment key={s.num}>
+              {i > 0 && <div className={`flex-1 h-0.5 ${isDone ? 'bg-[#22c55e]' : 'bg-gray-200'}`} />}
+              <div className="flex flex-col items-center gap-1">
+                <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold transition-colors ${
+                  isDone ? 'bg-[#22c55e] text-white' : isActive ? 'bg-[#1e3a5f] text-white ring-2 ring-[#1e3a5f]/20' : 'bg-gray-200 text-gray-400'
+                }`}>
+                  {isDone ? (
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                    </svg>
+                  ) : s.num}
+                </div>
+                <span className={`text-[10px] font-medium ${isActive ? 'text-[#1e3a5f]' : isDone ? 'text-[#22c55e]' : 'text-gray-400'}`}>{s.label}</span>
+              </div>
+            </React.Fragment>
+          )
+        })}
+      </div>
+
       {/* Step 1 — Enter Target */}
       <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
         <StepHeader number={1} title="Enter Target" done={hasPreview} active={!hasPreview} />
@@ -678,7 +758,13 @@ export default function TargetSetup() {
         <div className="flex gap-1 p-1 bg-gray-100 rounded-lg mb-4 w-fit">
           <button
             type="button"
-            onClick={() => { setInputMode('uniprot'); setPreview(null); setPreviewError(null) }}
+            onClick={() => {
+              if (inputMode !== 'uniprot') {
+                setInputMode('uniprot')
+                setPreview(null)
+                setPreviewError(null)
+              }
+            }}
             className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
               inputMode === 'uniprot' ? 'bg-white text-[#1e3a5f] shadow-sm' : 'text-gray-500 hover:text-gray-700'
             }`}
@@ -687,7 +773,13 @@ export default function TargetSetup() {
           </button>
           <button
             type="button"
-            onClick={() => { setInputMode('fasta'); setPreview(null); setPreviewError(null) }}
+            onClick={() => {
+              if (inputMode !== 'fasta') {
+                setInputMode('fasta')
+                setPreview(null)
+                setPreviewError(null)
+              }
+            }}
             className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
               inputMode === 'fasta' ? 'bg-white text-[#1e3a5f] shadow-sm' : 'text-gray-500 hover:text-gray-700'
             }`}
@@ -710,7 +802,7 @@ export default function TargetSetup() {
               <button
                 onClick={handleValidateUniprot}
                 disabled={loadingPreview || !uniprotId.trim()}
-                className="px-5 py-2.5 bg-[#1e3a5f] text-white font-semibold rounded-lg hover:bg-[#2a4f7c] disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2 text-sm whitespace-nowrap"
+                className="px-5 py-2.5 bg-[#22c55e] text-white font-semibold rounded-lg hover:bg-[#16a34a] disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2 text-sm whitespace-nowrap"
               >
                 {loadingPreview ? (
                   <>
@@ -745,7 +837,7 @@ export default function TargetSetup() {
               <button
                 onClick={handleValidateFasta}
                 disabled={loadingPreview || !fastaText.trim()}
-                className="px-4 py-2 bg-[#1e3a5f] text-white font-semibold rounded-lg hover:bg-[#2a4f7c] disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm flex items-center gap-2"
+                className="px-4 py-2 bg-[#22c55e] text-white font-semibold rounded-lg hover:bg-[#16a34a] disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm flex items-center gap-2"
               >
                 {loadingPreview ? (
                   <>
@@ -776,6 +868,16 @@ export default function TargetSetup() {
           </div>
         )}
       </div>
+
+      {/* Hint shown when only step 1 is visible and not yet validated */}
+      {!hasPreview && (
+        <div className="text-center py-8 text-gray-300">
+          <svg className="w-8 h-8 mx-auto mb-2 text-gray-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+          </svg>
+          <p className="text-sm">Enter a UniProt ID and click Validate to continue</p>
+        </div>
+      )}
 
       {/* UniProt Intelligence — shown after UniProt validation */}
       {hasPreview && inputMode === 'uniprot' && uniprotId && (
@@ -928,15 +1030,19 @@ export default function TargetSetup() {
                         {pocket.explanation && (
                           <p className="text-xs text-gray-400 mt-2 leading-relaxed">{pocket.explanation}</p>
                         )}
-                        {pocket.residues && pocket.residues.length > 0 && selectedPocketIdx === idx && (
-                          <div className="mt-2 p-2 bg-gray-50 rounded-lg">
-                            <p className="text-[10px] text-gray-400 font-semibold uppercase mb-1">Key Residues</p>
-                            <p className="text-xs text-gray-600 font-mono leading-relaxed break-all">
-                              {pocket.residues.slice(0, 20).join(', ')}
-                              {pocket.residues.length > 20 && <span className="text-gray-400"> +{pocket.residues.length - 20} more</span>}
-                            </p>
-                          </div>
-                        )}
+                        {pocket.residues && selectedPocketIdx === idx && (() => {
+                          const resArr = Array.isArray(pocket.residues) ? pocket.residues : (typeof pocket.residues === 'string' ? pocket.residues.split(',').map(s => s.trim()).filter(Boolean) : [])
+                          if (resArr.length === 0) return null
+                          return (
+                            <div className="mt-2 p-2 bg-gray-50 rounded-lg">
+                              <p className="text-[10px] text-gray-400 font-semibold uppercase mb-1">Key Residues</p>
+                              <p className="text-xs text-gray-600 font-mono leading-relaxed break-all">
+                                {resArr.slice(0, 20).join(', ')}
+                                {resArr.length > 20 && <span className="text-gray-400"> +{resArr.length - 20} more</span>}
+                              </p>
+                            </div>
+                          )
+                        })()}
                       </div>
                     </div>
                   </div>
@@ -1110,7 +1216,7 @@ export default function TargetSetup() {
 
           {assessment && (
             <div className="space-y-3">
-              <AssessmentCard assessment={assessment} />
+              <AssessmentCard assessment={normalizeAssessment(assessment)} />
               {/* Agent 1: Target Assessment — inline prominent card */}
               {assessment.agent_analysis && (
                 <AgentAdvisorCard

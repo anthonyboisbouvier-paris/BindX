@@ -18,7 +18,7 @@ from typing import Generator, Optional
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from models import Base, JobORM, ProjectORM, UserORM
+from models import Base, JobORM, ProjectORM, TargetAssessmentORM, UserORM
 
 logger = logging.getLogger(__name__)
 
@@ -433,6 +433,71 @@ def count_project_jobs(project_id: str) -> int:
     with get_db() as db:
         count = db.query(JobORM).filter(JobORM.project_id == project_id).count()
         return count
+
+
+# ---------------------------------------------------------------------------
+# BindX: Target Assessment helpers
+# ---------------------------------------------------------------------------
+
+def create_assessment(
+    assessment_id: str,
+    uniprot_id: str,
+    assessment_json: str,
+    project_id: Optional[str] = None,
+    disease_context: Optional[str] = None,
+    agent_responses_json: Optional[str] = None,
+    input_hash: Optional[str] = None,
+) -> TargetAssessmentORM:
+    """Insert a new target assessment row and return it."""
+    with get_db() as db:
+        row = TargetAssessmentORM(
+            id=assessment_id,
+            project_id=project_id,
+            uniprot_id=uniprot_id,
+            disease_context=disease_context,
+            assessment_json=assessment_json,
+            agent_responses_json=agent_responses_json,
+            input_hash=input_hash,
+            created_at=datetime.utcnow(),
+        )
+        db.add(row)
+        db.flush()
+        db.expunge(row)
+        logger.info("Assessment %s created for %s", assessment_id, uniprot_id)
+    return row
+
+
+def get_assessment(assessment_id: str) -> Optional[TargetAssessmentORM]:
+    """Fetch a target assessment by ID."""
+    with get_db() as db:
+        row = db.get(TargetAssessmentORM, assessment_id)
+        if row is not None:
+            db.expunge(row)
+        return row
+
+
+def get_assessment_by_hash(input_hash: str) -> Optional[TargetAssessmentORM]:
+    """Fetch a cached assessment by input hash (idempotence)."""
+    with get_db() as db:
+        row = (
+            db.query(TargetAssessmentORM)
+            .filter(TargetAssessmentORM.input_hash == input_hash)
+            .order_by(TargetAssessmentORM.created_at.desc())
+            .first()
+        )
+        if row is not None:
+            db.expunge(row)
+        return row
+
+
+def update_assessment_agent(assessment_id: str, agent_responses_json: str) -> None:
+    """Update the agent_responses_json for an existing assessment."""
+    with get_db() as db:
+        row = db.query(TargetAssessmentORM).filter(
+            TargetAssessmentORM.id == assessment_id
+        ).first()
+        if row:
+            row.agent_responses_json = agent_responses_json
 
 
 def list_project_jobs(project_id: str, limit: int = 50) -> list[JobORM]:

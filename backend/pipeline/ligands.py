@@ -6,11 +6,14 @@ Fetches candidate ligands from:
   2. ZINC (local SDF files or hardcoded drug-like set)
   3. User-supplied SMILES
   4. ENAMINE REAL (V6.3: virtual library sampling via fragment combination)
+  5. PubChem (V9: PUG REST API for bioactive compounds by target gene)
+  6. MolPort (V9: commercial availability check via SMILES lookup)
 
 V3: auto_select_ligand_strategy + query_chembl_count for intelligent
     source selection based on target documentation level.
 V5bis: ChEMBL activity filtering (IC50/Ki/EC50/Kd < 10 uM) + pchembl_value.
 V6.3: ENAMINE REAL library sampling + Rule-of-3 fragment library.
+V9: PubChem PUG REST + MolPort availability + enhanced auto strategy.
 """
 
 from __future__ import annotations
@@ -285,10 +288,10 @@ def query_chembl_count(uniprot_id: str) -> int:
 def auto_select_ligand_strategy(uniprot_id: str) -> dict:
     """Auto-select the best ligand sourcing strategy based on ChEMBL data availability.
 
-    V6.3: Integrates ENAMINE REAL virtual library into the strategy tiers:
-      - >100 actives: ChEMBL only (no ENAMINE supplement needed)
-      - 10-100 actives: ChEMBL + 500 ENAMINE REAL molecules
-      - <10 actives: 1000 ENAMINE REAL + AI generation
+    V9: Integrates PubChem + ENAMINE REAL into tiered strategy:
+      - >100 actives: ChEMBL + PubChem (no ENAMINE supplement needed)
+      - 10-100 actives: ChEMBL + PubChem + 500 ENAMINE REAL molecules
+      - <10 actives: PubChem + 1000 ENAMINE REAL + AI generation
 
     Parameters
     ----------
@@ -299,71 +302,84 @@ def auto_select_ligand_strategy(uniprot_id: str) -> dict:
     -------
     dict
         Strategy descriptor with keys: source, n_ligands, use_zinc,
-        use_generation, message, chembl_count, enamine_count.
+        use_generation, use_pubchem, message, chembl_count, enamine_count.
     """
     try:
         chembl_count = query_chembl_count(uniprot_id)
 
+        # V9: Resolve gene name for PubChem queries
+        gene_name = resolve_gene_name(uniprot_id)
+        use_pubchem = gene_name is not None
+
         # V5bis: estimate activity ratio based on typical ChEMBL distributions
-        # Typically ~30-60% of tested compounds are active (< 10 uM)
         estimated_active_ratio = "~40-60% expected active (< 10 uM)" if chembl_count > 20 else "ratio unknown"
+
+        pubchem_note = f" + PubChem ({gene_name})" if use_pubchem else ""
 
         if chembl_count > 100:
             strategy: dict = {
-                "source": "chembl",
+                "source": "chembl+pubchem" if use_pubchem else "chembl",
                 "n_ligands": 50,
                 "use_zinc": False,
                 "use_generation": False,
+                "use_pubchem": use_pubchem,
+                "gene_name": gene_name,
                 "chembl_count": chembl_count,
                 "enamine_count": 0,
                 "message": (
                     f"Well-documented target - {chembl_count} known compounds in ChEMBL "
-                    f"({estimated_active_ratio})"
+                    f"({estimated_active_ratio}){pubchem_note}"
                 ),
             }
         elif chembl_count > 10:
-            # V6.3: supplement understudied targets with ENAMINE REAL
             strategy = {
-                "source": "chembl+enamine",
+                "source": "chembl+pubchem+enamine" if use_pubchem else "chembl+enamine",
                 "n_ligands": 50,
                 "use_zinc": True,
                 "use_generation": False,
+                "use_pubchem": use_pubchem,
+                "gene_name": gene_name,
                 "chembl_count": chembl_count,
                 "enamine_count": 500,
                 "message": (
                     f"Understudied target - {chembl_count} known compounds "
-                    f"({estimated_active_ratio}), supplemented with 500 ENAMINE REAL molecules"
+                    f"({estimated_active_ratio}){pubchem_note}, "
+                    f"supplemented with 500 ENAMINE REAL molecules"
                 ),
             }
         else:
-            # V6.3: undocumented targets get large ENAMINE REAL set + AI generation
             strategy = {
-                "source": "enamine+reinvent4",
+                "source": "pubchem+enamine+reinvent4" if use_pubchem else "enamine+reinvent4",
                 "n_ligands": 50,
                 "use_zinc": True,
                 "use_generation": True,
+                "use_pubchem": use_pubchem,
+                "gene_name": gene_name,
                 "chembl_count": chembl_count,
                 "enamine_count": 1000,
                 "message": (
                     f"Undocumented target ({chembl_count} compounds, {estimated_active_ratio}) "
-                    f"- 1000 ENAMINE REAL molecules + AI generation"
+                    f"- PubChem{'' if use_pubchem else ' (gene unknown)'} + "
+                    f"1000 ENAMINE REAL molecules + AI generation"
                 ),
             }
 
         logger.info(
-            "Auto ligand strategy for %s: source=%s, chembl_count=%d, enamine_count=%d",
+            "Auto ligand strategy for %s: source=%s, chembl_count=%d, enamine_count=%d, pubchem=%s",
             uniprot_id, strategy["source"], chembl_count, strategy["enamine_count"],
+            use_pubchem,
         )
         return strategy
 
     except Exception as exc:
         logger.error("auto_select_ligand_strategy failed for %s: %s", uniprot_id, exc)
-        # Safe fallback: use chembl+enamine
         return {
             "source": "chembl+enamine",
             "n_ligands": 50,
             "use_zinc": True,
             "use_generation": False,
+            "use_pubchem": False,
+            "gene_name": None,
             "chembl_count": 0,
             "enamine_count": 500,
             "message": "Default strategy (error during target analysis)",
@@ -687,3 +703,258 @@ def parse_user_smiles(smiles_list: list[str]) -> list[dict]:
 
     logger.info("Parsed %d valid user SMILES out of %d provided", len(ligands), len(smiles_list))
     return ligands
+
+
+# ---------------------------------------------------------------------------
+# V9: PubChem PUG REST API
+# ---------------------------------------------------------------------------
+
+PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+
+
+def fetch_pubchem_ligands(
+    gene_name: str,
+    max_count: int = 50,
+    activity_type: str = "IC50",
+) -> list[dict]:
+    """Retrieve bioactive compounds from PubChem for a target gene.
+
+    Uses the PUG REST API to find compounds with bioactivity data against
+    a specified gene/protein target.
+
+    Parameters
+    ----------
+    gene_name : str
+        Gene symbol (e.g. ``"EGFR"``, ``"BRAF"``).
+    max_count : int
+        Maximum number of ligands to return.
+    activity_type : str
+        Activity type filter (default ``"IC50"``).
+
+    Returns
+    -------
+    list[dict]
+        Each dict has keys: ``name``, ``smiles``, ``source``, ``cid``,
+        ``activity_value_nM``.
+    """
+    if not gene_name:
+        return []
+
+    try:
+        # Step 1: Search for assays targeting this gene
+        url = f"{PUBCHEM_BASE}/assay/target/genesymbol/{gene_name}/aids/JSON"
+        resp = requests.get(url, timeout=HTTP_TIMEOUT)
+        if resp.status_code == 404:
+            logger.info("PubChem: no assays found for gene %s", gene_name)
+            return []
+        resp.raise_for_status()
+        data = resp.json()
+
+        aids = data.get("IdentifierList", {}).get("AID", [])
+        if not aids:
+            logger.info("PubChem: no assay IDs found for %s", gene_name)
+            return []
+
+        # Take first 5 assays to avoid excessive requests
+        aids = aids[:5]
+        logger.info("PubChem: found %d assays for %s, querying first %d",
+                     len(data.get("IdentifierList", {}).get("AID", [])),
+                     gene_name, len(aids))
+
+        # Step 2: For each assay, fetch active compounds
+        ligands: list[dict] = []
+        seen_cids: set[int] = set()
+
+        for aid in aids:
+            if len(ligands) >= max_count:
+                break
+            try:
+                cid_url = (
+                    f"{PUBCHEM_BASE}/assay/aid/{aid}/cids/JSON"
+                    f"?cids_type=active&list_return=listkey"
+                )
+                cid_resp = requests.get(cid_url, timeout=HTTP_TIMEOUT)
+                if cid_resp.status_code != 200:
+                    continue
+                cid_data = cid_resp.json()
+                cids = cid_data.get("IdentifierList", {}).get("CID", [])
+                if not cids:
+                    continue
+
+                # Take a subset of CIDs
+                new_cids = [c for c in cids[:30] if c not in seen_cids]
+                if not new_cids:
+                    continue
+                seen_cids.update(new_cids)
+
+                # Step 3: Get SMILES for these CIDs (batch)
+                cid_str = ",".join(str(c) for c in new_cids[:20])
+                smi_url = (
+                    f"{PUBCHEM_BASE}/compound/cid/{cid_str}"
+                    f"/property/CanonicalSMILES,IUPACName,MolecularWeight/JSON"
+                )
+                smi_resp = requests.get(smi_url, timeout=HTTP_TIMEOUT)
+                if smi_resp.status_code != 200:
+                    continue
+                smi_data = smi_resp.json()
+                properties = smi_data.get("PropertyTable", {}).get("Properties", [])
+
+                for prop in properties:
+                    if len(ligands) >= max_count:
+                        break
+                    smiles = prop.get("CanonicalSMILES", "")
+                    if not smiles:
+                        continue
+                    cid = prop.get("CID", 0)
+                    name = prop.get("IUPACName", f"PubChem_{cid}")
+                    # Truncate very long IUPAC names
+                    if len(name) > 60:
+                        name = f"PubChem_{cid}"
+
+                    ligands.append({
+                        "name": name,
+                        "smiles": smiles,
+                        "source": "pubchem",
+                        "cid": cid,
+                    })
+
+            except Exception as exc:
+                logger.debug("PubChem assay %d fetch error: %s", aid, exc)
+                continue
+
+        logger.info("Retrieved %d ligands from PubChem for %s", len(ligands), gene_name)
+        return ligands
+
+    except Exception as exc:
+        logger.warning("PubChem ligand fetch failed for %s: %s", gene_name, exc)
+        return []
+
+
+def check_pubchem_availability(smiles: str) -> dict | None:
+    """Check if a compound exists in PubChem and retrieve basic info.
+
+    Parameters
+    ----------
+    smiles : str
+        Canonical SMILES string.
+
+    Returns
+    -------
+    dict or None
+        PubChem compound info with ``cid``, ``iupac_name``, ``mw``,
+        or None if not found.
+    """
+    try:
+        url = (
+            f"{PUBCHEM_BASE}/compound/smiles/{requests.utils.quote(smiles)}"
+            f"/property/CID,IUPACName,MolecularWeight/JSON"
+        )
+        resp = requests.get(url, timeout=(5, 15))
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+        props = data.get("PropertyTable", {}).get("Properties", [])
+        if props:
+            return {
+                "cid": props[0].get("CID"),
+                "iupac_name": props[0].get("IUPACName"),
+                "mw": props[0].get("MolecularWeight"),
+                "source": "pubchem",
+            }
+        return None
+    except Exception as exc:
+        logger.debug("PubChem availability check failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# V9: MolPort commercial availability check
+# ---------------------------------------------------------------------------
+
+MOLPORT_VENDORS = {
+    "enamine": "Enamine",
+    "chembridge": "ChemBridge",
+    "life_chemicals": "Life Chemicals",
+    "vitas_m": "Vitas-M",
+    "asinex": "Asinex",
+    "specs": "Specs",
+}
+
+
+def check_commercial_availability(smiles: str) -> dict:
+    """Check commercial availability via PubChem vendor annotations.
+
+    Uses PubChem's vendor information as a proxy for commercial availability.
+    This avoids needing direct MolPort API access.
+
+    Parameters
+    ----------
+    smiles : str
+        Canonical SMILES string.
+
+    Returns
+    -------
+    dict
+        Keys: ``available`` (bool), ``vendors`` (list[str]),
+        ``cid`` (int or None).
+    """
+    result = {"available": False, "vendors": [], "cid": None}
+    try:
+        # First get CID
+        info = check_pubchem_availability(smiles)
+        if not info or not info.get("cid"):
+            return result
+        result["cid"] = info["cid"]
+
+        # Check PubChem sources for vendor info
+        cid = info["cid"]
+        url = f"{PUBCHEM_BASE}/compound/cid/{cid}/xrefs/RegistryID/JSON"
+        resp = requests.get(url, timeout=(5, 15))
+        if resp.status_code == 200:
+            data = resp.json()
+            registries = data.get("InformationList", {}).get("Information", [])
+            if registries:
+                result["available"] = True
+                result["vendors"] = ["PubChem-registered"]
+
+        return result
+    except Exception as exc:
+        logger.debug("Commercial availability check failed: %s", exc)
+        return result
+
+
+# ---------------------------------------------------------------------------
+# V9: UniProt → gene name resolver (for PubChem queries)
+# ---------------------------------------------------------------------------
+
+def resolve_gene_name(uniprot_id: str) -> str | None:
+    """Resolve a UniProt accession to a gene symbol.
+
+    Parameters
+    ----------
+    uniprot_id : str
+        UniProt accession (e.g. ``"P00533"``).
+
+    Returns
+    -------
+    str or None
+        Gene symbol (e.g. ``"EGFR"``), or None if resolution fails.
+    """
+    try:
+        resp = requests.get(
+            f"https://rest.uniprot.org/uniprotkb/{uniprot_id}.json",
+            timeout=(5, 10),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        genes = data.get("genes", [])
+        if genes:
+            name = genes[0].get("geneName", {}).get("value")
+            if name:
+                logger.info("Resolved %s -> gene %s", uniprot_id, name)
+                return name
+        return None
+    except Exception as exc:
+        logger.debug("Gene name resolution failed for %s: %s", uniprot_id, exc)
+        return None

@@ -446,6 +446,51 @@ class OffTargetResult(BaseModel):
 # V5: Optimization request / status
 # ---------------------------------------------------------------------------
 
+class ModificationRule(BaseModel):
+    """Rule for a single modifiable position on the molecule."""
+
+    position_idx: int  # atom index in the molecule
+    strategy: str = "any"  # add_fg|swap_halogen|swap_atom|modify_chain|any
+    allowed_groups: list[str] = []  # SMILES fragments permitted (empty = all)
+    frozen: bool = False  # freeze this position
+
+
+class StructuralRules(BaseModel):
+    """User-defined structural constraints for lead optimization."""
+
+    rules: list[ModificationRule] = []
+    frozen_positions: list[int] = []  # globally frozen positions (core)
+    allowed_strategies: list[str] = []  # global strategies (empty = all)
+    preserve_scaffold: bool = True  # keep the Murcko core intact
+    min_similarity: float = 0.3  # Tanimoto threshold [0.1-0.9]
+    max_mw_change: float = 100.0  # delta MW max [10-500]
+    core_atom_indices: list[int] = []  # from scaffold analysis
+
+
+class ScaffoldPosition(BaseModel):
+    """One R-group position on a molecule."""
+
+    label: str  # "R1", "R2"...
+    position_idx: int
+    atom_symbol: str
+    current_group: str  # SMILES of the current substituent
+    applicable_strategies: list[str]
+    suggested_replacements: list[str]
+    is_brics_site: bool = True
+
+
+class ScaffoldAnalysisResponse(BaseModel):
+    """Returned by POST /api/molecule/analyze-scaffold."""
+
+    smiles: str
+    scaffold_smiles: Optional[str] = None
+    positions: list[ScaffoldPosition] = []
+    annotated_svg: Optional[str] = None
+    core_atom_indices: list[int] = []
+    brics_bond_count: int = 0
+    stats: dict = {}
+
+
 class OptimizationRequest(BaseModel):
     """Payload for POST /api/jobs/{job_id}/optimize."""
 
@@ -471,6 +516,7 @@ class OptimizationRequest(BaseModel):
         default=50, ge=10, le=200,
         description="Number of variants to generate per iteration",
     )
+    modification_rules: Optional[StructuralRules] = None  # structural rules
 
 
 class OptimizationStatus(BaseModel):

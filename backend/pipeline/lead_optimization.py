@@ -67,6 +67,7 @@ def run_optimization(
     variants_per_iter: int = 50,
     work_dir: Optional[Path] = None,
     progress_callback: Optional[Callable[[int, float, str], None]] = None,
+    structural_rules: Optional[dict] = None,
 ) -> dict:
     """Run iterative lead optimization on a starting molecule.
 
@@ -158,6 +159,7 @@ def run_optimization(
         # Generate variants
         variants = _generate_variants(
             current_smiles, variants_per_iter, iter_rng, iteration,
+            structural_rules=structural_rules,
         )
         n_tested = len(variants)
         total_tested += n_tested
@@ -282,6 +284,7 @@ def _generate_variants(
     n_variants: int,
     rng: random.Random,
     iteration: int,
+    structural_rules: Optional[dict] = None,
 ) -> list[str]:
     """Generate structural variants of the parent molecule.
 
@@ -298,6 +301,8 @@ def _generate_variants(
         Random number generator for reproducibility.
     iteration : int
         Current iteration number (affects modification strategy).
+    structural_rules : dict, optional
+        User-defined structural constraints (frozen positions, strategies, etc.).
 
     Returns
     -------
@@ -305,7 +310,7 @@ def _generate_variants(
         List of unique, valid variant SMILES strings.
     """
     if _check_rdkit():
-        return _generate_variants_rdkit(parent_smiles, n_variants, rng, iteration)
+        return _generate_variants_rdkit(parent_smiles, n_variants, rng, iteration, structural_rules)
     else:
         return _generate_variants_mock(parent_smiles, n_variants, rng, iteration)
 
@@ -315,8 +320,13 @@ def _generate_variants_rdkit(
     n_variants: int,
     rng: random.Random,
     iteration: int,
+    structural_rules: Optional[dict] = None,
 ) -> list[str]:
-    """Generate variants using RDKit molecular editing."""
+    """Generate variants using RDKit molecular editing.
+
+    Respects structural_rules when provided: frozen positions, allowed
+    strategies, per-position groups, similarity and MW thresholds.
+    """
     try:
         from rdkit import Chem, RDLogger
         from rdkit.Chem import AllChem, Descriptors, QED as QED_module, RWMol
@@ -330,6 +340,22 @@ def _generate_variants_rdkit(
             RDLogger.EnableLog("rdApp.*")
             return _generate_variants_mock(parent_smiles, n_variants, rng, iteration)
 
+        # --- Parse structural rules ---
+        rules = structural_rules or {}
+        frozen_set: set[int] = set(rules.get("frozen_positions", []))
+        if rules.get("preserve_scaffold"):
+            frozen_set |= set(rules.get("core_atom_indices", []))
+        position_rules: dict[int, dict] = {}
+        for r in rules.get("rules", []):
+            if r.get("frozen"):
+                frozen_set.add(r["position_idx"])
+            else:
+                position_rules[r["position_idx"]] = r
+        allowed_strats_raw = rules.get("allowed_strategies", [])
+        allowed_strats: Optional[set[str]] = set(allowed_strats_raw) if allowed_strats_raw else None
+        min_similarity: float = rules.get("min_similarity", 0.3)
+        max_mw_delta: float = rules.get("max_mw_change", float('inf'))
+
         # Compute parent fingerprint for Tanimoto filter
         try:
             from rdkit.Chem import rdFingerprintGenerator
@@ -339,6 +365,8 @@ def _generate_variants_rdkit(
             parent_fp = AllChem.GetMorganFingerprintAsBitVect(parent_mol, 2, nBits=2048)
             fp_gen = None
 
+        parent_mw = Descriptors.ExactMolWt(parent_mol)
+
         variants: list[str] = []
         seen: set[str] = {parent_smiles}
 
@@ -346,12 +374,18 @@ def _generate_variants_rdkit(
         _FG = ["C", "CC", "O", "OC", "N", "NC", "F", "Cl", "C(F)(F)F",
                "C#N", "C(=O)N", "C1CC1", "N1CCNCC1", "N1CCOCC1"]
 
+        # Filter global strategies
+        all_strategies = ["add_fg", "swap_halogen", "swap_atom", "modify_chain"]
+        available_strategies = [s for s in all_strategies if not allowed_strats or s in allowed_strats]
+        if not available_strategies:
+            available_strategies = all_strategies
+
         max_attempts = n_variants * 5
         attempts = 0
 
         while len(variants) < n_variants and attempts < max_attempts:
             attempts += 1
-            strategy = rng.choice(["add_fg", "swap_halogen", "swap_atom", "modify_chain"])
+            strategy = rng.choice(available_strategies)
 
             new_smi: Optional[str] = None
 
@@ -364,10 +398,15 @@ def _generate_variants_rdkit(
                         a for a in rwmol.GetAtoms()
                         if a.GetIsAromatic() and a.GetAtomicNum() == 6
                         and a.GetTotalNumHs() > 0
+                        and a.GetIdx() not in frozen_set
                     ]
                     if ar_carbons:
                         target = rng.choice(ar_carbons)
-                        fg_smi = rng.choice(_FG)
+                        rule = position_rules.get(target.GetIdx())
+                        if rule and rule.get("allowed_groups"):
+                            fg_smi = rng.choice(rule["allowed_groups"])
+                        else:
+                            fg_smi = rng.choice(_FG)
                         fg_mol = Chem.MolFromSmiles(fg_smi)
                         if fg_mol is not None:
                             combo = Chem.RWMol(Chem.CombineMols(rwmol, fg_mol))
@@ -379,11 +418,23 @@ def _generate_variants_rdkit(
                 elif strategy == "swap_halogen":
                     halogens_map = {9: [17, 35], 17: [9, 35], 35: [9, 17]}
                     hal_atoms = [
-                        a for a in rwmol.GetAtoms() if a.GetAtomicNum() in halogens_map
+                        a for a in rwmol.GetAtoms()
+                        if a.GetAtomicNum() in halogens_map
+                        and a.GetIdx() not in frozen_set
                     ]
                     if hal_atoms:
                         target = rng.choice(hal_atoms)
-                        new_num = rng.choice(halogens_map[target.GetAtomicNum()])
+                        rule = position_rules.get(target.GetIdx())
+                        if rule and rule.get("allowed_groups"):
+                            # Map SMILES groups to atomic numbers
+                            group_map = {"F": 9, "Cl": 17, "Br": 35}
+                            choices = [group_map[g] for g in rule["allowed_groups"] if g in group_map]
+                            if choices:
+                                new_num = rng.choice(choices)
+                            else:
+                                new_num = rng.choice(halogens_map[target.GetAtomicNum()])
+                        else:
+                            new_num = rng.choice(halogens_map[target.GetAtomicNum()])
                         target.SetAtomicNum(new_num)
                         Chem.SanitizeMol(rwmol)
                         new_smi = Chem.MolToSmiles(rwmol)
@@ -394,6 +445,7 @@ def _generate_variants_rdkit(
                     swappable = [
                         a for a in rwmol.GetAtoms()
                         if not a.IsInRing() and a.GetAtomicNum() in swap_map
+                        and a.GetIdx() not in frozen_set
                     ]
                     if swappable:
                         target = rng.choice(swappable)
@@ -407,6 +459,7 @@ def _generate_variants_rdkit(
                         a for a in rwmol.GetAtoms()
                         if not a.GetIsAromatic() and a.GetAtomicNum() == 6
                         and a.GetDegree() >= 1 and a.GetTotalNumHs() > 0
+                        and a.GetIdx() not in frozen_set
                     ]
                     if chain_carbons:
                         target = rng.choice(chain_carbons)
@@ -441,13 +494,16 @@ def _generate_variants_rdkit(
                 else:
                     new_fp = AllChem.GetMorganFingerprintAsBitVect(new_mol, 2, nBits=2048)
                 sim = DataStructs.TanimotoSimilarity(parent_fp, new_fp)
-                if sim < 0.3:
+                if sim < min_similarity:
                     continue
 
-                # MW sanity
+                # MW sanity + delta check
                 mw = Descriptors.ExactMolWt(new_mol)
                 if mw < 150 or mw > 900:
                     continue
+                if max_mw_delta < float('inf'):
+                    if abs(mw - parent_mw) > max_mw_delta:
+                        continue
 
                 seen.add(new_smi)
                 variants.append(new_smi)
