@@ -142,12 +142,12 @@ export async function checkHealth() {
  * @returns {Promise<Object>} Preview data
  */
 export async function previewTarget(uniprotId) {
-  const response = await apiClient.post('/preview-target', { uniprot_id: uniprotId })
+  const response = await apiClient.post('/preview-target', { uniprot_id: uniprotId }, { timeout: 120000 })
   return response.data
 }
 
 export async function previewSequence(sequence) {
-  const response = await apiClient.post('/preview-sequence', { sequence })
+  const response = await apiClient.post('/preview-sequence', { sequence }, { timeout: 120000 })
   return response.data
 }
 
@@ -159,6 +159,16 @@ export async function previewSequence(sequence) {
  */
 export const getSynthesisRoute = (jobId, molIndex) =>
   apiClient.get(`/jobs/${jobId}/synthesis/${molIndex}`).then(r => r.data)
+
+/**
+ * Analyze a molecule's scaffold and R-group positions.
+ * @param {string} smiles - SMILES string of the molecule
+ * @returns {Promise<Object>} Scaffold analysis with positions, SVG, core indices
+ */
+export async function analyzeScaffold(smiles) {
+  const response = await apiClient.post('/molecule/analyze-scaffold', { smiles })
+  return response.data
+}
 
 /**
  * Start a lead optimization run for a given molecule in a job.
@@ -236,6 +246,51 @@ export async function getProjectDetail(projectId) {
 
 export async function updateProject(projectId, data) {
   const response = await apiClient.put(`/projects/${projectId}`, data)
+  return response.data
+}
+
+// ---------------------------------------------------------------------------
+// BindX: Target Assessment API
+// ---------------------------------------------------------------------------
+
+export async function runTargetAssessment(uniprotId, diseaseContext = null, options = {}) {
+  const response = await apiClient.post('/target-assessment', {
+    uniprot_id: uniprotId,
+    disease_context: diseaseContext,
+    ...options,
+  }, { timeout: 120000 })
+  return response.data
+}
+
+export async function getTargetAssessment(assessmentId) {
+  const response = await apiClient.get(`/target-assessment/${assessmentId}`)
+  return response.data
+}
+
+export async function queryAgent(agentName, context, projectId) {
+  const response = await apiClient.post(`/agent/${agentName}/query`, {
+    context,
+    ...(projectId ? { project_id: projectId } : {}),
+  }, { timeout: 120000 })
+  return response.data
+}
+
+export async function triggerRunAnalysis(jobId) {
+  const response = await apiClient.post(`/jobs/${jobId}/agent-analysis`, {}, { timeout: 120000 })
+  return response.data
+}
+
+// ---------------------------------------------------------------------------
+// V9: Time Estimation API
+// ---------------------------------------------------------------------------
+
+export async function estimatePipelineTime(params) {
+  const response = await apiClient.post('/estimate-time', params)
+  return response.data
+}
+
+export async function listDatabases() {
+  const response = await apiClient.get('/databases')
   return response.data
 }
 

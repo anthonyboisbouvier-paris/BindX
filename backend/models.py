@@ -124,6 +124,27 @@ class ProjectORM(Base):
 
 
 # ---------------------------------------------------------------------------
+# SQLAlchemy ORM — Target Assessment table (BindX)
+# ---------------------------------------------------------------------------
+
+class TargetAssessmentORM(Base):
+    """Persistent storage for target assessment results."""
+
+    __tablename__ = "target_assessments"
+
+    id: str = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: str = Column(String(36), ForeignKey("projects.id"), nullable=True)
+    uniprot_id: str = Column(String(20), nullable=False)
+    disease_context: str = Column(String(500), nullable=True)
+    assessment_json: str = Column(Text, nullable=True)  # Full assessment result
+    agent_responses_json: str = Column(Text, nullable=True)  # Agent analysis results
+    input_hash: str = Column(String(64), nullable=True, index=True)  # For idempotence
+    created_at: datetime.datetime = Column(
+        DateTime, nullable=False, default=datetime.datetime.utcnow
+    )
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -165,15 +186,34 @@ class JobCreate(BaseModel):
     )
     docking_engine: str = Field(
         default="auto",
-        description="Docking engine: gnina (CNN-scored), vina (classic), or auto (GNINA -> Vina -> mock fallback)",
+        description="Docking engine: gnina (CNN-scored CPU), gnina_gpu (GPU RunPod ~10x faster), vina (classic), or auto (GPU -> GNINA -> Vina -> mock fallback)",
     )
     notification_email: Optional[str] = Field(
         default=None, description="Email address for completion notification (deep mode)",
     )
 
+    # V11: unified pipeline controls
+    enable_dmpk: bool = Field(
+        default=True, description="Master toggle: DMPK analysis (backward compat, overrides all below when False)",
+    )
+
+    # V12: granular analysis toggles
+    enable_admet: bool = Field(default=True, description="ADMET prediction")
+    enable_synthesis: bool = Field(default=True, description="Retrosynthesis analysis")
+    enable_selectivity: bool = Field(default=True, description="Off-target selectivity screening")
+    enable_herg: bool = Field(default=True, description="hERG channel safety")
+    enable_safety: bool = Field(default=True, description="Confidence, PAINS, applicability domain")
+    box_size: Optional[list[float]] = Field(default=None, description="Docking box [x,y,z] Angstroms, None=auto from pocket")
+
     # V7: Project association
     project_id: Optional[str] = Field(
         default=None, description="Project ID to associate this job with",
+    )
+
+    # V8: Pre-computed target config (skips structure+pockets recomputation)
+    target_config_json: Optional[str] = Field(
+        default=None,
+        description="JSON-encoded target_preview_json to skip structure+pockets recomputation.",
     )
 
     # V2 fields kept for backward compat but no longer required
@@ -308,6 +348,17 @@ class SynthesisRoute(BaseModel):
 # Docking result (V1 + V2 + V3 fields)
 # ---------------------------------------------------------------------------
 
+class PoseQuality(BaseModel):
+    """Structured pose quality metrics from interaction analysis."""
+
+    n_contacts_4A: int = 0
+    n_hbonds: int = 0
+    key_residue_distances: Optional[dict] = None  # {"MET793": 2.8, "THR790": 3.1}
+    has_clashes: bool = False
+    n_clashes: int = 0
+    interaction_quality: float = 0.0
+
+
 class DockingResult(BaseModel):
     """One docked ligand with computed properties."""
 
@@ -349,6 +400,7 @@ class DockingResult(BaseModel):
     vina_score: Optional[float] = None  # Vina affinity (kcal/mol)
     cnn_score: Optional[float] = None  # GNINA CNN pose confidence (0-1)
     cnn_affinity: Optional[float] = None  # GNINA CNN affinity (pK)
+    cnn_vs: Optional[float] = None  # CNN_VS = CNNscore × CNNaffinity (VS ranking score)
     consensus_rank: Optional[float] = None  # Mean of 3 score ranks
     consensus_robust: Optional[bool] = None  # In top 50 of 2/3 methods
     interactions: Optional[dict] = None  # ProLIF interaction analysis
@@ -373,6 +425,13 @@ class DockingResult(BaseModel):
     # V6.3 fields
     combined_off_target: Optional[dict] = None  # SEA + docking combined screening
     herg_specialized: Optional[dict] = None  # Specialized hERG IC50 prediction
+
+    # V11 fields: docking transparency
+    docking_engine: Optional[str] = None  # "gnina" | "vina" | "mock" | None
+    docking_status: Optional[str] = None  # "docked" | "not_docked" | "failed"
+
+    # V12 fields: pose quality
+    pose_quality: Optional[PoseQuality] = None
 
 
 class JobResults(BaseModel):
@@ -419,6 +478,51 @@ class OffTargetResult(BaseModel):
 # V5: Optimization request / status
 # ---------------------------------------------------------------------------
 
+class ModificationRule(BaseModel):
+    """Rule for a single modifiable position on the molecule."""
+
+    position_idx: int  # atom index in the molecule
+    strategy: str = "any"  # add_fg|swap_halogen|swap_atom|modify_chain|any
+    allowed_groups: list[str] = []  # SMILES fragments permitted (empty = all)
+    frozen: bool = False  # freeze this position
+
+
+class StructuralRules(BaseModel):
+    """User-defined structural constraints for lead optimization."""
+
+    rules: list[ModificationRule] = []
+    frozen_positions: list[int] = []  # globally frozen positions (core)
+    allowed_strategies: list[str] = []  # global strategies (empty = all)
+    preserve_scaffold: bool = True  # keep the Murcko core intact
+    min_similarity: float = 0.3  # Tanimoto threshold [0.1-0.9]
+    max_mw_change: float = 100.0  # delta MW max [10-500]
+    core_atom_indices: list[int] = []  # from scaffold analysis
+
+
+class ScaffoldPosition(BaseModel):
+    """One R-group position on a molecule."""
+
+    label: str  # "R1", "R2"...
+    position_idx: int
+    atom_symbol: str
+    current_group: str  # SMILES of the current substituent
+    applicable_strategies: list[str]
+    suggested_replacements: list[str]
+    is_brics_site: bool = True
+
+
+class ScaffoldAnalysisResponse(BaseModel):
+    """Returned by POST /api/molecule/analyze-scaffold."""
+
+    smiles: str
+    scaffold_smiles: Optional[str] = None
+    positions: list[ScaffoldPosition] = []
+    annotated_svg: Optional[str] = None
+    core_atom_indices: list[int] = []
+    brics_bond_count: int = 0
+    stats: dict = {}
+
+
 class OptimizationRequest(BaseModel):
     """Payload for POST /api/jobs/{job_id}/optimize."""
 
@@ -444,6 +548,27 @@ class OptimizationRequest(BaseModel):
         default=50, ge=10, le=200,
         description="Number of variants to generate per iteration",
     )
+    docking_engine: str = Field(
+        default="gnina",
+        description="Docking engine for optimization: gnina (recommended), gnina_gpu (GPU RunPod), vina, none (skip docking), auto, or mock",
+    )
+    dock_top_n: int = Field(
+        default=20, ge=5, le=100,
+        description="Number of pre-filtered variants to actually dock per iteration",
+    )
+    exhaustiveness: int = Field(
+        default=8, ge=1, le=32,
+        description="Docking search exhaustiveness",
+    )
+    modification_rules: Optional[StructuralRules] = None  # structural rules
+
+    # V12: granular analysis toggles (same as JobCreate for parity)
+    enable_admet: bool = Field(default=True, description="ADMET prediction")
+    enable_synthesis: bool = Field(default=True, description="Retrosynthesis analysis")
+    enable_selectivity: bool = Field(default=True, description="Off-target selectivity screening")
+    enable_herg: bool = Field(default=True, description="hERG channel safety")
+    enable_safety: bool = Field(default=True, description="Confidence, PAINS, applicability domain")
+    box_size: Optional[list[float]] = Field(default=None, description="Docking box [x,y,z] Angstroms")
 
 
 class OptimizationStatus(BaseModel):
@@ -458,6 +583,7 @@ class OptimizationStatus(BaseModel):
     best_score: Optional[float] = None
     result: Optional[dict] = None
     error_message: Optional[str] = None
+    created_job_id: Optional[str] = None  # New job created from optimization results
 
 
 # ---------------------------------------------------------------------------
@@ -517,3 +643,78 @@ class ProjectResponse(BaseModel):
     target_preview_json: Optional[dict] = None
     created_at: Optional[str] = None
     job_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# BindX: Target Assessment schemas
+# ---------------------------------------------------------------------------
+
+class TargetAssessmentRequest(BaseModel):
+    """Payload for POST /api/target-assessment."""
+
+    uniprot_id: str = Field(..., min_length=2, max_length=20)
+    disease_context: Optional[str] = Field(
+        default=None, description="EFO disease ID or free-text disease name",
+    )
+    modality: str = Field(
+        default="small_molecule",
+        description="Drug modality: small_molecule, biologic, degrader",
+    )
+    project_id: Optional[str] = Field(
+        default=None, description="Project to associate this assessment with",
+    )
+    weights: Optional[dict[str, float]] = Field(
+        default=None,
+        description="Custom aggregation weights (evidence, druggability, novelty, safety, feasibility)",
+    )
+    include_agents: bool = Field(
+        default=True,
+        description="Whether to run AI agent analysis (requires OPENAI_API_KEY)",
+    )
+    force_refresh: bool = Field(
+        default=False,
+        description="Bypass cache and re-run the full assessment",
+    )
+
+
+class TargetAssessmentResult(BaseModel):
+    """Returned by GET /api/target-assessment/{id}."""
+
+    id: str
+    uniprot_id: str
+    disease_context: Optional[str] = None
+    modality: str = "small_molecule"
+    scores: dict = {}
+    composite_score: float = 0.0
+    recommendation: str = "CAUTION"
+    rationale: Optional[str] = None
+    flags: list[str] = []
+    critical_flags: list[str] = []
+    agent_analysis: Optional[dict] = None
+    provenance: dict = {}
+    input_hash: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# BindX: Agent query schemas
+# ---------------------------------------------------------------------------
+
+class AgentQuery(BaseModel):
+    """Payload for POST /api/agent/{agent_name}/query."""
+
+    context: dict = Field(..., description="Structured input context for the agent")
+    project_id: Optional[str] = Field(default=None, description="Project ID for enriched agent queries")
+
+
+class AgentResponse(BaseModel):
+    """Response from an agent query."""
+
+    available: bool = False
+    agent_name: str = ""
+    model: str = "gpt-4o"
+    analysis: Optional[dict] = None
+    fallback: Optional[str] = None
+    version: str = ""
+    timestamp: Optional[str] = None
+    input_hash: Optional[str] = None

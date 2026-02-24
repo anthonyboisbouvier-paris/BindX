@@ -77,7 +77,7 @@ export default function LoginPage() {
           <button
             type="submit"
             disabled={loading}
-            className="w-full bg-[#1e3a5f] text-white py-2.5 rounded-lg font-medium hover:bg-[#152d4a] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="w-full bg-[#22c55e] text-white py-2.5 rounded-lg font-medium hover:bg-[#16a34a] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {loading ? (
               <span className="flex items-center justify-center gap-2">
@@ -97,9 +97,17 @@ export default function LoginPage() {
             Create one
           </Link>
         </p>
+        <div className="flex items-center gap-3 mt-4 mb-2">
+          <div className="flex-1 h-px bg-gray-100" />
+          <span className="text-xs text-gray-300">or</span>
+          <div className="flex-1 h-px bg-gray-100" />
+        </div>
         <p className="text-center text-sm text-gray-400 mt-2">
-          <Link to="/" className="hover:text-[#1e3a5f] transition-colors">
+          <Link to="/" className="hover:text-[#1e3a5f] transition-colors inline-flex items-center gap-1">
             Continue without signing in
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 8l4 4m0 0l-4 4m4-4H3" />
+            </svg>
           </Link>
         </p>
       </div>

@@ -1,6 +1,7 @@
 import React from 'react'
 import { Link } from 'react-router-dom'
 import { useProject } from '../../contexts/ProjectContext.jsx'
+import AssessmentCard from '../../components/AssessmentCard.jsx'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -81,6 +82,58 @@ function TargetSummaryCard({ targetConfig }) {
 }
 
 // ---------------------------------------------------------------------------
+// Normalize assessment data to the format AssessmentCard expects.
+// The stored format uses flat integer keys (0-100); AssessmentCard expects
+// { composite_score: 0-1, scores: { evidence: { score }, druggability: { score }, ... } }
+// ---------------------------------------------------------------------------
+
+function normalizeAssessment(raw) {
+  if (!raw) return null
+
+  // Already in the correct format (has composite_score as a float 0-1)
+  if (raw.composite_score != null && raw.composite_score <= 1 && raw.scores) {
+    return raw
+  }
+
+  // Legacy / simplified format: flat integer scores 0-100
+  const toFloat = (v) => (v != null ? v / 100 : 0)
+
+  // Map stored keys to the 5 dimensions AssessmentCard renders
+  const scores = {
+    evidence:     { score: toFloat(raw.data_score     ?? raw.evidence_score) },
+    druggability: { score: toFloat(raw.druggability_score) },
+    novelty:      { score: toFloat(raw.novelty_score) },
+    safety:       { score: toFloat(raw.safety_score) },
+    feasibility:  { score: toFloat(raw.structural_score ?? raw.feasibility_score) },
+  }
+
+  // Composite: use overall_score if present, otherwise average available scores
+  let composite
+  if (raw.overall_score != null) {
+    composite = raw.overall_score / 100
+  } else {
+    const vals = Object.values(scores).map(s => s.score).filter(v => v > 0)
+    composite = vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : 0
+  }
+
+  // Derive recommendation from composite score if not stored
+  let recommendation = raw.recommendation
+  if (!recommendation) {
+    if (composite >= 0.65) recommendation = 'GO'
+    else if (composite >= 0.40) recommendation = 'CAUTION'
+    else recommendation = 'NO-GO'
+  }
+
+  return {
+    ...raw,
+    composite_score: composite,
+    scores,
+    recommendation,
+    rationale: raw.rationale || raw.summary || '',
+  }
+}
+
+// ---------------------------------------------------------------------------
 // ProjectOverview — Screen 1
 // ---------------------------------------------------------------------------
 
@@ -143,37 +196,7 @@ export default function ProjectOverview() {
         )}
       </div>
 
-      {/* Target not configured — CTA */}
-      {!isTargetConfigured && (
-        <div className="bg-amber-50 border border-amber-200 rounded-xl p-6 text-center">
-          <svg className="w-12 h-12 text-amber-400 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <circle cx="12" cy="12" r="9" strokeWidth={1.8} />
-            <circle cx="12" cy="12" r="5" strokeWidth={1.8} />
-            <circle cx="12" cy="12" r="1.5" fill="currentColor" strokeWidth={0} />
-          </svg>
-          <h3 className="text-lg font-bold text-amber-800 mb-2">Configure your target to begin</h3>
-          <p className="text-sm text-amber-600 mb-4 max-w-md mx-auto">
-            Before running any screening, you need to validate a target protein, select a 3D structure, and choose a binding pocket.
-          </p>
-          <Link
-            to={`/project/${project.id}/target`}
-            className="inline-flex items-center gap-2 px-5 py-2.5 bg-[#1e3a5f] text-white font-semibold rounded-xl hover:bg-[#2a4f7c] transition-colors shadow-sm"
-          >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <circle cx="12" cy="12" r="9" strokeWidth={2} />
-              <circle cx="12" cy="12" r="5" strokeWidth={2} />
-            </svg>
-            Go to Target Setup
-          </Link>
-        </div>
-      )}
-
-      {/* Target configured — summary */}
-      {isTargetConfigured && targetConfig && (
-        <TargetSummaryCard targetConfig={targetConfig} />
-      )}
-
-      {/* Stats */}
+      {/* Stats — always visible, above any CTA */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
         <StatCard label="Total Runs" value={jobs.length} />
         <StatCard
@@ -188,26 +211,64 @@ export default function ProjectOverview() {
         />
         <StatCard
           label="Best Score"
-          value={bestScore != null && bestScore > 0 ? `${Math.round(bestScore * 100)}/100` : '—'}
+          value={bestScore != null && bestScore > 0 ? `${Math.round((bestScore > 1 ? bestScore : bestScore * 100))}/100` : '—'}
           colorClass="text-[#22c55e]"
         />
       </div>
+
+      {/* Target not configured — compact inline CTA */}
+      {!isTargetConfigured && (
+        <div className="flex items-center gap-4 bg-amber-50 border border-amber-200 rounded-xl px-5 py-4">
+          <div className="w-10 h-10 rounded-full bg-amber-100 flex items-center justify-center shrink-0">
+            <svg className="w-5 h-5 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="9" strokeWidth={2} />
+              <circle cx="12" cy="12" r="5" strokeWidth={2} />
+              <circle cx="12" cy="12" r="1.5" fill="currentColor" strokeWidth={0} />
+            </svg>
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-semibold text-amber-800">Configure your target to begin</p>
+            <p className="text-xs text-amber-600 mt-0.5">Validate a target protein, select a 3D structure, and choose a binding pocket.</p>
+          </div>
+          <Link
+            to={`/project/${project.id}/target`}
+            className="shrink-0 px-4 py-2 bg-[#1e3a5f] text-white text-sm font-semibold rounded-lg hover:bg-[#2a4f7c] transition-colors"
+          >
+            Setup Target
+          </Link>
+        </div>
+      )}
+
+      {/* Target configured — summary */}
+      {isTargetConfigured && targetConfig && (
+        <TargetSummaryCard targetConfig={targetConfig} />
+      )}
+
+      {/* BindX: Target Assessment summary */}
+      {isTargetConfigured && targetConfig?.assessment && (
+        <AssessmentCard assessment={normalizeAssessment(
+          targetConfig.assessment.agent_analysis && !targetConfig.assessment.agent_analysis.available
+            ? { ...targetConfig.assessment, agent_analysis: null }
+            : targetConfig.assessment
+        )} />
+      )}
 
       {/* Quick actions */}
       <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
         <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Quick Actions</h2>
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-          <Link
-            to={`/project/${project.id}/target`}
-            className="flex items-center gap-2.5 px-4 py-3 rounded-xl font-semibold text-sm bg-[#1e3a5f] text-white hover:bg-[#2a4f7c] transition-colors"
-          >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <circle cx="12" cy="12" r="9" strokeWidth={2} />
-              <circle cx="12" cy="12" r="5" strokeWidth={2} />
-            </svg>
-            {isTargetConfigured ? 'Reconfigure Target' : 'Target Setup'}
-          </Link>
-          {isTargetConfigured && (
+          {!isTargetConfigured ? (
+            <Link
+              to={`/project/${project.id}/target`}
+              className="flex items-center gap-2.5 px-4 py-3 rounded-xl font-semibold text-sm bg-[#22c55e] text-white hover:bg-[#16a34a] transition-colors col-span-2 sm:col-span-1"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="9" strokeWidth={2} />
+                <circle cx="12" cy="12" r="5" strokeWidth={2} />
+              </svg>
+              Setup Target
+            </Link>
+          ) : (
             <>
               <Link
                 to={`/project/${project.id}/runs`}
@@ -217,7 +278,7 @@ export default function ProjectOverview() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
-                View Runs
+                New Screening
               </Link>
               {completedJobs.length > 0 && (
                 <Link
@@ -228,9 +289,19 @@ export default function ProjectOverview() {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                       d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
                   </svg>
-                  Latest Results
+                  View Results
                 </Link>
               )}
+              <Link
+                to={`/project/${project.id}/target`}
+                className="flex items-center gap-2.5 px-4 py-3 rounded-xl font-semibold text-sm bg-white text-gray-500 border border-gray-200 hover:bg-gray-50 transition-colors"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <circle cx="12" cy="12" r="9" strokeWidth={2} />
+                  <circle cx="12" cy="12" r="5" strokeWidth={2} />
+                </svg>
+                Reconfigure Target
+              </Link>
             </>
           )}
         </div>

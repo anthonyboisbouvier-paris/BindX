@@ -1,7 +1,9 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { getProteinUrl, getPoseUrl, getReportUrl } from '../api.js'
 
-// Load 3Dmol via CDN script tag approach for reliable loading
+// --------------------------------------------------
+// 3Dmol loader — CDN script tag approach
+// --------------------------------------------------
 function load3Dmol() {
   return new Promise((resolve, reject) => {
     if (window.$3Dmol) {
@@ -27,8 +29,50 @@ function load3Dmol() {
 }
 
 // --------------------------------------------------
+// Color mode helpers
+// --------------------------------------------------
+const HYDRO_SCALE = {
+  ILE: 4.5, VAL: 4.2, LEU: 3.8, PHE: 2.8, CYS: 2.5, MET: 1.9, ALA: 1.8,
+  GLY: -0.4, THR: -0.7, SER: -0.8, TRP: -0.9, TYR: -1.3, PRO: -1.6,
+  HIS: -3.2, GLU: -3.5, GLN: -3.5, ASP: -3.5, ASN: -3.5, LYS: -3.9, ARG: -4.5,
+}
+
+function hydroColor(atom) {
+  const val = HYDRO_SCALE[atom.resn] ?? 0
+  const t = (val + 4.5) / 9.0
+  if (t < 0.5) {
+    const s = t * 2
+    return `rgb(${Math.round(s * 255)},${Math.round(s * 255)},255)`
+  }
+  const s = (t - 0.5) * 2
+  return `rgb(255,${Math.round((1 - s) * 255)},${Math.round((1 - s) * 255)})`
+}
+
+function getColorSpec(mode) {
+  switch (mode) {
+    case 'ss':      return { colorscheme: 'ssJmol' }
+    case 'hydro':   return { colorfunc: hydroColor }
+    case 'bfactor': return { colorscheme: { prop: 'b', gradient: 'rwb', min: 0, max: 100 } }
+    case 'chain':   return { colorscheme: 'chain' }
+    default:        return { color: '#4a9eff' }
+  }
+}
+
+// Domain palette — cycles through 6 distinct colours
+const DOMAIN_COLORS = ['#6366f1', '#8b5cf6', '#ec4899', '#14b8a6', '#f59e0b', '#06b6d4']
+
+// Human-readable label for each color mode
+const COLOR_MODE_LABELS = {
+  default:  'Default (blue)',
+  ss:       'Secondary Structure',
+  hydro:    'Hydrophobicity',
+  bfactor:  'B-factor / pLDDT',
+  chain:    'Chain',
+}
+
+// --------------------------------------------------
 // Simplified toolbar — used in V3 dashboard flow
-// Props: onBack, onPrev, onNext, jobId
+// Props: onBack, onPrev, onNext, jobId, onReset
 // --------------------------------------------------
 function SimplifiedToolbar({ onBack, onPrev, onNext, jobId, onReset }) {
   return (
@@ -107,9 +151,22 @@ function SimplifiedToolbar({ onBack, onPrev, onNext, jobId, onReset }) {
 }
 
 // --------------------------------------------------
-// Full toolbar (V2 style) — retained for backwards compat
+// Full toolbar (V2 style) — with color mode dropdown
+// Props: topResults, selectedPoseIndex, onPoseSelect,
+//        currentStyle, onStyleChange,
+//        colorMode, onColorChange,
+//        onReset
 // --------------------------------------------------
-function FullToolbar({ topResults, selectedPoseIndex, onPoseSelect, currentStyle, onStyleChange, onReset }) {
+function FullToolbar({
+  topResults,
+  selectedPoseIndex,
+  onPoseSelect,
+  currentStyle,
+  onStyleChange,
+  colorMode,
+  onColorChange,
+  onReset,
+}) {
   return (
     <div className="flex items-center justify-between px-4 py-3 bg-dockit-blue border-b border-dockit-blue-dark">
       <h3 className="text-white font-semibold text-sm flex items-center gap-2">
@@ -120,7 +177,7 @@ function FullToolbar({ topResults, selectedPoseIndex, onPoseSelect, currentStyle
         3D Viewer
       </h3>
 
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap justify-end">
         {/* Pose selector */}
         {topResults.length > 0 && (
           <select
@@ -154,6 +211,18 @@ function FullToolbar({ topResults, selectedPoseIndex, onPoseSelect, currentStyle
           ))}
         </div>
 
+        {/* Color mode dropdown */}
+        <select
+          value={colorMode}
+          onChange={(e) => onColorChange(e.target.value)}
+          title="Color mode"
+          className="text-xs bg-dockit-blue-light text-white border border-white/20 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-dockit-green"
+        >
+          {Object.entries(COLOR_MODE_LABELS).map(([value, label]) => (
+            <option key={value} value={value}>{label}</option>
+          ))}
+        </select>
+
         {/* Reset view */}
         <button
           onClick={onReset}
@@ -175,6 +244,11 @@ function FullToolbar({ topResults, selectedPoseIndex, onPoseSelect, currentStyle
 //   jobId, results, selectedPoseIndex, onPoseSelect — V2 full mode
 //   simplified — boolean, enables simplified toolbar
 //   onBack, onPrev, onNext — simplified mode callbacks
+//   pocketCenter, pocketResidues — pocket overlay
+//   uniprotFeatures — { activeSites, bindingSites, domains }
+//     activeSites:  [{ position }]  or [{ residues:[...] }]
+//     bindingSites: [{ position }]  or [{ residues:[...] }]
+//     domains:      [{ start, end, name }]
 // --------------------------------------------------
 export default function Viewer3D({
   jobId,
@@ -185,6 +259,9 @@ export default function Viewer3D({
   onBack,
   onPrev,
   onNext,
+  pocketCenter = null,
+  pocketResidues = null,
+  uniprotFeatures = null,
 }) {
   const containerRef = useRef(null)
   const viewerRef = useRef(null)
@@ -192,17 +269,61 @@ export default function Viewer3D({
   const [error, setError] = useState(null)
   const [viewerReady, setViewerReady] = useState(false)
   const [currentStyle, setCurrentStyle] = useState('cartoon')
+  const [colorMode, setColorMode] = useState('default')
   const [ligandLoaded, setLigandLoaded] = useState(false)
+  const [noPose, setNoPose] = useState(false)
+  const [showPocket, setShowPocket] = useState(true)
+  const [annotations, setAnnotations] = useState({
+    activeSites: false,
+    bindingSites: false,
+    domains: false,
+  })
+
   const surfaceActiveRef = useRef(false)
 
   const topResults = results?.results?.slice(0, 10) || []
 
+  // --------------------------------------------------
+  // Helpers: extract residue numbers from UniProt feature arrays
+  // --------------------------------------------------
+  function extractResidues(featureArr) {
+    if (!featureArr || !Array.isArray(featureArr)) return []
+    const nums = []
+    featureArr.forEach((f) => {
+      // Flat position
+      if (f.position != null) {
+        const n = parseInt(f.position)
+        if (!isNaN(n)) nums.push(n)
+      }
+      // Nested residues array
+      if (Array.isArray(f.residues)) {
+        f.residues.forEach((r) => {
+          const n = parseInt(r?.position ?? r)
+          if (!isNaN(n)) nums.push(n)
+        })
+      }
+      // start/end range (domains)
+      if (f.start != null && f.end != null) {
+        const start = parseInt(f.start)
+        const end = parseInt(f.end)
+        if (!isNaN(start) && !isNaN(end)) {
+          for (let i = start; i <= end; i++) nums.push(i)
+        }
+      }
+    })
+    return [...new Set(nums)]
+  }
+
+  // --------------------------------------------------
+  // initViewer — load protein, set up viewer
+  // --------------------------------------------------
   const initViewer = useCallback(async () => {
     if (!containerRef.current || !jobId) return
 
     setLoading(true)
     setError(null)
     setLigandLoaded(false)
+    setNoPose(false)
 
     try {
       const $3Dmol = await load3Dmol()
@@ -240,6 +361,9 @@ export default function Viewer3D({
     }
   }, [jobId])
 
+  // --------------------------------------------------
+  // loadPose — fetch and display a docking pose
+  // --------------------------------------------------
   const loadPose = useCallback(async (poseIndex) => {
     const viewer = viewerRef.current
     if (!viewer || poseIndex === null || poseIndex === undefined) return
@@ -254,18 +378,31 @@ export default function Viewer3D({
       }
 
       const poseUrl = getPoseUrl(jobId, poseIndex)
-      const response = await fetch(poseUrl)
-      if (!response.ok) {
-        console.warn(`[Viewer3D] Pose ${poseIndex} not available: ${response.status}`)
+      let poseLoaded = false
+      try {
+        const response = await fetch(poseUrl)
+        if (response.ok) {
+          const poseData = await response.text()
+          const isSdf = /V2000|V3000|\$\$\$\$/.test(poseData)
+          const isPdbqt = /BRANCH|ENDROOT|TORSDOF/.test(poseData)
+          const format = isSdf ? 'sdf' : isPdbqt ? 'pdbqt' : 'pdb'
+          viewer.addModel(poseData, format)
+          poseLoaded = true
+        }
+      } catch (fetchErr) {
+        console.warn(`[Viewer3D] Pose fetch failed for index ${poseIndex}:`, fetchErr)
+      }
+
+      // No pose file available — show "not docked" banner, do NOT render fake ligand
+      if (!poseLoaded) {
+        console.info(`[Viewer3D] No docking pose for index ${poseIndex} — showing banner`)
+        setNoPose(true)
+        setLigandLoaded(false)
+        viewer.render()
         return
       }
 
-      const poseData = await response.text()
-      // Detect SDF format first, then PDBQT, then fall back to PDB
-      const isSdf = /V2000|V3000|\$\$\$\$/.test(poseData)
-      const isPdbqt = /BRANCH|ENDROOT|TORSDOF/.test(poseData)
-      const format = isSdf ? 'sdf' : isPdbqt ? 'pdbqt' : 'pdb'
-      viewer.addModel(poseData, format)
+      setNoPose(false)
 
       // Last model is the ligand
       const models2 = viewer.getModelList()
@@ -290,10 +427,13 @@ export default function Viewer3D({
         }
       }
 
-      // Zoom to fit all loaded models (protein + ligand) so the ligand
-      // appears in context rather than isolated
-      viewer.zoomTo()
-      viewer.zoom(1.2)
+      // Zoom to ligand region (not the whole protein) so the pose is visible
+      try {
+        viewer.zoomTo({ model: ligandModel })
+        viewer.zoom(0.7) // zoom out slightly to show surrounding pocket
+      } catch (_) {
+        viewer.zoomTo()
+      }
       viewer.render()
       setLigandLoaded(true)
     } catch (err) {
@@ -301,63 +441,176 @@ export default function Viewer3D({
     }
   }, [jobId, simplified])
 
-  // Apply protein style change
-  const applyStyle = useCallback((style) => {
+  // --------------------------------------------------
+  // applyAllStyles — unified callback
+  // Sets base protein style (cartoon/surface/stick x colorMode),
+  // then overlays pocket highlight, then UniProt annotations.
+  // This replaces the old applyStyle + pocket useEffect pair so
+  // changing protein style no longer resets pocket residue sticks.
+  // --------------------------------------------------
+  const applyAllStyles = useCallback(() => {
     const viewer = viewerRef.current
-    if (!viewer) return
+    if (!viewer || !viewerReady) return
 
     const models = viewer.getModelList()
     const proteinModel = models?.[0]
     if (!proteinModel) return
 
-    // Always remove any existing surface before applying a new style so we
-    // never accumulate stacked surfaces when the button is clicked repeatedly.
+    // 1. Remove any existing surfaces and shapes before rebuilding
     if (surfaceActiveRef.current) {
       try { viewer.removeAllSurfaces() } catch (_) {}
       surfaceActiveRef.current = false
     }
+    try { viewer.removeAllShapes() } catch (_) {}
 
-    if (style === 'surface') {
-      // Show a translucent cartoon underneath the surface so the backbone
-      // silhouette is still readable, then overlay the VDW surface.
+    const colorSpec = getColorSpec(colorMode)
+
+    // 2. Base protein style
+    if (currentStyle === 'surface') {
+      // Coloured cartoon underlay (opacity 0.3), then translucent white surface
       viewer.setStyle({ model: proteinModel }, {
-        cartoon: { color: '#4a9eff', opacity: 0.3 },
+        cartoon: { ...colorSpec, opacity: 0.3 },
       })
       const $3Dmol = window.$3Dmol
       const surfaceType = $3Dmol?.SurfaceType?.VDW ?? 1
       viewer.addSurface(
         surfaceType,
-        { opacity: 0.7, color: '#4a9eff' },
+        { opacity: 0.35, color: '#e2e8f0' },
         { model: proteinModel }
       )
       surfaceActiveRef.current = true
-    } else if (style === 'cartoon') {
+    } else if (currentStyle === 'cartoon') {
       viewer.setStyle({ model: proteinModel }, {
-        cartoon: { color: '#4a9eff', opacity: 0.85 },
+        cartoon: { ...colorSpec, opacity: 0.85 },
       })
     } else {
-      // 'stick' style for protein backbone
-      viewer.setStyle({ model: proteinModel }, {
-        stick: { colorscheme: 'default', radius: 0.15 },
+      // stick
+      const stickSpec = colorMode === 'default'
+        ? { colorscheme: 'default', radius: 0.15 }
+        : { ...colorSpec, radius: 0.15 }
+      viewer.setStyle({ model: proteinModel }, { stick: stickSpec })
+    }
+
+    // 3. Pocket overlay
+    if (showPocket && pocketCenter && Array.isArray(pocketCenter) && pocketCenter.length === 3) {
+      const [x, y, z] = pocketCenter
+      viewer.addSphere({
+        center: { x, y, z },
+        radius: 6,
+        color: '#f59e0b',
+        opacity: 0.25,
+        wireframe: false,
       })
+
+      if (pocketResidues && pocketResidues.length > 0) {
+        const resSels = pocketResidues.map((r) => {
+          const parts = r.split('_')
+          return parts.length >= 2 ? parseInt(parts[parts.length - 1]) : null
+        }).filter((n) => n != null)
+
+        if (resSels.length > 0) {
+          viewer.addStyle(
+            { resi: resSels, model: proteinModel },
+            { stick: { color: '#f59e0b', radius: 0.12, opacity: 0.7 } }
+          )
+        }
+      }
+    }
+
+    // 4. UniProt annotations
+    if (uniprotFeatures) {
+      // Active Sites — red spheres + sticks
+      if (annotations.activeSites) {
+        const residues = extractResidues(uniprotFeatures.activeSites)
+        if (residues.length > 0) {
+          viewer.addStyle(
+            { resi: residues, model: proteinModel },
+            {
+              stick: { color: '#ef4444', radius: 0.18, opacity: 0.95 },
+              sphere: { color: '#ef4444', radius: 0.4, opacity: 0.7 },
+            }
+          )
+        }
+      }
+
+      // Binding Sites — orange sticks
+      if (annotations.bindingSites) {
+        const residues = extractResidues(uniprotFeatures.bindingSites)
+        if (residues.length > 0) {
+          viewer.addStyle(
+            { resi: residues, model: proteinModel },
+            { stick: { color: '#f97316', radius: 0.18, opacity: 0.95 } }
+          )
+        }
+      }
+
+      // Domains — per-domain coloured cartoon regions
+      if (annotations.domains && Array.isArray(uniprotFeatures.domains)) {
+        uniprotFeatures.domains.forEach((domain, idx) => {
+          const color = DOMAIN_COLORS[idx % DOMAIN_COLORS.length]
+          const start = parseInt(domain.start)
+          const end = parseInt(domain.end)
+          if (!isNaN(start) && !isNaN(end)) {
+            const resiRange = []
+            for (let i = start; i <= end; i++) resiRange.push(i)
+            viewer.addStyle(
+              { resi: resiRange, model: proteinModel },
+              { cartoon: { color, opacity: 0.95 } }
+            )
+          }
+        })
+      }
     }
 
     viewer.render()
-  }, [])
+  }, [
+    viewerReady,
+    currentStyle,
+    colorMode,
+    showPocket,
+    pocketCenter,
+    pocketResidues,
+    uniprotFeatures,
+    annotations,
+  ])
 
+  // --------------------------------------------------
+  // Effects
+  // --------------------------------------------------
+
+  // Initialize viewer when jobId changes
   useEffect(() => {
     initViewer()
   }, [initViewer])
 
+  // Re-apply all styles whenever any relevant state changes
+  useEffect(() => {
+    applyAllStyles()
+  }, [applyAllStyles])
+
+  // Load pose when selection changes
   useEffect(() => {
     if (viewerReady && selectedPoseIndex !== null && selectedPoseIndex !== undefined) {
       loadPose(selectedPoseIndex)
     }
   }, [selectedPoseIndex, viewerReady, loadPose])
 
+  // --------------------------------------------------
+  // Handlers
+  // --------------------------------------------------
   const handleStyleChange = (style) => {
     setCurrentStyle(style)
-    applyStyle(style)
+    // applyAllStyles triggers automatically via the effect above
+  }
+
+  const handleColorChange = (mode) => {
+    setColorMode(mode)
+    // applyAllStyles triggers automatically via the effect above
+  }
+
+  const toggleAnnotation = (key) => {
+    setAnnotations((prev) => ({ ...prev, [key]: !prev[key] }))
+    // applyAllStyles triggers automatically via the effect above
   }
 
   const handleReset = () => {
@@ -367,6 +620,37 @@ export default function Viewer3D({
     viewer.render()
   }
 
+  // --------------------------------------------------
+  // Annotation toggle button — reusable sub-component
+  // --------------------------------------------------
+  function AnnotationToggle({ label, colorDot, active, onToggle }) {
+    return (
+      <button
+        onClick={onToggle}
+        className={`flex items-center gap-1.5 px-2 py-0.5 rounded border transition-colors ${
+          active
+            ? 'border-opacity-60 text-gray-700'
+            : 'bg-white border-gray-200 text-gray-400 hover:border-gray-300'
+        }`}
+        style={active ? { backgroundColor: colorDot + '18', borderColor: colorDot } : {}}
+      >
+        <span
+          className="w-3 h-3 rounded-full inline-block flex-shrink-0"
+          style={{ backgroundColor: colorDot, opacity: active ? 1 : 0.3 }}
+        />
+        {label} {active ? 'ON' : 'OFF'}
+      </button>
+    )
+  }
+
+  // Determine whether to show annotation toggles in the legend
+  const hasActiveSites = uniprotFeatures?.activeSites?.length > 0
+  const hasBindingSites = uniprotFeatures?.bindingSites?.length > 0
+  const hasDomains = uniprotFeatures?.domains?.length > 0
+
+  // --------------------------------------------------
+  // Render
+  // --------------------------------------------------
   return (
     <div className="card overflow-hidden">
       {/* Toolbar */}
@@ -385,6 +669,8 @@ export default function Viewer3D({
           onPoseSelect={onPoseSelect}
           currentStyle={currentStyle}
           onStyleChange={handleStyleChange}
+          colorMode={colorMode}
+          onColorChange={handleColorChange}
           onReset={handleReset}
         />
       )}
@@ -419,20 +705,79 @@ export default function Viewer3D({
           className="w-full h-full viewer-container"
           style={{ visibility: loading || error ? 'hidden' : 'visible' }}
         />
+
+        {/* "Not docked" banner — shown when selected molecule has no pose */}
+        {noPose && !loading && !error && (
+          <div className="absolute inset-x-0 bottom-0 flex items-center justify-center z-10 pointer-events-none pb-6">
+            <div className="bg-gray-800/90 backdrop-blur-sm border border-gray-600 rounded-xl px-6 py-3 flex items-center gap-3 shadow-lg pointer-events-auto">
+              <svg className="w-5 h-5 text-amber-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                  d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" />
+              </svg>
+              <div>
+                <p className="text-white text-sm font-semibold">No docking pose available</p>
+                <p className="text-gray-400 text-xs">This molecule was not docked — only real docked poses are shown</p>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
-      {/* Legend */}
-      <div className="flex items-center gap-6 px-4 py-2 bg-gray-50 border-t border-gray-100 text-xs text-gray-500">
+      {/* Legend + annotation toggles */}
+      <div className="flex items-center gap-4 px-4 py-2 bg-gray-50 border-t border-gray-100 text-xs text-gray-500 flex-wrap">
+        {/* Static legend items */}
         <span className="flex items-center gap-1.5">
           <span className="w-3 h-3 rounded-full bg-blue-400 inline-block" />
-          Protein (receptor)
+          Protein
         </span>
         <span className="flex items-center gap-1.5">
           <span className="w-3 h-3 rounded-full bg-dockit-green inline-block" />
-          Ligand (docking pose)
+          Ligand
         </span>
-        <span className="ml-auto text-gray-400">
-          Left click: rotate | Scroll: zoom | Right click: translate
+
+        {/* Pocket toggle */}
+        {pocketCenter && (
+          <button
+            onClick={() => setShowPocket((v) => !v)}
+            className={`flex items-center gap-1.5 px-2 py-0.5 rounded border transition-colors ${
+              showPocket
+                ? 'bg-amber-50 border-amber-300 text-amber-700'
+                : 'bg-white border-gray-200 text-gray-400 hover:border-gray-300'
+            }`}
+          >
+            <span className="w-3 h-3 rounded-full bg-amber-400 inline-block" style={{ opacity: showPocket ? 1 : 0.3 }} />
+            Pocket {showPocket ? 'ON' : 'OFF'}
+          </button>
+        )}
+
+        {/* UniProt annotation toggles */}
+        {hasActiveSites && (
+          <AnnotationToggle
+            label="Active Sites"
+            colorDot="#ef4444"
+            active={annotations.activeSites}
+            onToggle={() => toggleAnnotation('activeSites')}
+          />
+        )}
+        {hasBindingSites && (
+          <AnnotationToggle
+            label="Binding Sites"
+            colorDot="#f97316"
+            active={annotations.bindingSites}
+            onToggle={() => toggleAnnotation('bindingSites')}
+          />
+        )}
+        {hasDomains && (
+          <AnnotationToggle
+            label="Domains"
+            colorDot="#6366f1"
+            active={annotations.domains}
+            onToggle={() => toggleAnnotation('domains')}
+          />
+        )}
+
+        <span className="ml-auto text-gray-400 hidden sm:inline">
+          Rotate | Scroll: zoom | Right: pan
         </span>
       </div>
     </div>

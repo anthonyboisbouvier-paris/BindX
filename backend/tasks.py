@@ -70,6 +70,87 @@ def _store_pipeline_summary(job_id: str, summary: dict) -> None:
         logger.warning("[%s] Failed to store pipeline summary: %s", job_id, exc)
 
 
+def _run_single_interaction(protein_path: str, ligand_path: str, uniprot_id: str, smiles: str) -> Optional[dict]:
+    """Run interaction analysis for a single molecule in an isolated subprocess.
+
+    ProLIF/MDAnalysis can SIGSEGV on certain PDB structures. Running in a
+    subprocess protects the Celery worker process from being killed.
+    """
+    import multiprocessing as mp
+
+    def _worker(conn, prot, lig, uid, smi):
+        try:
+            from pipeline.interaction_analysis import analyze_interactions
+            result = analyze_interactions(
+                protein_path=prot, ligand_path=lig,
+                uniprot_id=uid, smiles=smi,
+            )
+            conn.send(result)
+        except Exception as exc:
+            conn.send({"error": str(exc)})
+        finally:
+            conn.close()
+
+    parent_conn, child_conn = mp.Pipe()
+    proc = mp.Process(target=_worker, args=(child_conn, protein_path, ligand_path, uniprot_id, smiles))
+    proc.start()
+    proc.join(timeout=45)  # 45s max per molecule
+
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=5)
+        return None
+
+    if proc.exitcode != 0:
+        return None
+
+    if parent_conn.poll():
+        result = parent_conn.recv()
+        if isinstance(result, dict) and "error" not in result:
+            return result
+    return None
+
+
+def _safe_interaction_analysis(job_id: str, molecules: list[dict], pdb_path: str, uniprot_id: str) -> int:
+    """Run interaction analysis for a list of molecules with crash isolation.
+
+    Also computes structured pose quality metrics (V12).
+    Returns the number of molecules successfully analyzed.
+    """
+    n_analyzed = 0
+    for mol in molecules:
+        smi = mol.get("smiles", "")
+        try:
+            result = _run_single_interaction(
+                protein_path=pdb_path,
+                ligand_path=mol.get("pose_pdbqt_path", ""),
+                uniprot_id=uniprot_id,
+                smiles=smi,
+            )
+            if result:
+                mol["interactions"] = result
+                mol["interaction_quality"] = result.get("interaction_quality", 0.5)
+                n_analyzed += 1
+
+                # V12: compute structured pose quality
+                try:
+                    from pipeline.interaction_analysis import compute_pose_quality
+                    ligand_path = mol.get("pose_pdbqt_path", "")
+                    if ligand_path:
+                        pq = compute_pose_quality(pdb_path, ligand_path, uniprot_id, smi)
+                        mol["pose_quality"] = pq
+                except Exception as pq_exc:
+                    logger.debug("[%s] Pose quality failed for %s: %s",
+                                 job_id, mol.get("name", "?"), pq_exc)
+            else:
+                logger.warning("[%s] Interaction analysis returned no result for %s",
+                               job_id, mol.get("name", "?"))
+        except Exception as mol_exc:
+            logger.warning("[%s] Interaction analysis skipped for %s: %s",
+                           job_id, mol.get("name", "?"), mol_exc)
+    return n_analyzed
+
+
 def _fetch_protein_name(uniprot_id: str) -> Optional[str]:
     """Fetch the recommended protein name from the UniProt REST API.
 
@@ -145,7 +226,7 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
         audit = AuditLog(job_id)
         audit.log("pipeline", "Pipeline started", {"params": {
             k: v for k, v in params.items()
-            if k not in ("smiles_list",)  # exclude potentially large data
+            if k not in ("smiles_list", "target_config")  # exclude potentially large data
         }})
 
         uniprot_id: str = params.get("uniprot_id", "") or ""
@@ -167,49 +248,101 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
         notification_email: Optional[str] = params.get("notification_email")
         auto_strategy: bool = params.get("auto_strategy", False)
 
-        is_standard = mode in ("standard", "advanced")
+        # V8: pre-computed target config from Target Setup (skips structure+pockets)
+        target_config: Optional[dict] = params.get("target_config")
+
+        enable_dmpk = params.get("enable_dmpk", True)
+
+        # V12: granular analysis flags (backward compat: enable_dmpk=False disables all)
+        master = enable_dmpk
+        enable_admet = params.get("enable_admet", master)
+        enable_synthesis = params.get("enable_synthesis", master)
+        enable_selectivity = params.get("enable_selectivity", master)
+        enable_herg = params.get("enable_herg", master)
+        enable_safety = params.get("enable_safety", master)
+        if not master:
+            enable_admet = enable_synthesis = enable_selectivity = enable_herg = enable_safety = False
+
+        # V12: box_size override (None = auto from pocket)
+        box_size_override = params.get("box_size")
 
         # ------------------------------------------------------------------
-        # Step 1: Fetch protein structure (0% -> 8%)
+        # Step 1: Fetch / restore protein structure (0% -> 8%)
         # ------------------------------------------------------------------
-        _update_progress(job_id, 3, "Fetching protein structure")
-
         structure_source = "unknown"
-        if sequence and not uniprot_id:
-            # V3: direct sequence input
-            from pipeline.structure import fetch_structure_from_sequence
-            pdb_path, structure_source = fetch_structure_from_sequence(sequence, work_dir)
-            _update_progress(
-                job_id, 8, "Structure retrieved",
-                step_details=f"Folded from sequence ({len(sequence)} residues) via {structure_source}",
-            )
-        else:
-            from pipeline.structure import fetch_structure
-            pdb_path, structure_source = fetch_structure(uniprot_id, work_dir)
-            _update_progress(
-                job_id, 8, "Structure retrieved",
-                step_details=f"Source: {structure_source}",
-            )
+        pdb_info: Optional[dict] = None
+        ligand_id: Optional[str] = None
+
+        # V8: reuse pre-computed structure from Target Setup when available
+        _target_config_used = False
+        if target_config:
+            try:
+                structures_list = target_config.get("structures") or []
+                sel_idx = int(target_config.get("selected_structure_idx", 0))
+                sel_structure = (
+                    structures_list[sel_idx] if structures_list and sel_idx < len(structures_list)
+                    else structures_list[0] if structures_list
+                    else target_config.get("structure") or {}
+                )
+                pdb_data_inline: Optional[str] = sel_structure.get("pdb_data")
+                download_url: Optional[str] = sel_structure.get("download_url")
+                structure_source = sel_structure.get("source", "cached")
+
+                pdb_path = work_dir / "protein.pdb"
+                if pdb_data_inline:
+                    pdb_path.write_text(pdb_data_inline)
+                    _target_config_used = True
+                    logger.info("[%s] Step 1 skipped — using inline pdb_data from Target Setup", job_id)
+                elif download_url:
+                    _update_progress(job_id, 3, "Downloading structure from Target Setup")
+                    resp = http_requests.get(download_url, timeout=30)
+                    resp.raise_for_status()
+                    pdb_path.write_bytes(resp.content)
+                    _target_config_used = True
+                    logger.info("[%s] Step 1 skipped — downloaded structure from %s", job_id, download_url)
+                else:
+                    logger.warning("[%s] target_config has no pdb_data or download_url — re-fetching", job_id)
+            except Exception as exc:
+                logger.warning("[%s] Failed to restore structure from target_config: %s — re-fetching", job_id, exc)
+                _target_config_used = False
+
+        if not _target_config_used:
+            _update_progress(job_id, 3, "Fetching protein structure")
+            if sequence and not uniprot_id:
+                # V3: direct sequence input
+                from pipeline.structure import fetch_structure_from_sequence
+                pdb_path, structure_source = fetch_structure_from_sequence(sequence, work_dir)
+                _update_progress(
+                    job_id, 8, "Structure retrieved",
+                    step_details=f"Folded from sequence ({len(sequence)} residues) via {structure_source}",
+                )
+            else:
+                from pipeline.structure import fetch_structure
+                pdb_path, structure_source = fetch_structure(uniprot_id, work_dir)
+                _update_progress(
+                    job_id, 8, "Structure retrieved",
+                    step_details=f"Source: {structure_source}",
+                )
+
+            # V5bis: Retrieve PDB experimental metadata (ligand_id, resolution, etc.)
+            if uniprot_id and structure_source == "pdb_experimental":
+                try:
+                    from pipeline.structure import get_pdb_info
+                    pdb_info = get_pdb_info(work_dir, uniprot_id)
+                    if pdb_info:
+                        ligand_id = pdb_info.get("ligand_id")
+                        pipeline_summary["pdb_info"] = pdb_info
+                        logger.info("[%s] PDB info: %s (ligand=%s)", job_id,
+                                    pdb_info.get("pdb_id", "?"), ligand_id or "none")
+                except Exception as exc:
+                    logger.warning("[%s] Failed to retrieve PDB info: %s", job_id, exc)
+
+        _update_progress(job_id, 8, "Structure ready", step_details=f"Source: {structure_source}")
 
         # Store structure source and PDB path
         update_job(job_id, pdb_path=str(pdb_path), structure_source=structure_source)
         pipeline_summary["structure_source"] = structure_source
         pipeline_summary["steps_completed"].append("structure")
-
-        # V5bis: Retrieve PDB experimental metadata (ligand_id, resolution, etc.)
-        pdb_info: Optional[dict] = None
-        ligand_id: Optional[str] = None
-        if uniprot_id and structure_source == "pdb_experimental":
-            try:
-                from pipeline.structure import get_pdb_info
-                pdb_info = get_pdb_info(work_dir, uniprot_id)
-                if pdb_info:
-                    ligand_id = pdb_info.get("ligand_id")
-                    pipeline_summary["pdb_info"] = pdb_info
-                    logger.info("[%s] PDB info: %s (ligand=%s)", job_id,
-                                pdb_info.get("pdb_id", "?"), ligand_id or "none")
-            except Exception as exc:
-                logger.warning("[%s] Failed to retrieve PDB info: %s", job_id, exc)
 
         # --- A1: Compute effective_structure_source early ---
         effective_structure_source = structure_source
@@ -217,10 +350,10 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
             effective_structure_source = "pdb_holo"
         pipeline_summary["effective_structure_source"] = effective_structure_source
 
-        audit.log("structure", f"Structure retrieved from {structure_source}", {
+        audit.log("structure", f"Structure ready from {structure_source}", {
             "source": structure_source,
             "pdb_path": str(pdb_path),
-            "pdb_info": pdb_info,
+            "reused_from_target_setup": _target_config_used,
         })
 
         # ------------------------------------------------------------------
@@ -260,28 +393,56 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
             logger.warning("[%s] Disorder prediction failed: %s", job_id, exc)
 
         # ------------------------------------------------------------------
-        # Step 2: Detect binding pockets (8% -> 15%)
+        # Step 2: Detect / restore binding pockets (8% -> 15%)
         # ------------------------------------------------------------------
-        _update_progress(job_id, 10, "Detecting binding pockets")
-        from pipeline.pockets import detect_pockets
-        pockets = detect_pockets(pdb_path, work_dir, ligand_id=ligand_id)
-        best_pocket = pockets[0]
-        center = tuple(best_pocket["center"])
+        _update_progress(job_id, 10, "Restoring binding site from Target Setup" if target_config else "Detecting binding pockets")
+
+        pockets = []
         pocket_size = (25.0, 25.0, 25.0)
-        pocket_method = best_pocket.get("method", "unknown")
+        _pocket_reused = False
+
+        if target_config:
+            try:
+                pockets_raw = target_config.get("pockets") or []
+                sel_pocket_idx = int(target_config.get("selected_pocket_idx", 0))
+                sel_pocket = (
+                    pockets_raw[sel_pocket_idx] if pockets_raw and sel_pocket_idx < len(pockets_raw)
+                    else pockets_raw[0] if pockets_raw
+                    else None
+                )
+                if sel_pocket and sel_pocket.get("center"):
+                    center_raw = sel_pocket["center"]
+                    center = tuple(float(c) for c in center_raw[:3])
+                    pocket_method = sel_pocket.get("method", "cached")
+                    pockets = pockets_raw
+                    best_pocket = sel_pocket
+                    _pocket_reused = True
+                    logger.info("[%s] Step 2 skipped — using pocket from Target Setup center=%s", job_id, center)
+                else:
+                    logger.warning("[%s] target_config pocket has no center — re-detecting", job_id)
+            except Exception as exc:
+                logger.warning("[%s] Failed to restore pocket from target_config: %s — re-detecting", job_id, exc)
+
+        if not _pocket_reused:
+            from pipeline.pockets import detect_pockets
+            pockets = detect_pockets(pdb_path, work_dir, ligand_id=ligand_id)
+            best_pocket = pockets[0]
+            center = tuple(best_pocket["center"])
+            pocket_method = best_pocket.get("method", "unknown")
+
         _update_progress(
             job_id, 15,
-            f"Best pocket at ({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f})",
-            step_details=f"{len(pockets)} pocket(s) detected via {pocket_method}",
+            f"Binding site: ({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f})",
+            step_details=f"{'Reused from Target Setup' if _pocket_reused else str(len(pockets)) + ' pocket(s) detected'} via {pocket_method}",
         )
         pipeline_summary["n_pockets"] = len(pockets)
         pipeline_summary["best_pocket_center"] = list(center)
         pipeline_summary["best_pocket_method"] = pocket_method
         pipeline_summary["steps_completed"].append("pockets")
-        audit.log("pockets", f"Detected {len(pockets)} pocket(s)", {
+        audit.log("pockets", f"Pocket ready via {pocket_method}", {
             "n_pockets": len(pockets),
             "best_center": list(center),
-            "pocket_method": pocket_method,
+            "reused_from_target_setup": _pocket_reused,
         })
 
         # V6: Check if pocket center falls within an IDR
@@ -360,11 +521,11 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
             update_job(job_id, strategy_message=strategy_message)
 
             # Override flags based on strategy
-            use_chembl = strategy["source"] in ("chembl", "chembl+zinc")
-            use_zinc = strategy["use_zinc"]
+            use_chembl = "chembl" in strategy["source"]
+            use_zinc = strategy["use_zinc"] or "zinc" in strategy["source"]
             # V3: always enable generation in standard mode
             # auto_strategy only adjusts n_generated based on ChEMBL coverage
-            if is_standard:
+            if master:
                 enable_generation = True
                 if not strategy["use_generation"]:
                     # Well-documented target: generate fewer molecules (exploratory)
@@ -394,6 +555,24 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
             )
             logger.info("Added %d ChEMBL ligands", len(chembl_ligs))
 
+        # V9: PubChem ligands (when gene name is available from strategy)
+        if auto_strategy and strategy_message and uniprot_id:
+            try:
+                strategy_data = pipeline_summary.get("ligand_strategy", {})
+                gene_name = strategy_data.get("gene_name")
+                if gene_name and strategy_data.get("use_pubchem", False):
+                    _update_progress(job_id, 27, f"Querying PubChem for {gene_name}")
+                    from pipeline.ligands import fetch_pubchem_ligands
+                    pubchem_ligs = fetch_pubchem_ligands(gene_name, max_count=min(30, max_ligands))
+                    all_ligands.extend(pubchem_ligs)
+                    logger.info("Added %d PubChem ligands for %s", len(pubchem_ligs), gene_name)
+                    audit.log("ligands_pubchem", f"PubChem: {len(pubchem_ligs)} ligands for {gene_name}", {
+                        "n_pubchem": len(pubchem_ligs),
+                        "gene_name": gene_name,
+                    })
+            except Exception as exc:
+                logger.warning("[%s] PubChem ligand fetch failed: %s", job_id, exc)
+
         if use_zinc:
             _update_progress(job_id, 28, "Loading ZINC molecules")
             from pipeline.ligands import fetch_zinc_ligands
@@ -416,8 +595,9 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
 
         if not all_ligands:
             raise RuntimeError(
-                f"No ligands found for {uniprot_id or 'sequence'}. "
-                "Try enabling ChEMBL or ZINC, or provide custom SMILES."
+                f"No known ligands found for target {uniprot_id or 'sequence'} in any database. "
+                "This is not a docking engine issue. "
+                "Try providing custom SMILES molecules, or use a different ligand source."
             )
 
         _update_progress(
@@ -439,7 +619,7 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
             mapped = int(30 + (pct - 40) / 50 * 25) if pct >= 40 else 30
             _update_progress(job_id, min(mapped, 55), msg)
 
-        if enable_diffdock and is_standard:
+        if enable_diffdock and master:
             _update_progress(job_id, 31, "Docking with DiffDock (AI mode)")
             from pipeline.docking_diffdock import dock_all_diffdock
             docking_results = dock_all_diffdock(
@@ -451,7 +631,8 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
             for r in docking_results:
                 r["docking_method"] = "diffdock"
         else:
-            _update_progress(job_id, 31, f"Docking with {docking_engine}")
+            engine_label = {"auto": "Auto (GPU/GNINA/Vina)", "gnina": "GNINA", "gnina_gpu": "GNINA GPU (RunPod)", "vina": "Vina"}.get(docking_engine, docking_engine)
+            _update_progress(job_id, 31, f"Docking with {engine_label}")
             from pipeline.docking import dock_all_ligands
             docking_results = dock_all_ligands(
                 receptor_pdbqt=receptor_pdbqt,
@@ -487,7 +668,7 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
         # ------------------------------------------------------------------
         generated_results: list[dict] = []
 
-        if is_standard and enable_generation:
+        if False and enable_dmpk and enable_generation:  # generation disabled in main pipeline; only in optimization
             _update_progress(job_id, 56, "Generating novel molecules (AI)")
             from pipeline.generation import generate_molecules
 
@@ -564,7 +745,7 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
         admet_results: list[dict] = []
         all_for_admet = docking_results + generated_results
 
-        if is_standard:
+        if enable_admet:
             _update_progress(job_id, 70, "Predicting ADMET properties")
             from pipeline.admet import predict_admet
 
@@ -583,14 +764,14 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
                 "n_admet": len(admet_results),
             })
         else:
-            _update_progress(job_id, 78, "Skipping ADMET (rapid mode)")
+            _update_progress(job_id, 78, "Skipping ADMET")
 
         # ------------------------------------------------------------------
         # Step 9: Score and rank (78% -> 82%)
         # ------------------------------------------------------------------
         _update_progress(job_id, 80, "Computing scores")
 
-        if is_standard and admet_results:
+        if enable_admet and admet_results:
             from pipeline.scoring import score_results_v2
             scored_known = score_results_v2(docking_results, admet_results)
             scored_generated = score_results_v2(generated_results, admet_results) if generated_results else []
@@ -661,25 +842,18 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
         # ------------------------------------------------------------------
         try:
             _update_progress(job_id, 83, "Analyzing protein-ligand interactions")
-            from pipeline.interaction_analysis import analyze_interactions
             all_scored = sorted(
                 scored_known + scored_generated,
                 key=lambda x: x.get("composite_score", 0), reverse=True,
             )
             top_for_interactions = all_scored[:10]
-            for mol in top_for_interactions:
-                smi = mol.get("smiles", "")
-                interaction_result = analyze_interactions(
-                    protein_path=str(pdb_path),
-                    ligand_path=mol.get("pose_pdbqt_path", ""),
-                    uniprot_id=uniprot_id,
-                    smiles=smi,
-                )
-                mol["interactions"] = interaction_result
-                mol["interaction_quality"] = interaction_result.get("interaction_quality", 0.5)
-            pipeline_summary["steps_completed"].append("interactions")
-            audit.log("interactions", f"Interaction analysis for top {len(top_for_interactions)} candidates", {
-                "n_analyzed": len(top_for_interactions),
+            n_analyzed = _safe_interaction_analysis(
+                job_id, top_for_interactions, str(pdb_path), uniprot_id
+            )
+            if n_analyzed > 0:
+                pipeline_summary["steps_completed"].append("interactions")
+            audit.log("interactions", f"Interaction analysis for {n_analyzed}/{len(top_for_interactions)} candidates", {
+                "n_analyzed": n_analyzed,
             })
         except Exception as exc:
             logger.warning("[%s] Interaction analysis failed: %s", job_id, exc)
@@ -729,7 +903,7 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
         # ------------------------------------------------------------------
         # Step 10: Off-target screening (84% -> 86%) --- standard mode, top 5
         # ------------------------------------------------------------------
-        if is_standard:
+        if enable_selectivity:
             _update_progress(job_id, 84, "Off-target safety screening")
             try:
                 from pipeline.off_target import screen_candidates
@@ -760,7 +934,7 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
         # ------------------------------------------------------------------
         # Step 10a (V6.3): Combined off-target screening for top 5
         # ------------------------------------------------------------------
-        if is_standard:
+        if enable_selectivity:
             try:
                 _update_progress(job_id, 85, "V6.3: Combined off-target screening (SEA + docking)")
                 from pipeline.off_target import combined_off_target_screening
@@ -806,7 +980,7 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
         # ------------------------------------------------------------------
         # Step 10a2 (V6.3): Specialized hERG for top 20 molecules
         # ------------------------------------------------------------------
-        if is_standard:
+        if enable_herg:
             try:
                 _update_progress(job_id, 86, "V6.3: Specialized hERG screening (top 20)")
                 from pipeline.admet import predict_herg_specialized
@@ -853,7 +1027,7 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
         # ------------------------------------------------------------------
         # Step 10b: Retrosynthesis of top 5 (86% -> 92%) --- standard mode
         # ------------------------------------------------------------------
-        if is_standard and enable_retrosynthesis:
+        if enable_synthesis and enable_retrosynthesis:
             _update_progress(job_id, 87, "Planning retrosynthesis for top molecules")
             from pipeline.retrosynthesis import plan_synthesis
 
@@ -885,28 +1059,31 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
             _update_progress(job_id, 92, "Skipping retrosynthesis")
 
         # ------------------------------------------------------------------
-        # Step 10c: Confidence scoring (all results)
+        # Step 10c: Confidence scoring (all results) — guarded by enable_safety
         # ------------------------------------------------------------------
-        try:
-            from pipeline.confidence import calculate_confidence
+        if enable_safety:
+            try:
+                from pipeline.confidence import calculate_confidence
 
-            for mol in scored_known + scored_generated:
-                # V5bis: attach pocket method for confidence scoring
-                mol.setdefault("pocket_method", pocket_method)
-                # V6: pass disorder_info for potential penalty
-                mol["confidence"] = calculate_confidence(
-                    mol, effective_structure_source, disorder_info=disorder_info
-                )
-            pipeline_summary["steps_completed"].append("confidence")
-            audit.log("confidence", "Confidence scores calculated for all results", {
-                "n_scored": len(scored_known) + len(scored_generated),
-                "effective_structure_source": effective_structure_source,
-                "disorder_penalty_applied": bool(
-                    disorder_info and disorder_info.get("fraction_disordered", 0) > 0.3
-                ),
-            })
-        except Exception as exc:
-            logger.warning("[%s] Confidence scoring failed: %s", job_id, exc)
+                for mol in scored_known + scored_generated:
+                    # V5bis: attach pocket method for confidence scoring
+                    mol.setdefault("pocket_method", pocket_method)
+                    # V6: pass disorder_info for potential penalty
+                    mol["confidence"] = calculate_confidence(
+                        mol, effective_structure_source, disorder_info=disorder_info
+                    )
+                pipeline_summary["steps_completed"].append("confidence")
+                audit.log("confidence", "Confidence scores calculated for all results", {
+                    "n_scored": len(scored_known) + len(scored_generated),
+                    "effective_structure_source": effective_structure_source,
+                    "disorder_penalty_applied": bool(
+                        disorder_info and disorder_info.get("fraction_disordered", 0) > 0.3
+                    ),
+                })
+            except Exception as exc:
+                logger.warning("[%s] Confidence scoring failed: %s", job_id, exc)
+        else:
+            _update_progress(job_id, 93, "Skipping confidence scoring")
 
         # ------------------------------------------------------------------
         # Step 11: Generate report + ZIP (92% -> 98%)
@@ -941,7 +1118,7 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
         # PDF
         pdf_path = generate_pdf_report(
             job_meta, scored_known, work_dir / "report.pdf",
-            generated_results=scored_generated if is_standard else None,
+            generated_results=scored_generated if master else None,
         )
 
         _update_progress(job_id, 97, "Creating ZIP archive")
@@ -1160,6 +1337,18 @@ def run_deep_screening(self, job_id: str, params: dict) -> dict:
         from pipeline.ligands import fetch_zinc_ligands
         zinc_ligs = fetch_zinc_ligands(max_count=min(100, max_ligands))
         all_ligands.extend(zinc_ligs)
+
+        # V9: PubChem for deep screening
+        try:
+            from pipeline.ligands import resolve_gene_name, fetch_pubchem_ligands
+            gene_name_deep = resolve_gene_name(uniprot_id) if uniprot_id else None
+            if gene_name_deep:
+                _update_progress(job_id, 16, f"Querying PubChem for {gene_name_deep}")
+                pubchem_ligs = fetch_pubchem_ligands(gene_name_deep, max_count=min(50, max_ligands))
+                all_ligands.extend(pubchem_ligs)
+                logger.info("Deep: added %d PubChem ligands for %s", len(pubchem_ligs), gene_name_deep)
+        except Exception as exc:
+            logger.warning("[%s] Deep PubChem fetch failed: %s", job_id, exc)
 
         if not all_ligands:
             raise RuntimeError("No ligands found for deep screening.")
@@ -1405,24 +1594,18 @@ def run_deep_screening(self, job_id: str, params: dict) -> dict:
         # ------------------------------------------------------------------
         try:
             _update_progress(job_id, 87, "Deep screening: Analyzing protein-ligand interactions")
-            from pipeline.interaction_analysis import analyze_interactions
             all_scored_deep_ia = sorted(
                 scored_known + scored_generated,
                 key=lambda x: x.get("composite_score", 0), reverse=True,
             )
             top_for_interactions_deep = all_scored_deep_ia[:10]
-            for mol in top_for_interactions_deep:
-                smi = mol.get("smiles", "")
-                interaction_result = analyze_interactions(
-                    protein_path=str(pdb_path),
-                    ligand_path=mol.get("pose_pdbqt_path", ""),
-                    uniprot_id=uniprot_id,
-                    smiles=smi,
-                )
-                mol["interactions"] = interaction_result
-                mol["interaction_quality"] = interaction_result.get("interaction_quality", 0.5)
-            pipeline_summary["steps_completed"].append("interactions")
-            logger.info("[%s] Deep interaction analysis: analyzed %d molecules", job_id, len(top_for_interactions_deep))
+            n_analyzed_deep = _safe_interaction_analysis(
+                job_id, top_for_interactions_deep, str(pdb_path), uniprot_id
+            )
+            if n_analyzed_deep > 0:
+                pipeline_summary["steps_completed"].append("interactions")
+            logger.info("[%s] Deep interaction analysis: analyzed %d/%d molecules",
+                        job_id, n_analyzed_deep, len(top_for_interactions_deep))
         except Exception as exc:
             logger.warning("[%s] Deep interaction analysis failed: %s", job_id, exc)
 
@@ -1573,18 +1756,45 @@ def run_lead_optimization(self, opt_id: str, params: dict) -> dict:
     try:
         from pipeline.lead_optimization import run_optimization
 
-        # Get pocket center from pipeline summary
+        # Get pocket center and size from pipeline summary
         pocket_center = [22.0, 0.5, 18.0]  # fallback
+        pocket_size = params.get("pocket_size", [25.0, 25.0, 25.0])
         try:
             from database import get_job
             job = get_job(job_id)
             if job and job.pipeline_summary_json:
                 summary = json.loads(job.pipeline_summary_json)
                 pocket_center = summary.get("best_pocket_center", pocket_center)
+                # Extract pocket size from pipeline summary if available
+                if "pocket_size" in summary:
+                    pocket_size = summary["pocket_size"]
         except Exception as exc:
             logger.warning("[%s] Could not load pocket center: %s", opt_id, exc)
 
-        target_pdbqt = str(work_dir / "receptor.pdbqt")
+        # Resolve receptor path from pipeline summary (the real file is
+        # named e.g. P00533_receptor.pdbqt, stored at prepare step).
+        target_pdbqt = None
+        try:
+            from database import get_job as _gj
+            parent = _gj(job_id)
+            if parent and parent.pipeline_summary_json:
+                ps = json.loads(parent.pipeline_summary_json)
+                candidate = ps.get("receptor_path", "")
+                if candidate and Path(candidate).exists():
+                    target_pdbqt = candidate
+                    logger.info("[opt:%s] Receptor from pipeline_summary: %s", opt_id[:8], target_pdbqt)
+        except Exception as rp_exc:
+            logger.warning("[opt:%s] Could not read receptor_path from summary: %s", opt_id[:8], rp_exc)
+
+        # Fallback: glob for *receptor*.pdbqt in work_dir
+        if not target_pdbqt:
+            receptor_candidates = sorted(work_dir.glob("*receptor*.pdbqt"))
+            if receptor_candidates:
+                target_pdbqt = str(receptor_candidates[0])
+                logger.info("[opt:%s] Receptor from glob: %s", opt_id[:8], target_pdbqt)
+            else:
+                target_pdbqt = str(work_dir / "receptor.pdbqt")
+                logger.warning("[opt:%s] No receptor found, using default: %s", opt_id[:8], target_pdbqt)
 
         n_iterations = params.get("n_iterations", 10)
 
@@ -1601,6 +1811,11 @@ def run_lead_optimization(self, opt_id: str, params: dict) -> dict:
             variants_per_iter=params.get("variants_per_iter", 50),
             work_dir=opt_work_dir,
             progress_callback=progress_cb,
+            structural_rules=params.get("structural_rules"),
+            docking_engine=params.get("docking_engine", "auto"),
+            pocket_size=pocket_size,
+            exhaustiveness=params.get("exhaustiveness", 8),
+            dock_top_n=params.get("dock_top_n", 20),
         )
 
         # Store result as JSON file for retrieval
@@ -1615,10 +1830,14 @@ def run_lead_optimization(self, opt_id: str, params: dict) -> dict:
             result["final_lead"]["score"],
         )
 
+        # Auto-create a new job in the project with optimization results
+        new_job_id = _create_job_from_optimization(opt_id, params, result)
+
         return {
             "status": "completed",
             "optimization_id": opt_id,
             "result": result,
+            "created_job_id": new_job_id,
         }
 
     except Exception as exc:
@@ -1629,6 +1848,253 @@ def run_lead_optimization(self, opt_id: str, params: dict) -> dict:
             "optimization_id": opt_id,
             "error": error_msg,
         }
+
+
+def _create_job_from_optimization(opt_id: str, params: dict, result: dict) -> Optional[str]:
+    """Create a completed job in the project from optimization results.
+
+    Called after optimization finishes. Builds molecule dicts from the
+    optimization output, then runs the full enrichment pipeline (ADMET,
+    scoring, clustering, Pareto, off-target, hERG, confidence) so that
+    optimization results have the same quality of data as HTS runs.
+
+    Parameters
+    ----------
+    opt_id : str
+        Optimization UUID.
+    params : dict
+        Original optimization parameters (contains ``job_id``).
+    result : dict
+        Optimization result dict with ``final_lead``, ``best_molecule``, etc.
+
+    Returns
+    -------
+    str or None
+        The new job_id, or None on failure.
+    """
+    from uuid import uuid4 as _uuid4
+
+    try:
+        parent_job_id = params["job_id"]
+        from database import get_job as _get_job, create_job as _create_job, update_job as _update_job
+        parent_job = _get_job(parent_job_id)
+        if parent_job is None:
+            logger.warning("Cannot create opt job: parent job %s not found", parent_job_id)
+            return None
+
+        new_job_id = str(_uuid4())
+        project_id = getattr(parent_job, "project_id", None)
+        uniprot_id = getattr(parent_job, "uniprot_id", "") or ""
+        user_id = getattr(parent_job, "user_id", None)
+
+        from pipeline.scoring import generate_2d_svg, compute_properties
+
+        def _opt_mol_entry(smiles, name, affinity, score, admet_data, source="optimization", dock_meta=None):
+            """Build a result entry for an optimization molecule with RDKit properties."""
+            props = compute_properties(smiles) or {}
+            dm = dock_meta or {}
+            return {
+                "name": name,
+                "smiles": smiles,
+                "affinity": affinity,
+                "composite_score": score,
+                "source": source,
+                "vina_score": dm.get("vina_score", affinity),
+                "cnn_score": dm.get("cnn_score", 0.0),
+                "cnn_affinity": dm.get("cnn_affinity", 0.0),
+                "docking_engine": dm.get("docking_engine", "optimization"),
+                "pose_pdbqt_path": dm.get("pose_pdbqt_path", ""),
+                "mw": props.get("MW") or admet_data.get("mw", 0),
+                "logp": props.get("logP") or admet_data.get("logp", 0),
+                "qed": props.get("qed") or admet_data.get("qed", 0),
+                "tpsa": props.get("tpsa") or admet_data.get("tpsa", 0),
+                "hbd": props.get("hbd"),
+                "hba": props.get("hba"),
+                "rotatable_bonds": props.get("rotatable_bonds"),
+                "toxicity_score": admet_data.get("toxicity_score", 0),
+                "bioavailability_score": admet_data.get("bioavailability_score", 0),
+                "synthesis_score": admet_data.get("synthesis_score", 0),
+                "svg": generate_2d_svg(smiles),
+            }
+
+        # Collect all molecules from optimization
+        opt_results = []
+
+        # 1. Add best/final lead
+        best_mol = result.get("best_molecule") or result.get("final_lead") or {}
+        starting_mol = result.get("starting_molecule") or {}
+        mol_name = best_mol.get("name", params.get("molecule_name", "optimized"))
+        admet = best_mol.get("admet") or {}
+
+        best_smiles = best_mol.get("smiles", params.get("smiles", ""))
+
+        # Extract docking metadata from best molecule
+        best_dock_meta = {k: best_mol.get(k) for k in
+            ("vina_score", "cnn_score", "cnn_affinity", "docking_engine", "pose_pdbqt_path")
+            if best_mol.get(k) is not None}
+
+        entry = _opt_mol_entry(best_smiles, mol_name, best_mol.get("affinity", -8.0), best_mol.get("score", 0.5), admet,
+                               dock_meta=best_dock_meta)
+        entry["optimization_origin"] = {
+            "optimization_id": opt_id,
+            "parent_job_id": parent_job_id,
+            "starting_molecule": starting_mol.get("name", ""),
+            "starting_score": starting_mol.get("score", 0),
+            "final_score": best_mol.get("score", 0),
+            "iterations": len(result.get("iterations", [])),
+        }
+        opt_results.append(entry)
+
+        # 2. Add top molecules from iterations (deduplicated)
+        seen = {best_smiles}
+        for tm in result.get("top_molecules", []):
+            smi = tm.get("smiles", "")
+            if smi and smi not in seen:
+                seen.add(smi)
+                tm_admet = tm.get("admet") or {}
+                tm_dock_meta = {k: tm.get(k) for k in
+                    ("vina_score", "cnn_score", "cnn_affinity", "docking_engine", "pose_pdbqt_path")
+                    if tm.get(k) is not None}
+                tm_entry = _opt_mol_entry(smi, tm.get("name", f"opt_variant_{len(opt_results)}"),
+                                          tm.get("affinity", -7.0), tm.get("score", 0.4), tm_admet,
+                                          dock_meta=tm_dock_meta)
+                tm_entry["optimization_origin"] = {
+                    "optimization_id": opt_id,
+                    "parent_job_id": parent_job_id,
+                    "iteration": tm.get("iteration", 0),
+                }
+                opt_results.append(tm_entry)
+
+        # 3. Add starting molecule for comparison
+        start_smiles = starting_mol.get("smiles", params.get("smiles", ""))
+        start_entry = _opt_mol_entry(start_smiles, f"{starting_mol.get('name', 'starting')} (original)",
+                                     starting_mol.get("affinity", -5.0), starting_mol.get("score", 0.3), {},
+                                     source="optimization_reference")
+        start_entry["docking_engine"] = "reference"
+        opt_results.append(start_entry)
+
+        # -----------------------------------------------------------
+        # Run full enrichment pipeline (ADMET, scoring, clustering,
+        # Pareto, off-target, hERG, confidence)
+        # -----------------------------------------------------------
+        try:
+            from pipeline.enrich import enrich_results, generate_3d_conformer
+
+            enrich_work_dir = DATA_DIR / parent_job_id / "optimization" / opt_id / "enrich"
+            enrich_work_dir.mkdir(parents=True, exist_ok=True)
+
+            structure_source = getattr(parent_job, "structure_source", "cached") or "cached"
+
+            # V12: forward individual analysis flags from optimization params
+            opt_enable_admet = params.get("enable_admet", True)
+            opt_enable_synthesis = params.get("enable_synthesis", True)
+            opt_enable_selectivity = params.get("enable_selectivity", True)
+            opt_enable_herg = params.get("enable_herg", True)
+            opt_enable_safety = params.get("enable_safety", True)
+
+            passed, eliminated, enrich_summary = enrich_results(
+                molecules=opt_results,
+                work_dir=enrich_work_dir,
+                structure_source=structure_source,
+                enable_retrosynthesis=opt_enable_synthesis,
+                enable_admet=opt_enable_admet,
+                enable_selectivity=opt_enable_selectivity,
+                enable_herg=opt_enable_herg,
+                enable_safety=opt_enable_safety,
+            )
+
+            # Use enriched results (passed + eliminated for completeness)
+            opt_results = passed + eliminated
+            logger.info(
+                "[opt:%s] Enrichment: %d passed, %d eliminated, steps=%s",
+                opt_id[:8], len(passed), len(eliminated),
+                enrich_summary.get("steps_completed", []),
+            )
+
+            # Generate 3D conformers for pose-less molecules
+            for i, mol in enumerate(opt_results):
+                smi = mol.get("smiles", "")
+                if smi and not mol.get("pose_sdf_path"):
+                    sdf_path = enrich_work_dir / f"conformer_{i}.sdf"
+                    result_path = generate_3d_conformer(smi, sdf_path)
+                    if result_path:
+                        mol["pose_sdf_path"] = str(result_path)
+
+            # Run interaction analysis for molecules with real pose files
+            pdb_path = getattr(parent_job, "pdb_path", None)
+            if pdb_path:
+                mols_with_pose = [m for m in opt_results
+                                  if m.get("pose_pdbqt_path") and os.path.exists(str(m["pose_pdbqt_path"]))]
+                if mols_with_pose:
+                    try:
+                        n_analyzed = _safe_interaction_analysis(
+                            new_job_id, mols_with_pose, pdb_path, uniprot_id)
+                        logger.info("[opt:%s] Interaction analysis: %d/%d molecules",
+                                    opt_id[:8], n_analyzed, len(mols_with_pose))
+                    except Exception as ia_exc:
+                        logger.warning("[opt:%s] Interaction analysis failed: %s", opt_id[:8], ia_exc)
+        except Exception as enrich_exc:
+            logger.warning("[opt:%s] Enrichment failed (using raw results): %s", opt_id[:8], enrich_exc)
+            enrich_summary = {"steps_completed": [], "steps_failed": ["all"]}
+
+        results_json = json.dumps(opt_results)
+        pipeline_summary = {
+            "mode": "optimization",
+            "steps_completed": ["optimization"] + enrich_summary.get("steps_completed", []),
+            "optimization_id": opt_id,
+            "parent_job_id": parent_job_id,
+            "total_results": len(opt_results),
+            "n_passed": len([m for m in opt_results if not m.get("eliminated")]),
+            "best_affinity": best_mol.get("affinity", -8.0),
+            "best_composite": best_mol.get("score", 0.5),
+            "comparison": result.get("comparison", {}),
+            "enrichment": enrich_summary,
+        }
+
+        _create_job(
+            job_id=new_job_id,
+            uniprot_id=uniprot_id,
+            use_chembl=False,
+            use_zinc=False,
+            max_ligands=1,
+            smiles_list=[best_mol.get("smiles", "")],
+            mode="optimization",
+            project_id=project_id,
+            user_id=user_id,
+        )
+
+        _update_job(
+            new_job_id,
+            status="completed",
+            progress=100,
+            current_step="Optimization complete",
+            results_json=results_json,
+            pipeline_summary_json=json.dumps(pipeline_summary),
+            protein_name=getattr(parent_job, "protein_name", uniprot_id) or uniprot_id,
+            pdb_path=getattr(parent_job, "pdb_path", None),
+            structure_source=getattr(parent_job, "structure_source", "cached"),
+            completed_at=datetime.now(timezone.utc),
+        )
+
+        # Write meta.json for disk recovery
+        meta_dir = DATA_DIR / parent_job_id / "optimization" / opt_id
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            (meta_dir / "meta.json").write_text(
+                json.dumps({"created_job_id": new_job_id})
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            "[opt:%s] Created optimization job %s (project=%s)",
+            opt_id[:8], new_job_id, project_id,
+        )
+        return new_job_id
+
+    except Exception as exc:
+        logger.warning("[opt:%s] Failed to create job from optimization: %s", opt_id[:8], exc)
+        return None
 
 
 def _make_serializable(results: list[dict]) -> list[dict]:

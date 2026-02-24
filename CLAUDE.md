@@ -111,3 +111,59 @@ curl http://localhost:8000/api/health
 - Linear: issues, sprints
 - Hugging Face: ESMFold, modèles ML
 - Playwright: screenshots UI
+
+
+## CONTEXT MANAGEMENT (CRITICAL)
+
+### Screenshots
+- **NEVER accumulate screenshots in context.** After taking a Playwright screenshot, analyze it, report findings, then move on. Do NOT keep multiple screenshots in conversation history.
+- **Image dimension limit: 2000px max.** Always resize or crop screenshots:
+  ```js
+  await page.screenshot({ path: 'screenshot.png', clip: { x: 0, y: 0, width: 1280, height: 800 } })
+  ```
+- **Max 2 screenshots per task.** If you need more, run `/compact` between batches.
+- **For "Take screenshots of all screens" tasks:** process ONE screen at a time, save to disk, run `/compact`, then do the next screen. Never capture all screens in a single context window.
+
+### Context overflow prevention
+- **Run `/compact` proactively** when you feel context is getting heavy (many tool outputs, long code blocks, multiple images). Do NOT wait for the error.
+- **If you see "dimension limit for many-image requests (2000px)":** STOP immediately. Run `/compact`. Do NOT retry before compacting. After compacting, reduce image dimensions before retrying.
+- **Never loop on the same error more than twice.** If `/compact` doesn't fix it, start a new session.
+
+### Large task strategy
+- Break screenshot-heavy tasks into sub-batches of 2-3 screens max
+- Save screenshots to `./screenshots/` directory, reference by filename in PROGRESS.md
+- Prefer describing UI state in text over keeping images in context
+
+
+## SELF-RECOVERY RULES
+
+### Before ANY task
+- Check docker containers are running: `docker compose ps`
+- Check backend health: `curl -s http://localhost:8000/api/health`
+- Check frontend serves: `curl -s -o /dev/null -w "%{http_code}" http://localhost:3000`
+- If any service is down, fix it BEFORE starting the task
+
+### When stuck
+- **3 strikes rule**: if the same fix fails 3 times, STOP. Simplify the approach or skip with a TODO.
+- **Never run `docker compose up --build` more than 2 times in a row** without investigating logs first: `docker compose logs --tail=50 backend`
+- **Before retrying a failed command**, read the error message fully and change your approach. Do not blindly retry.
+
+### Git safety
+- `git stash` before any risky refactor
+- Commit working state after each completed task with a descriptive message
+- Never rewrite more than 3 files without testing in between
+
+### Worker/Celery health
+- After any backend change, verify the Celery worker restarted: `docker compose logs --tail=20 worker`
+- If a job stays "queued" for more than 30 seconds, check worker logs immediately
+- Common fix: `docker compose restart worker`
+
+### Resource management
+- Monitor disk space: `df -h /` (Docker images eat disk fast)
+- Monitor memory: `free -h` (Celery + Redis + FastAPI + Node can exceed 4GB)
+- If builds are slow, prune: `docker system prune -f`
+
+### Testing discipline
+- After modifying backend code: test the API endpoint with curl BEFORE touching frontend
+- After modifying frontend: check browser console for errors BEFORE taking screenshots
+- Never assume a change works. Verify.

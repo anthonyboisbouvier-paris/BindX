@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react'
+import React, { useMemo, useState } from 'react'
 import InfoTip from './InfoTip.jsx'
 
 // --------------------------------------------------
@@ -163,6 +163,7 @@ export default function ADMETRadar({ admet }) {
   const fillColor  = resolveColor(colorCode)
   const scoreValue = admet?.composite_score
   const flags      = admet?.flags || []
+  const [showDetailedDMPK, setShowDetailedDMPK] = useState(false)
 
   // Axis tip positions (value = 1)
   const axisTips = AXES.map((_, i) => polarToXY(1, i, N, CX, CY, R))
@@ -338,6 +339,88 @@ export default function ADMETRadar({ admet }) {
             </div>
           </div>
         )}
+
+        {/* Detailed DMPK table (collapsible) */}
+        <div className="w-full border-t border-gray-100 pt-3">
+          <button
+            onClick={() => setShowDetailedDMPK(v => !v)}
+            className="flex items-center gap-1.5 text-xs font-medium text-gray-500 hover:text-dockit-blue transition-colors"
+          >
+            <svg className={`w-3.5 h-3.5 transition-transform ${showDetailedDMPK ? 'rotate-90' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+            </svg>
+            {showDetailedDMPK ? 'Hide' : 'Show'} detailed DMPK values
+          </button>
+          {showDetailedDMPK && (
+            <div className="mt-2 overflow-hidden rounded-lg border border-gray-200">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="bg-gray-50 text-left">
+                    <th className="px-3 py-1.5 font-semibold text-gray-600">Property</th>
+                    <th className="px-3 py-1.5 font-semibold text-gray-600 text-right">Value</th>
+                    <th className="px-3 py-1.5 font-semibold text-gray-600 text-center">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {[
+                    { key: 'oral_bioavailability', label: 'Oral Bioavailability', section: 'absorption', format: v => `${(v * 100).toFixed(0)}%`, thresholds: [0.3, 0.7] },
+                    { key: 'intestinal_permeability', label: 'Intestinal Permeability', section: 'absorption', format: v => Number(v).toFixed(2), thresholds: [0.3, 0.7] },
+                    { key: 'ppb', label: 'Plasma Protein Binding', section: 'distribution', format: v => `${(v * 100).toFixed(0)}%`, thresholds: [0.5, 0.95], invert: true },
+                    { key: 'bbb_permeability', label: 'BBB Permeability', section: 'distribution', format: v => Number(v).toFixed(2), thresholds: [0.3, 0.7] },
+                    { key: 'clearance', label: 'Clearance', section: 'excretion', format: v => `${Number(v).toFixed(1)} mL/min/kg`, thresholds: [5, 30], invert: true },
+                    { key: 'half_life', label: 'Half-life', section: 'excretion', format: v => `${Number(v).toFixed(1)} h`, thresholds: [2, 8] },
+                    { key: 'cyp1a2_inhibition', label: 'CYP1A2 Inhibitor', section: 'metabolism', format: v => Number(v).toFixed(2), thresholds: [0.5, 0.3], invert: true },
+                    { key: 'cyp2c9_inhibition', label: 'CYP2C9 Inhibitor', section: 'metabolism', format: v => Number(v).toFixed(2), thresholds: [0.5, 0.3], invert: true },
+                    { key: 'cyp2c19_inhibition', label: 'CYP2C19 Inhibitor', section: 'metabolism', format: v => Number(v).toFixed(2), thresholds: [0.5, 0.3], invert: true },
+                    { key: 'cyp2d6_inhibition', label: 'CYP2D6 Inhibitor', section: 'metabolism', format: v => Number(v).toFixed(2), thresholds: [0.5, 0.3], invert: true },
+                    { key: 'cyp3a4_inhibition', label: 'CYP3A4 Inhibitor', section: 'metabolism', format: v => Number(v).toFixed(2), thresholds: [0.5, 0.3], invert: true },
+                    { key: 'herg_inhibition', label: 'hERG Inhibition', section: 'toxicity', format: v => Number(v).toFixed(2), thresholds: [0.5, 0.3], invert: true },
+                    { key: 'ames_mutagenicity', label: 'Ames Mutagenicity', section: 'toxicity', format: v => Number(v).toFixed(2), thresholds: [0.5, 0.3], invert: true },
+                    { key: 'hepatotoxicity', label: 'Hepatotoxicity', section: 'toxicity', format: v => Number(v).toFixed(2), thresholds: [0.5, 0.3], invert: true },
+                  ].map(({ key, label, section, format, thresholds, invert }) => {
+                    const val = admet[key] ?? admet[section]?.[key]
+                    if (val === null || val === undefined) return null
+                    const numVal = Number(val)
+                    let status, statusColor, statusBg
+                    if (invert) {
+                      // Lower is better (e.g. CYP inhibition, toxicity)
+                      if (numVal <= thresholds[1]) { status = 'Low'; statusColor = 'text-green-700'; statusBg = 'bg-green-100' }
+                      else if (numVal <= thresholds[0]) { status = 'Moderate'; statusColor = 'text-yellow-700'; statusBg = 'bg-yellow-100' }
+                      else { status = 'High'; statusColor = 'text-red-700'; statusBg = 'bg-red-100' }
+                    } else {
+                      // Higher is better (e.g. bioavailability)
+                      if (numVal >= thresholds[1]) { status = 'Good'; statusColor = 'text-green-700'; statusBg = 'bg-green-100' }
+                      else if (numVal >= thresholds[0]) { status = 'Moderate'; statusColor = 'text-yellow-700'; statusBg = 'bg-yellow-100' }
+                      else { status = 'Low'; statusColor = 'text-red-700'; statusBg = 'bg-red-100' }
+                    }
+                    return (
+                      <tr key={key} className="hover:bg-gray-50">
+                        <td className="px-3 py-1.5 text-gray-600">{label}</td>
+                        <td className="px-3 py-1.5 text-right font-mono text-gray-800">{format(numVal)}</td>
+                        <td className="px-3 py-1.5 text-center">
+                          <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold ${statusColor} ${statusBg}`}>
+                            {status}
+                          </span>
+                        </td>
+                      </tr>
+                    )
+                  }).filter(Boolean)}
+                </tbody>
+              </table>
+              {/* Show message if no detailed data */}
+              {[
+                'oral_bioavailability', 'intestinal_permeability', 'ppb', 'bbb_permeability',
+                'clearance', 'half_life', 'cyp1a2_inhibition', 'cyp2c9_inhibition',
+                'cyp2c19_inhibition', 'cyp2d6_inhibition', 'cyp3a4_inhibition',
+                'herg_inhibition', 'ames_mutagenicity', 'hepatotoxicity',
+              ].every(k => (admet[k] ?? admet?.absorption?.[k] ?? admet?.distribution?.[k] ?? admet?.metabolism?.[k] ?? admet?.excretion?.[k] ?? admet?.toxicity?.[k]) == null) && (
+                <div className="px-3 py-4 text-center text-xs text-gray-400">
+                  No detailed DMPK values available for this molecule
+                </div>
+              )}
+            </div>
+          )}
+        </div>
 
         {/* Color-coded summary band */}
         <div

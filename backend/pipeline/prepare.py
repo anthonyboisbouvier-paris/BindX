@@ -20,8 +20,59 @@ logger = logging.getLogger(__name__)
 # Receptor preparation
 # ---------------------------------------------------------------------------
 
+def _strip_hetatm(pdb_path: Path, work_dir: Path) -> Path:
+    """Strip HETATM records from a PDB file for receptor preparation.
+
+    Removes waters (HOH), co-crystallized ligands, and crystallization
+    artifacts that would occupy the binding pocket and block docking.
+    Keeps only protein ATOM records, CONECT, TER, END, and header lines.
+
+    Parameters
+    ----------
+    pdb_path : Path
+        Original PDB file (possibly from AlphaFold or PDB).
+    work_dir : Path
+        Directory for the cleaned PDB.
+
+    Returns
+    -------
+    Path
+        Path to the cleaned PDB file (protein-only).
+    """
+    cleaned_path = work_dir / f"{pdb_path.stem}_clean.pdb"
+    kept = 0
+    removed = 0
+    removed_residues: set[str] = set()
+
+    with open(pdb_path, "r") as fin, open(cleaned_path, "w") as fout:
+        for line in fin:
+            record = line[:6].strip()
+            if record == "HETATM":
+                res_name = line[17:20].strip()
+                removed_residues.add(res_name)
+                removed += 1
+                continue
+            fout.write(line)
+            if record == "ATOM":
+                kept += 1
+
+    if removed > 0:
+        logger.info(
+            "Stripped %d HETATM atoms (%s) from %s, kept %d ATOM records",
+            removed, ", ".join(sorted(removed_residues)), pdb_path.name, kept,
+        )
+    else:
+        logger.debug("No HETATM records found in %s", pdb_path.name)
+
+    return cleaned_path
+
+
 def prepare_receptor(pdb_path: Path, work_dir: Path) -> Path:
     """Convert a PDB file to PDBQT format for AutoDock Vina.
+
+    The PDB is first cleaned by stripping all HETATM records (waters,
+    co-crystallized ligands, crystallization artifacts) that would block
+    the binding pocket during docking.
 
     Parameters
     ----------
@@ -42,21 +93,24 @@ def prepare_receptor(pdb_path: Path, work_dir: Path) -> Path:
         logger.info("Receptor PDBQT already exists: %s", pdbqt_path)
         return pdbqt_path
 
+    # Step 0: Strip HETATM records (waters, ligands, artifacts)
+    cleaned_pdb = _strip_hetatm(pdb_path, work_dir)
+
     # Strategy 1: Open Babel
     if shutil.which("obabel"):
-        success = _obabel_pdb_to_pdbqt(pdb_path, pdbqt_path)
+        success = _obabel_pdb_to_pdbqt(cleaned_pdb, pdbqt_path)
         if success:
             return pdbqt_path
 
     # Strategy 2: ADFRsuite prepare_receptor
     if shutil.which("prepare_receptor"):
-        success = _adfr_prepare_receptor(pdb_path, pdbqt_path)
+        success = _adfr_prepare_receptor(cleaned_pdb, pdbqt_path)
         if success:
             return pdbqt_path
 
     # Strategy 3: Manual fallback (no external tools)
     logger.info("No conversion tools available; using manual PDB->PDBQT conversion")
-    _manual_pdb_to_pdbqt(pdb_path, pdbqt_path)
+    _manual_pdb_to_pdbqt(cleaned_pdb, pdbqt_path)
     return pdbqt_path
 
 
@@ -100,7 +154,7 @@ def _manual_pdb_to_pdbqt(pdb_path: Path, pdbqt_path: Path) -> None:
 
     with open(pdb_path, "r") as fh:
         for line in fh:
-            if line.startswith("ATOM") or line.startswith("HETATM"):
+            if line.startswith("ATOM"):
                 # Ensure line is at least 78 chars (PDB fixed-width format)
                 padded = line.rstrip("\n").ljust(78)
                 # Append autodock atom type (use element symbol from cols 76-78)

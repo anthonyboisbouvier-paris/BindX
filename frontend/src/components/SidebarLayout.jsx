@@ -1,6 +1,6 @@
 import React from 'react'
 import { Outlet, NavLink, useParams, useLocation } from 'react-router-dom'
-import { ProjectProvider, useProject } from '../contexts/ProjectContext.jsx'
+import { ProjectProvider, useProject, useProjectSafe } from '../contexts/ProjectContext.jsx'
 import { HitSelectionProvider } from '../contexts/HitSelectionContext.jsx'
 
 // ---------------------------------------------------------------------------
@@ -100,7 +100,7 @@ function ProjectTreeNode({ projectId, isTargetConfigured }) {
     [
       'flex items-center gap-2 px-3 py-2 text-xs rounded-md transition-colors duration-150',
       item.disabled
-        ? 'text-white/25 cursor-default'
+        ? 'text-white/30 cursor-not-allowed'
         : isActive
           ? 'bg-white/10 text-white font-medium'
           : 'text-white/55 hover:text-white hover:bg-white/5',
@@ -173,13 +173,8 @@ function SidebarLayoutInner() {
   const location = useLocation()
 
   // Safely read isTargetConfigured — may not be in a ProjectProvider
-  let isTargetConfigured = false
-  try {
-    const ctx = useProject()
-    isTargetConfigured = ctx.isTargetConfigured
-  } catch {
-    // Not inside ProjectProvider — leave false
-  }
+  const ctx = useProjectSafe()
+  const isTargetConfigured = ctx?.isTargetConfigured ?? false
 
   // Sub-items for mobile (flat list)
   const mobileSubItems = projectId ? buildSubNavItems(projectId, isTargetConfigured) : []
@@ -216,13 +211,57 @@ function SidebarLayoutInner() {
               isTargetConfigured={isTargetConfigured}
             />
           ) : (
-            <p className="px-3 text-white/30 text-xs italic">Select a project to begin</p>
+            <div className="px-3 py-4 space-y-2">
+              <p className="text-white/30 text-xs italic">Select a project to begin</p>
+              <div className="space-y-1.5">
+                {['Target', 'Runs', 'Results', 'Optimize', 'Reports'].map(label => (
+                  <div key={label} className="flex items-center gap-2 px-3 py-1.5 text-white/10 text-xs">
+                    <div className="w-4 h-4 rounded bg-white/5" />
+                    <span>{label}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
           )}
         </nav>
 
-        {/* DockIt branding at bottom */}
-        <div className="px-4 py-3 border-t border-white/10">
-          <p className="text-white/20 text-xs">DockIt v8.0.0</p>
+        {/* Bottom links */}
+        <div className="px-3 py-3 border-t border-white/10 space-y-1">
+          <NavLink
+            to="/methodology"
+            className={({ isActive }) =>
+              [
+                'flex items-center gap-2 px-3 py-1.5 text-xs rounded-md transition-colors duration-150',
+                isActive
+                  ? 'bg-white/10 text-white font-medium'
+                  : 'text-white/40 hover:text-white hover:bg-white/5',
+              ].join(' ')
+            }
+          >
+            <svg className="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8}
+                d="M9.75 3.104v5.714a2.25 2.25 0 01-.659 1.591L5 14.5M9.75 3.104c-.251.023-.501.05-.75.082m.75-.082a24.301 24.301 0 014.5 0m0 0v5.714a2.25 2.25 0 00.659 1.591L19 14.5M14.25 3.104c.251.023.501.05.75.082M19 14.5l-1.47 4.9a2.25 2.25 0 01-2.156 1.6H8.626a2.25 2.25 0 01-2.156-1.6L5 14.5m14 0H5" />
+            </svg>
+            <span>Methodology</span>
+          </NavLink>
+          <NavLink
+            to="/references"
+            className={({ isActive }) =>
+              [
+                'flex items-center gap-2 px-3 py-1.5 text-xs rounded-md transition-colors duration-150',
+                isActive
+                  ? 'bg-white/10 text-white font-medium'
+                  : 'text-white/40 hover:text-white hover:bg-white/5',
+              ].join(' ')
+            }
+          >
+            <svg className="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8}
+                d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+            </svg>
+            <span>References</span>
+          </NavLink>
+          <p className="text-white/20 text-xs px-3">DockIt v10.0.0</p>
         </div>
       </aside>
 

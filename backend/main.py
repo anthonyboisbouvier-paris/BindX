@@ -33,13 +33,17 @@ from database import (
     create_user, get_user, get_user_by_email,
     create_project, get_project, list_projects, update_project,
     count_project_jobs, list_project_jobs,
+    create_assessment, get_assessment, get_assessment_by_hash, update_assessment_agent,
 )
 from models import (
     ADMETResult, DockingResult, JobCreate, JobResults, JobStatus,
     OffTargetResult, OptimizationRequest, OptimizationStatus,
+    PoseQuality, ScaffoldAnalysisResponse,
     SynthesisRoute, SynthesisStep,
     UserCreate, UserLogin, UserResponse,
     ProjectCreate, ProjectUpdate, ProjectResponse,
+    TargetAssessmentRequest, TargetAssessmentResult,
+    AgentQuery, AgentResponse,
 )
 from pipeline.structure import query_rcsb_pdb, fetch_structure_from_sequence
 
@@ -265,20 +269,23 @@ def _get_pedagogical_tip(step: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _map_mode_to_params(mode: str, body: JobCreate) -> dict:
-    """Map V3 mode (rapid/standard/deep) to pipeline parameters.
+    """Map request body to pipeline parameters.
 
-    Parameters
-    ----------
-    mode : str
-        One of "rapid", "standard", "deep", or V2 compat "basic"/"advanced".
-    body : JobCreate
-        The original request body.
-
-    Returns
-    -------
-    dict
-        Pipeline parameters dict ready for the Celery task.
+    V11: mode is kept for backward compat but the key control is now
+    `enable_dmpk`. The frontend sends compounds count, engine choice,
+    and DMPK toggle directly.
     """
+    enable_dmpk = body.enable_dmpk if hasattr(body, 'enable_dmpk') else True
+
+    # V12: granular analysis flags (backward compat: enable_dmpk=False disables all)
+    master = enable_dmpk
+    enable_admet = getattr(body, 'enable_admet', master) if master else False
+    enable_synthesis = getattr(body, 'enable_synthesis', master) if master else False
+    enable_selectivity = getattr(body, 'enable_selectivity', master) if master else False
+    enable_herg = getattr(body, 'enable_herg', master) if master else False
+    enable_safety = getattr(body, 'enable_safety', master) if master else False
+    box_size = getattr(body, 'box_size', None)
+
     base_params: dict = {
         "uniprot_id": body.uniprot_id or "",
         "sequence": body.sequence,
@@ -286,58 +293,29 @@ def _map_mode_to_params(mode: str, body: JobCreate) -> dict:
         "mode": mode,
         "docking_engine": body.docking_engine,
         "notification_email": body.notification_email,
+        "enable_dmpk": enable_dmpk,
+        "enable_admet": enable_admet,
+        "enable_synthesis": enable_synthesis,
+        "enable_selectivity": enable_selectivity,
+        "enable_herg": enable_herg,
+        "enable_safety": enable_safety,
+        "box_size": box_size,
+        "max_ligands": body.max_ligands or 50,
+        "use_chembl": body.use_chembl if body.use_chembl is not None else True,
+        "use_zinc": body.use_zinc if body.use_zinc is not None else True,
+        "enable_generation": False,
+        "enable_diffdock": body.enable_diffdock if body.enable_diffdock is not None else False,
+        "enable_retrosynthesis": enable_synthesis,
+        "n_generated_molecules": 0,
+        "auto_strategy": True,
     }
 
-    if mode == "rapid" or mode == "basic":
-        # Quick V1-style pipeline: small ligand set, no generation, no ADMET
-        base_params.update({
-            "max_ligands": body.max_ligands or 50,
-            "use_chembl": body.use_chembl if body.use_chembl is not None else True,
-            "use_zinc": body.use_zinc if body.use_zinc is not None else False,
-            "enable_generation": False,
-            "enable_diffdock": False,
-            "enable_retrosynthesis": False,
-            "n_generated_molecules": 0,
-            "auto_strategy": False,
-        })
-
-    elif mode == "standard" or mode == "advanced":
-        # Advanced pipeline: GNINA is ~15s/molecule, so default to 50 (not 500)
-        base_params.update({
-            "max_ligands": body.max_ligands or 50,
-            "use_chembl": True,
-            "use_zinc": True,
-            "enable_generation": True,
-            "enable_diffdock": body.enable_diffdock if body.enable_diffdock is not None else False,
-            "enable_retrosynthesis": True,
-            "n_generated_molecules": body.n_generated_molecules or 20,
-            "auto_strategy": True,
-        })
-
-    elif mode == "deep":
-        # Massive screening, up to 4h, email notification
+    # Deep screening for very large compound sets (>200)
+    if (body.max_ligands or 0) > 200 or mode == "deep":
         base_params.update({
             "max_ligands": body.max_ligands or 5000,
-            "use_chembl": True,
-            "use_zinc": True,
-            "enable_generation": True,
-            "enable_diffdock": False,
-            "enable_retrosynthesis": True,
-            "n_generated_molecules": body.n_generated_molecules or 200,
-            "auto_strategy": True,
-        })
-
-    else:
-        # Fallback to rapid
-        base_params.update({
-            "max_ligands": body.max_ligands or 50,
-            "use_chembl": True,
-            "use_zinc": False,
-            "enable_generation": False,
-            "enable_diffdock": False,
-            "enable_retrosynthesis": False,
-            "n_generated_molecules": 0,
-            "auto_strategy": False,
+            "enable_generation": enable_dmpk,
+            "n_generated_molecules": body.n_generated_molecules or 200 if enable_dmpk else 0,
         })
 
     return base_params
@@ -426,6 +404,28 @@ def _extract_admet_domain(admet_data: Optional[dict]) -> Optional[dict]:
     return None
 
 
+def _lazy_svg(smiles: Optional[str]) -> Optional[str]:
+    """Generate 2D SVG on-the-fly for results that lack a pre-rendered SVG."""
+    if not smiles:
+        return None
+    try:
+        from pipeline.scoring import generate_2d_svg
+        return generate_2d_svg(smiles)
+    except Exception:
+        return None
+
+
+def _infer_docking_status(r: dict) -> str:
+    """Infer docking status from result data."""
+    engine = r.get("docking_engine") or r.get("docking_method") or ""
+    has_pose = bool(r.get("pose_pdbqt_path") or r.get("pose_sdf_path"))
+    if has_pose and engine.lower() in ("gnina", "vina", "autodock_vina"):
+        return "docked"
+    if engine.lower() in ("mock",):
+        return "docked"  # mock still counts as having been through docking
+    return "not_docked"
+
+
 def _parse_results(raw_list: list[dict]) -> list[DockingResult]:
     """Convert raw JSON dicts into DockingResult pydantic models with V3 fields."""
     results: list[DockingResult] = []
@@ -491,8 +491,8 @@ def _parse_results(raw_list: list[dict]) -> list[DockingResult]:
             hba=r.get("hba"),
             rotatable_bonds=r.get("rotatable_bonds"),
             composite_score=composite,
-            svg=r.get("svg_2d") or r.get("svg"),
-            pose_pdbqt=r.get("pose_pdbqt_path"),
+            svg=r.get("svg_2d") or r.get("svg") or _lazy_svg(r.get("smiles")),
+            pose_pdbqt=r.get("pose_pdbqt_path") or r.get("pose_sdf_path"),
             source=r.get("source"),
             admet=admet_obj,
             synthesis_route=synth_obj,
@@ -513,6 +513,10 @@ def _parse_results(raw_list: list[dict]) -> list[DockingResult]:
             vina_score=r.get("vina_score"),
             cnn_score=r.get("cnn_score"),
             cnn_affinity=r.get("cnn_affinity"),
+            cnn_vs=r.get("cnn_vs") or (
+                round((r.get("cnn_score") or 0) * (r.get("cnn_affinity") or 0), 4)
+                if r.get("cnn_score") and r.get("cnn_affinity") else None
+            ),
             consensus_rank=r.get("consensus_rank"),
             consensus_robust=r.get("consensus_robust"),
             interactions=r.get("interactions"),
@@ -534,6 +538,11 @@ def _parse_results(raw_list: list[dict]) -> list[DockingResult]:
             # V6.3 fields
             combined_off_target=r.get("combined_off_target"),
             herg_specialized=r.get("herg_specialized"),
+            # V11 fields: docking transparency
+            docking_engine=r.get("docking_engine"),
+            docking_status=r.get("docking_status") or _infer_docking_status(r),
+            # V12 fields: pose quality
+            pose_quality=r.get("pose_quality"),
         ))
     return results
 
@@ -677,6 +686,18 @@ async def list_projects_endpoint(
     return result
 
 
+def _job_best_score(job) -> float | None:
+    """Extract best composite_score from a completed job's results_json."""
+    if job.status != "completed" or not job.results_json:
+        return None
+    try:
+        results = json.loads(job.results_json)
+        scores = [r.get("composite_score", 0.0) for r in results if isinstance(r, dict)]
+        return round(max(scores), 4) if scores else None
+    except Exception:
+        return None
+
+
 @app.get("/api/projects/{project_id}", response_model=dict)
 async def get_project_endpoint(
     project_id: str,
@@ -717,6 +738,10 @@ async def get_project_endpoint(
             "protein_name": j.protein_name,
             "created_at": j.created_at.isoformat() if j.created_at else None,
             "completed_at": j.completed_at.isoformat() if j.completed_at else None,
+            "enable_generation": bool(j.enable_generation) if hasattr(j, 'enable_generation') else False,
+            "has_custom_smiles": bool(j.smiles_list) if hasattr(j, 'smiles_list') else False,
+            "best_score": _job_best_score(j),
+            "error_message": j.error_message if j.status == "failed" else None,
         } for j in jobs],
     }
 
@@ -1205,9 +1230,11 @@ def _build_pockets_info(
                     "method": method,
                     "probability": round(probability, 4),
                     "residues_count": len(residues) if isinstance(residues, list) else 0,
+                    "residues": residues[:50] if isinstance(residues, list) else [],
                     "center": list(center) if isinstance(center, tuple) else center,
                     "selected": (i == 0),  # First pocket is the selected one
                     "explanation": explanation,
+                    "volume": round(pocket.get("volume", 0.0), 1),
                 })
 
             return formatted
@@ -1415,6 +1442,23 @@ async def create_docking_job(
 
     # Build pipeline parameters based on mode
     task_params = _map_mode_to_params(mode, body)
+
+    # V8: inject target_config to skip structure+pockets recomputation
+    target_config_raw: Optional[str] = body.target_config_json
+    if not target_config_raw and body.project_id:
+        from database import get_project as _get_project
+        proj = _get_project(body.project_id)
+        if proj and getattr(proj, "target_preview_json", None):
+            target_config_raw = proj.target_preview_json
+    if target_config_raw:
+        try:
+            task_params["target_config"] = (
+                json.loads(target_config_raw)
+                if isinstance(target_config_raw, str)
+                else target_config_raw
+            )
+        except Exception:
+            pass  # malformed JSON — pipeline will re-compute
 
     # Determine effective boolean flags for DB storage
     use_chembl = task_params.get("use_chembl", True)
@@ -1712,7 +1756,10 @@ async def download_pose(job_id: str, ligand_index: int) -> FileResponse:
             detail=f"Ligand index {ligand_index} out of range (0-{len(results)-1})",
         )
 
-    pose_path_str = results[ligand_index].get("pose_pdbqt_path")
+    pose_path_str = (
+        results[ligand_index].get("pose_pdbqt_path")
+        or results[ligand_index].get("pose_sdf_path")
+    )
     if not pose_path_str:
         raise HTTPException(status_code=404, detail="Pose file not available for this ligand")
 
@@ -1787,6 +1834,32 @@ async def get_audit_log(job_id: str) -> dict:
         )
 
 
+@app.post("/api/molecule/analyze-scaffold")
+async def analyze_scaffold_endpoint(body: dict) -> ScaffoldAnalysisResponse:
+    """Analyze a molecule's scaffold, R-groups, and return annotated SVG.
+
+    Parameters
+    ----------
+    body : dict
+        Must contain ``smiles`` key.
+
+    Returns
+    -------
+    ScaffoldAnalysisResponse
+    """
+    smiles = body.get("smiles", "")
+    if not smiles:
+        raise HTTPException(status_code=422, detail="smiles field is required")
+
+    try:
+        from pipeline.scaffold_analysis import analyze_scaffold
+        result = analyze_scaffold(smiles)
+        return ScaffoldAnalysisResponse(**result)
+    except Exception as exc:
+        logger.error("Scaffold analysis failed for %s: %s", smiles[:60], exc)
+        raise HTTPException(status_code=500, detail=f"Scaffold analysis failed: {exc}")
+
+
 @app.post("/api/jobs/{job_id}/optimize")
 async def start_optimization(job_id: str, body: OptimizationRequest) -> dict:
     """Start a lead optimization task for a molecule from a completed job.
@@ -1828,6 +1901,17 @@ async def start_optimization(job_id: str, body: OptimizationRequest) -> dict:
         "weights": body.weights,
         "n_iterations": body.n_iterations,
         "variants_per_iter": body.variants_per_iter,
+        "structural_rules": body.modification_rules.model_dump() if body.modification_rules else None,
+        "docking_engine": body.docking_engine,
+        "dock_top_n": body.dock_top_n,
+        "exhaustiveness": body.exhaustiveness,
+        # V12: granular analysis flags
+        "enable_admet": body.enable_admet,
+        "enable_synthesis": body.enable_synthesis,
+        "enable_selectivity": body.enable_selectivity,
+        "enable_herg": body.enable_herg,
+        "enable_safety": body.enable_safety,
+        "box_size": body.box_size,
     }
 
     # Store initial status
@@ -1886,6 +1970,40 @@ async def get_optimization_status(job_id: str, opt_id: str) -> OptimizationStatu
         Current status, progress, and results (if completed).
     """
     opt_data = _optimization_results.get(opt_id)
+
+    # If not in memory, try to recover from disk (e.g. after API restart)
+    if opt_data is None:
+        result_path = DATA_DIR / job_id / "optimization" / opt_id / "result.json"
+        if result_path.exists():
+            try:
+                with open(result_path, "r", encoding="utf-8") as f:
+                    result = json.load(f)
+                # Try to recover created_job_id from meta file
+                created_job_id = None
+                meta_path = DATA_DIR / job_id / "optimization" / opt_id / "meta.json"
+                if meta_path.exists():
+                    try:
+                        meta = json.loads(meta_path.read_text())
+                        created_job_id = meta.get("created_job_id")
+                    except Exception:
+                        pass
+                opt_data = {
+                    "optimization_id": opt_id,
+                    "job_id": job_id,
+                    "status": "completed",
+                    "progress": 100,
+                    "current_iteration": result.get("total_tested", 10),
+                    "total_iterations": len(result.get("iterations", [])) or 10,
+                    "best_score": result.get("final_lead", {}).get("score")
+                                 or result.get("best_molecule", {}).get("score"),
+                    "result": result,
+                    "error_message": None,
+                    "created_job_id": created_job_id,
+                }
+                _optimization_results[opt_id] = opt_data
+            except (json.JSONDecodeError, IOError):
+                pass
+
     if opt_data is None:
         raise HTTPException(
             status_code=404,
@@ -1905,12 +2023,24 @@ async def get_optimization_status(job_id: str, opt_id: str) -> OptimizationStatu
             try:
                 with open(result_path, "r", encoding="utf-8") as f:
                     result = json.load(f)
+                # Also recover created_job_id from meta.json
+                created_job_id = opt_data.get("created_job_id")
+                if not created_job_id:
+                    meta_path = DATA_DIR / job_id / "optimization" / opt_id / "meta.json"
+                    if meta_path.exists():
+                        try:
+                            meta = json.loads(meta_path.read_text())
+                            created_job_id = meta.get("created_job_id")
+                        except Exception:
+                            pass
                 opt_data.update({
                     "status": "completed",
                     "progress": 100,
                     "result": result,
-                    "best_score": result.get("final_lead", {}).get("score"),
+                    "best_score": result.get("final_lead", {}).get("score")
+                                 or result.get("best_molecule", {}).get("score"),
                     "current_iteration": opt_data.get("total_iterations", 10),
+                    "created_job_id": created_job_id,
                 })
             except (json.JSONDecodeError, IOError):
                 pass
@@ -1925,6 +2055,7 @@ async def get_optimization_status(job_id: str, opt_id: str) -> OptimizationStatu
         best_score=opt_data.get("best_score"),
         result=opt_data.get("result"),
         error_message=opt_data.get("error_message"),
+        created_job_id=opt_data.get("created_job_id"),
     )
 
 
@@ -1957,6 +2088,35 @@ def _dispatch_optimization_task(opt_id: str, params: dict) -> None:
         _run_optimization_sync(opt_id, params)
 
 
+def _create_job_from_optimization(opt_id: str, params: dict, result: dict) -> Optional[str]:
+    """Create a new job in the project from optimization results.
+
+    Delegates to the same function in tasks.py for consistency (single
+    implementation of the enrichment pipeline integration).
+
+    Parameters
+    ----------
+    opt_id : str
+        Optimization UUID.
+    params : dict
+        Original optimization parameters (contains ``job_id``).
+    result : dict
+        Optimization result dict with ``final_lead``, ``best_molecule``,
+        ``iterations``, etc.
+
+    Returns
+    -------
+    str or None
+        The new job_id, or None on failure.
+    """
+    try:
+        from tasks import _create_job_from_optimization as _tasks_create
+        return _tasks_create(opt_id, params, result)
+    except Exception as exc:
+        logger.warning("Failed to create job from optimization %s: %s", opt_id, exc)
+        return None
+
+
 def _run_optimization_sync(opt_id: str, params: dict) -> None:
     """Run optimization synchronously (fallback when Celery is unavailable).
 
@@ -1977,17 +2137,29 @@ def _run_optimization_sync(opt_id: str, params: dict) -> None:
         job_id = params["job_id"]
         work_dir = DATA_DIR / job_id
 
-        # Get pocket center from the job's pipeline summary
+        # Get pocket center and receptor path from the job's pipeline summary
         job = get_job(job_id)
         pocket_center = [22.0, 0.5, 18.0]  # fallback default
+        target_pdbqt = None
         if job and job.pipeline_summary_json:
             try:
                 summary = json.loads(job.pipeline_summary_json)
                 pocket_center = summary.get("best_pocket_center", pocket_center)
+                # V12: resolve receptor path from pipeline summary
+                rp = summary.get("receptor_path", "")
+                if rp and Path(rp).exists():
+                    target_pdbqt = rp
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        target_pdbqt = str(work_dir / "receptor.pdbqt")
+        # V12: resolve receptor path (same logic as celery task)
+        if not target_pdbqt:
+            receptor_candidates = sorted(work_dir.glob("*receptor*.pdbqt"))
+            if receptor_candidates:
+                target_pdbqt = str(receptor_candidates[0])
+            else:
+                target_pdbqt = str(work_dir / "receptor.pdbqt")
+                logger.warning("No receptor found for opt %s, using default: %s", opt_id, target_pdbqt)
 
         def progress_cb(iteration: int, score: float, message: str) -> None:
             n_iters = params.get("n_iterations", 10)
@@ -2008,20 +2180,30 @@ def _run_optimization_sync(opt_id: str, params: dict) -> None:
             variants_per_iter=params.get("variants_per_iter", 50),
             work_dir=work_dir / "optimization" / opt_id,
             progress_callback=progress_cb,
+            structural_rules=params.get("structural_rules"),
+            docking_engine=params.get("docking_engine", "auto"),
+            pocket_size=params.get("pocket_size", [25.0, 25.0, 25.0]),
+            exhaustiveness=params.get("exhaustiveness", 8),
+            dock_top_n=params.get("dock_top_n", 20),
         )
+
+        # Auto-create a new job in the project with optimization results
+        new_job_id = _create_job_from_optimization(opt_id, params, result)
 
         _optimization_results[opt_id].update({
             "status": "completed",
             "progress": 100,
             "result": result,
             "best_score": result["final_lead"]["score"],
+            "created_job_id": new_job_id,
         })
 
         logger.info(
-            "Optimization %s completed: score %.3f -> %.3f",
+            "Optimization %s completed: score %.3f -> %.3f (new job: %s)",
             opt_id,
             result["starting_molecule"]["score"],
             result["final_lead"]["score"],
+            new_job_id,
         )
 
     except Exception as exc:
@@ -2033,4 +2215,531 @@ def _run_optimization_sync(opt_id: str, params: dict) -> None:
         _optimization_results[opt_id].update({
             "status": "failed",
             "error_message": error_msg,
+        })
+
+
+# ---------------------------------------------------------------------------
+# BindX: Target Assessment endpoints
+# ---------------------------------------------------------------------------
+
+_assessment_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="assessment")
+
+
+@app.post("/api/target-assessment")
+async def run_target_assessment(req: TargetAssessmentRequest) -> JSONResponse:
+    """Run a full target assessment (5 scores + recommendation + optional AI agents).
+
+    Returns the assessment result with composite score and GO/CAUTION/NO-GO.
+    Cached by input_hash for idempotence.
+    """
+    import hashlib as _hashlib
+
+    # Compute input hash for cache lookup
+    input_hash = _hashlib.md5(
+        json.dumps({
+            "uniprot_id": req.uniprot_id,
+            "disease_context": req.disease_context,
+            "modality": req.modality,
+        }, sort_keys=True).encode()
+    ).hexdigest()
+
+    # Check cache (skip if force_refresh or if agents were requested but previous cache has no agent data)
+    cached = get_assessment_by_hash(input_hash)
+    if cached and not req.force_refresh:
+        result = json.loads(cached.assessment_json)
+        agent_data = json.loads(cached.agent_responses_json) if cached.agent_responses_json else None
+
+        # If agents requested but cached result has unavailable agents, re-run agents only
+        needs_agent_rerun = (
+            req.include_agents
+            and (not agent_data or not agent_data.get("available", False))
+        )
+        if not needs_agent_rerun:
+            logger.info("Returning cached assessment for %s (hash=%s)", req.uniprot_id, input_hash)
+            return JSONResponse({
+                "id": cached.id,
+                "cached": True,
+                **result,
+                "agent_analysis": agent_data,
+            })
+
+        # Re-run agent with cached assessment scores
+        logger.info("Cached assessment found but agent unavailable — re-running agent for %s", req.uniprot_id)
+        try:
+            from pipeline.agents.target_agent import TargetAssessmentAgent
+            agent = TargetAssessmentAgent()
+            agent_context = {
+                "uniprot_id": req.uniprot_id,
+                "disease_context": req.disease_context,
+                "scores": result.get("scores", {}),
+                "composite_score": result.get("composite_score"),
+                "recommendation": result.get("recommendation"),
+                "flags": result.get("flags", []),
+            }
+            loop = asyncio.get_event_loop()
+            agent_data = await loop.run_in_executor(
+                _assessment_pool,
+                lambda: agent.query_sync(agent_context),
+            )
+            # Update DB with fresh agent data
+            try:
+                update_assessment_agent(cached.id, json.dumps(agent_data))
+            except Exception:
+                pass
+        except Exception as agent_exc:
+            logger.warning("Agent re-run failed: %s", agent_exc)
+            agent_data = {"available": False, "fallback": str(agent_exc)}
+
+        return JSONResponse({
+            "id": cached.id,
+            "cached": True,
+            **result,
+            "agent_analysis": agent_data,
+        })
+
+    # Get preview data from project if available
+    preview_data = None
+    if req.project_id:
+        project = get_project(req.project_id)
+        if project and project.target_preview_json:
+            try:
+                preview_data = json.loads(project.target_preview_json) if isinstance(
+                    project.target_preview_json, str
+                ) else project.target_preview_json
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # Run assessment in thread pool (involves blocking HTTP calls)
+    loop = asyncio.get_event_loop()
+    try:
+        from pipeline.target_assessment import assess_target
+        assessment = await loop.run_in_executor(
+            _assessment_pool,
+            lambda: assess_target(
+                uniprot_id=req.uniprot_id,
+                disease_context=req.disease_context,
+                modality=req.modality,
+                preview_data=preview_data,
+                weights=req.weights,
+            ),
+        )
+    except Exception as exc:
+        logger.error("Target assessment failed for %s: %s", req.uniprot_id, exc)
+        raise HTTPException(500, f"Assessment failed: {exc}")
+
+    # Optionally run Agent 1 (Target Assessment Agent)
+    agent_data = None
+    if req.include_agents:
+        try:
+            from pipeline.agents.target_agent import TargetAssessmentAgent
+            agent = TargetAssessmentAgent()
+            agent_context = {
+                "uniprot_id": req.uniprot_id,
+                "disease_context": req.disease_context,
+                "scores": assessment.get("scores", {}),
+                "composite_score": assessment.get("composite_score"),
+                "recommendation": assessment.get("recommendation"),
+                "flags": assessment.get("flags", []),
+            }
+            agent_result = await loop.run_in_executor(
+                _assessment_pool,
+                lambda: agent.query_sync(agent_context),
+            )
+            agent_data = agent_result
+        except Exception as agent_exc:
+            logger.warning("Agent 1 failed: %s", agent_exc)
+            agent_data = {"available": False, "fallback": str(agent_exc)}
+
+    # Store in DB
+    assessment_id = str(uuid4())
+    try:
+        create_assessment(
+            assessment_id=assessment_id,
+            uniprot_id=req.uniprot_id,
+            assessment_json=json.dumps(assessment),
+            project_id=req.project_id,
+            disease_context=req.disease_context,
+            agent_responses_json=json.dumps(agent_data) if agent_data else None,
+            input_hash=input_hash,
+        )
+    except Exception as db_exc:
+        logger.warning("Failed to store assessment: %s", db_exc)
+
+    return JSONResponse({
+        "id": assessment_id,
+        "cached": False,
+        **assessment,
+        "agent_analysis": agent_data,
+    })
+
+
+@app.get("/api/target-assessment/{assessment_id}")
+async def get_target_assessment(assessment_id: str) -> JSONResponse:
+    """Retrieve a stored target assessment by ID."""
+    row = get_assessment(assessment_id)
+    if not row:
+        raise HTTPException(404, "Assessment not found")
+
+    result = json.loads(row.assessment_json) if row.assessment_json else {}
+    agent_data = json.loads(row.agent_responses_json) if row.agent_responses_json else None
+
+    return JSONResponse({
+        "id": row.id,
+        "uniprot_id": row.uniprot_id,
+        "disease_context": row.disease_context,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        **result,
+        "agent_analysis": agent_data,
+    })
+
+
+# ---------------------------------------------------------------------------
+# BindX: Agent ad-hoc query endpoint
+# ---------------------------------------------------------------------------
+
+AGENT_REGISTRY = {
+    "target": "pipeline.agents.target_agent.TargetAssessmentAgent",
+    "run_analysis": "pipeline.agents.run_analysis_agent.RunAnalysisAgent",
+    "candidate": "pipeline.agents.candidate_agent.CandidateEvaluationAgent",
+    "optimization": "pipeline.agents.optimization_agent.OptimizationStrategyAgent",
+}
+
+
+@app.post("/api/agent/{agent_name}/query")
+async def query_agent(agent_name: str, req: AgentQuery) -> JSONResponse:
+    """Query a specific AI agent with arbitrary context.
+
+    Available agents: target, run_analysis, candidate, optimization.
+    If project_id is provided, enriches context with project target info.
+    """
+    if agent_name not in AGENT_REGISTRY:
+        raise HTTPException(
+            404,
+            f"Unknown agent '{agent_name}'. Available: {list(AGENT_REGISTRY.keys())}",
+        )
+
+    # Enrich context with project info if project_id provided
+    enriched_context = dict(req.context)
+    if req.project_id:
+        try:
+            from database import get_db
+            from models import ProjectORM
+            with get_db() as session:
+                proj = session.query(ProjectORM).filter_by(id=req.project_id).first()
+                if proj:
+                    if proj.uniprot_id and "uniprot_id" not in enriched_context:
+                        enriched_context["uniprot_id"] = proj.uniprot_id
+                    # Extract gene name and target name from target_preview_json
+                    if proj.target_preview_json:
+                        try:
+                            tp = json.loads(proj.target_preview_json) if isinstance(proj.target_preview_json, str) else proj.target_preview_json
+                            if tp.get("protein_name") and "target_name" not in enriched_context:
+                                enriched_context["target_name"] = tp["protein_name"]
+                            # Try to get gene name from assessment or UniProt
+                            assessment = tp.get("assessment", {})
+                            if assessment.get("provenance", {}).get("gene_name"):
+                                enriched_context["gene_name"] = assessment["provenance"]["gene_name"]
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+        except Exception as proj_exc:
+            logger.debug("Could not enrich context from project %s: %s", req.project_id, proj_exc)
+
+    module_path, class_name = AGENT_REGISTRY[agent_name].rsplit(".", 1)
+
+    try:
+        import importlib
+        mod = importlib.import_module(module_path)
+        agent_class = getattr(mod, class_name)
+        agent = agent_class()
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            _assessment_pool,
+            lambda: agent.query_sync(enriched_context),
+        )
+
+        return JSONResponse(result)
+
+    except Exception as exc:
+        logger.error("Agent '%s' query failed: %s", agent_name, exc)
+        return JSONResponse({
+            "available": False,
+            "agent_name": agent_name,
+            "fallback": "Agent analysis failed. Please try again.",
+        })
+
+
+def _compute_score_stats(molecules: list) -> dict:
+    """Compute score statistics for a list of molecules."""
+    if not molecules:
+        return {}
+    affinities = [m.get("affinity", 0) for m in molecules if m.get("affinity") is not None]
+    scores = [m.get("composite_score", 0) for m in molecules if m.get("composite_score") is not None]
+    qeds = [m.get("qed", 0) for m in molecules if m.get("qed") is not None]
+    return {
+        "n_molecules": len(molecules),
+        "affinity": {"min": min(affinities) if affinities else None, "max": max(affinities) if affinities else None,
+                     "mean": sum(affinities) / len(affinities) if affinities else None},
+        "composite_score": {"min": min(scores) if scores else None, "max": max(scores) if scores else None,
+                           "mean": sum(scores) / len(scores) if scores else None},
+        "qed": {"min": min(qeds) if qeds else None, "max": max(qeds) if qeds else None,
+                "mean": sum(qeds) / len(qeds) if qeds else None},
+    }
+
+
+def _compute_hit_classes(molecules: list) -> dict:
+    """Classify hits by score thresholds."""
+    thresholds = {"excellent": 0.7, "good": 0.5, "moderate": 0.3}
+    counts = {k: 0 for k in thresholds}
+    counts["weak"] = 0
+    for m in molecules:
+        score = m.get("composite_score", 0)
+        if score >= thresholds["excellent"]:
+            counts["excellent"] += 1
+        elif score >= thresholds["good"]:
+            counts["good"] += 1
+        elif score >= thresholds["moderate"]:
+            counts["moderate"] += 1
+        else:
+            counts["weak"] += 1
+    return counts
+
+
+@app.post("/api/jobs/{job_id}/agent-analysis")
+async def trigger_run_analysis(job_id: str) -> JSONResponse:
+    """Trigger Agent 2 (Run Analysis) on a completed job's results.
+
+    Builds context from the job's results.json and runs the Run Analysis Agent.
+    """
+    from database import get_db
+    from models import JobORM
+
+    with get_db() as session:
+        job = session.query(JobORM).filter_by(id=job_id).first()
+        if not job:
+            raise HTTPException(404, f"Job {job_id} not found")
+        if job.status != "completed":
+            raise HTTPException(400, f"Job {job_id} is not completed (status: {job.status})")
+        if not job.results_json:
+            raise HTTPException(400, f"Job {job_id} has no results")
+
+        molecules = json.loads(job.results_json)
+        score_stats = _compute_score_stats(molecules)
+        hit_classes = _compute_hit_classes(molecules)
+
+        # Build context for Agent 2
+        context = {
+            "job_id": job_id,
+            "mode": job.mode or "rapid",
+            "docking_engine": job.docking_engine or "auto",
+            "n_ligands_screened": len(molecules),
+            "uniprot_id": job.uniprot_id,
+            "protein_name": job.protein_name,
+            "score_statistics": score_stats,
+            "hit_classification": hit_classes,
+            "top_molecules": [
+                {
+                    "name": m.get("name", ""),
+                    "smiles": m.get("smiles", ""),
+                    "affinity": m.get("affinity"),
+                    "composite_score": m.get("composite_score"),
+                    "qed": m.get("qed"),
+                    "logp": m.get("logp"),
+                    "mw": m.get("mw"),
+                    "source": m.get("source"),
+                    "cnn_score": m.get("cnn_score"),
+                    "toxicity_level": m.get("toxicity_level"),
+                    "admet_composite": m.get("admet", {}).get("composite_score") if isinstance(m.get("admet"), dict) else None,
+                }
+                for m in sorted(molecules, key=lambda x: x.get("composite_score", 0), reverse=True)[:10]
+            ],
+        }
+
+    try:
+        from pipeline.agents.run_analysis_agent import RunAnalysisAgent
+        agent = RunAnalysisAgent()
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            _assessment_pool,
+            lambda: agent.query_sync(context),
+        )
+
+        return JSONResponse(result)
+
+    except Exception as exc:
+        logger.error("Run analysis agent failed for job %s: %s", job_id, exc)
+        return JSONResponse({
+            "available": False,
+            "agent_name": "Run Analysis Agent",
+            "fallback": f"Agent error: {exc}",
+        })
+
+
+# ---------------------------------------------------------------------------
+# V9 — Time estimation endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/api/estimate-time")
+async def estimate_time(req: Request) -> JSONResponse:
+    """Estimate pipeline runtime based on run configuration parameters.
+
+    Accepts JSON body with keys matching pipeline params:
+    n_ligands, mode, docking_engine, enable_generation, etc.
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+
+    from pipeline.time_estimation import estimate_pipeline_time, quick_estimate
+
+    n_ligands = int(body.get("n_ligands", 50))
+    mode = body.get("mode", "rapid")
+    docking_engine = body.get("docking_engine", "auto")
+
+    # Full estimate
+    full = estimate_pipeline_time(
+        n_ligands=n_ligands,
+        mode=mode,
+        docking_engine=docking_engine,
+        enable_generation=body.get("enable_generation", mode != "rapid"),
+        n_generated_molecules=int(body.get("n_generated_molecules", 100)),
+        enable_retrosynthesis=body.get("enable_retrosynthesis", mode != "rapid"),
+        enable_diffdock=body.get("enable_diffdock", False),
+        structure_source=body.get("structure_source", "alphafold"),
+        use_pubchem=body.get("use_pubchem", True),
+        use_enamine=body.get("use_enamine", n_ligands < 100),
+        use_chembl=body.get("use_chembl", True),
+        include_agents=body.get("include_agents", False),
+        protein_length=int(body.get("protein_length", 400)),
+    )
+
+    # Quick summary
+    quick = quick_estimate(n_ligands=n_ligands, mode=mode, docking_engine=docking_engine)
+
+    return JSONResponse({
+        "estimate": full,
+        "quick": quick,
+    })
+
+
+# ---------------------------------------------------------------------------
+# V9 — Chemical database info endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/api/databases")
+async def list_databases() -> JSONResponse:
+    """List available chemical databases and their status."""
+    return JSONResponse({
+        "databases": [
+            {
+                "id": "chembl",
+                "name": "ChEMBL",
+                "description": "Bioactive compounds with drug-like properties from EBI",
+                "type": "bioactivity",
+                "url": "https://www.ebi.ac.uk/chembl/",
+                "status": "active",
+                "avg_query_time_s": 10,
+            },
+            {
+                "id": "pubchem",
+                "name": "PubChem",
+                "description": "NCBI chemical compound database with bioassay data",
+                "type": "bioactivity",
+                "url": "https://pubchem.ncbi.nlm.nih.gov/",
+                "status": "active",
+                "avg_query_time_s": 12,
+            },
+            {
+                "id": "zinc",
+                "name": "ZINC20",
+                "description": "Drug-like molecules for virtual screening",
+                "type": "drug-like",
+                "url": "https://zinc20.docking.org/",
+                "status": "active",
+                "avg_query_time_s": 1,
+            },
+            {
+                "id": "enamine_real",
+                "name": "Enamine REAL",
+                "description": "Make-on-demand virtual library (37B+ compounds)",
+                "type": "virtual_library",
+                "url": "https://enamine.net/compound-collections/real-compounds",
+                "status": "active",
+                "avg_query_time_s": 2,
+            },
+        ],
+    })
+
+
+# ---------------------------------------------------------------------------
+# V9 — Scientific references & expected results
+# ---------------------------------------------------------------------------
+
+@app.get("/api/references")
+async def get_references(category: Optional[str] = None) -> JSONResponse:
+    """Return scientific references for all tools/methods used in DockIt."""
+    from pipeline.references import get_references, get_categories
+    refs = get_references(category)
+    cats = get_categories()
+    return JSONResponse({"references": refs, "categories": cats})
+
+
+@app.get("/api/expected-results")
+async def get_expected_results() -> JSONResponse:
+    """Return expected results and benchmarks for each pipeline mode."""
+    from pipeline.references import get_expected_results
+    return JSONResponse(get_expected_results())
+
+
+# ---------------------------------------------------------------------------
+# V9 — Pipeline analytics / monitoring
+# ---------------------------------------------------------------------------
+
+@app.get("/api/analytics")
+async def get_analytics() -> JSONResponse:
+    """Return pipeline analytics: run counts, success rates, avg times by mode.
+
+    Useful for monitoring dashboards (n8n, Grafana) and performance tracking.
+    """
+    from database import get_db
+    from models import JobORM
+
+    with get_db() as db:
+        all_jobs = db.query(JobORM).all()
+        total = len(all_jobs)
+        completed = sum(1 for j in all_jobs if j.status == "completed")
+        failed = sum(1 for j in all_jobs if j.status == "failed")
+        running = sum(1 for j in all_jobs if j.status == "running")
+
+        # Mode breakdown
+        mode_counts = {}
+        for j in all_jobs:
+            m = j.mode or "rapid"
+            mode_counts[m] = mode_counts.get(m, 0) + 1
+
+        # Success rate
+        success_rate = (completed / total * 100) if total > 0 else 0
+
+        # Recent failures (last 5)
+        recent_failures = [
+            {
+                "job_id": j.id,
+                "error": j.error_message or "Unknown",
+                "mode": j.mode,
+                "created_at": j.created_at.isoformat() if j.created_at else None,
+            }
+            for j in sorted(all_jobs, key=lambda x: x.created_at or "", reverse=True)
+            if j.status == "failed"
+        ][:5]
+
+        return JSONResponse({
+            "total_jobs": total,
+            "completed": completed,
+            "failed": failed,
+            "running": running,
+            "success_rate_pct": round(success_rate, 1),
+            "mode_breakdown": mode_counts,
+            "recent_failures": recent_failures,
         })

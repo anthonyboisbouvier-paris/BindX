@@ -283,6 +283,93 @@ def analyze_interactions(
     return _mock_interactions(uniprot_id, smiles=smiles)
 
 
+def compute_pose_quality(
+    protein_path: str,
+    ligand_path: str,
+    uniprot_id: str = "",
+    smiles: str = "",
+) -> dict:
+    """Compute structured pose quality metrics from interaction analysis.
+
+    Wraps ``analyze_interactions()`` and extracts a structured dict of
+    quality metrics suitable for the ``PoseQuality`` Pydantic model.
+
+    Parameters
+    ----------
+    protein_path : str
+        Path to the protein PDB file.
+    ligand_path : str
+        Path to the docked ligand file (PDB, SDF, PDBQT).
+    uniprot_id : str
+        UniProt accession for functional residue lookup.
+    smiles : str
+        SMILES of the ligand (for mock fallback).
+
+    Returns
+    -------
+    dict
+        Keys: ``n_contacts_4A``, ``n_hbonds``, ``has_clashes``, ``n_clashes``,
+        ``key_residue_distances``, ``interaction_quality``.
+    """
+    raw = analyze_interactions(protein_path, ligand_path, uniprot_id, smiles)
+    interactions = raw.get("interactions", [])
+
+    contacts_4A = 0
+    hbonds = 0
+    clashes = 0
+
+    for itype in interactions:
+        dist = itype.get("distance", 3.5)  # default for methods without distance
+        if dist < 4.0:
+            contacts_4A += 1
+        if dist < 1.5:
+            clashes += 1
+        if itype.get("type", "") in ("HBDonor", "HBAcceptor", "Hbond"):
+            hbonds += 1
+
+    # Key residue distances from known functional residues
+    key_residue_distances: dict[str, float] = {}
+    functional = KNOWN_FUNCTIONAL_RESIDUES.get(uniprot_id, {})
+    known_res = functional.get("residues", [])
+    if known_res:
+        # Build a map from residue_number -> min distance
+        res_min_dist: dict[int, float] = {}
+        for i in interactions:
+            rn = i.get("residue_number", 0)
+            d = i.get("distance", 3.5)
+            if rn not in res_min_dist or d < res_min_dist[rn]:
+                res_min_dist[rn] = d
+
+        # Common residue name lookup (simplified)
+        aa3 = {
+            "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+            "GLU": "E", "GLN": "Q", "GLY": "G", "HIS": "H", "ILE": "I",
+            "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+            "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+        }
+        # Build residue label from interaction data
+        res_labels: dict[int, str] = {}
+        for i in interactions:
+            rn = i.get("residue_number", 0)
+            res_name = i.get("residue", "")
+            if rn and res_name:
+                res_labels[rn] = res_name
+
+        for rn in known_res:
+            label = res_labels.get(rn, f"RES{rn}")
+            if rn in res_min_dist:
+                key_residue_distances[label] = round(res_min_dist[rn], 1)
+
+    return {
+        "n_contacts_4A": contacts_4A,
+        "n_hbonds": hbonds,
+        "has_clashes": clashes > 0,
+        "n_clashes": clashes,
+        "key_residue_distances": key_residue_distances if key_residue_distances else None,
+        "interaction_quality": raw.get("interaction_quality", 0.0),
+    }
+
+
 def score_interaction_quality(interactions_result: dict) -> float:
     """Extract interaction_quality score (0-1) for composite scoring.
 

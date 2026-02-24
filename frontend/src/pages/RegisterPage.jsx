@@ -97,6 +97,18 @@ export default function RegisterPage() {
               minLength={8}
               className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-[#1e3a5f] focus:border-transparent outline-none transition-shadow"
             />
+            {password && (
+              <div className="flex items-center gap-2 mt-1.5">
+                <div className="flex-1 h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                  <div className={`h-full rounded-full transition-all ${
+                    password.length >= 12 ? 'bg-[#22c55e] w-full' : password.length >= 8 ? 'bg-yellow-400 w-2/3' : 'bg-red-400 w-1/3'
+                  }`} />
+                </div>
+                <span className="text-[10px] text-gray-400 tabular-nums w-12 text-right">
+                  {password.length >= 12 ? 'Strong' : password.length >= 8 ? 'OK' : 'Weak'}
+                </span>
+              </div>
+            )}
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Confirm Password</label>
@@ -107,8 +119,13 @@ export default function RegisterPage() {
               required
               autoComplete="new-password"
               placeholder="Repeat your password"
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-[#1e3a5f] focus:border-transparent outline-none transition-shadow"
+              className={`w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-[#1e3a5f] focus:border-transparent outline-none transition-shadow ${
+                confirm && password !== confirm ? 'border-red-300 bg-red-50' : 'border-gray-300'
+              }`}
             />
+            {confirm && password !== confirm && (
+              <p className="text-xs text-red-500 mt-1">Passwords do not match</p>
+            )}
           </div>
           <button
             type="submit"
@@ -133,9 +150,17 @@ export default function RegisterPage() {
             Sign In
           </Link>
         </p>
+        <div className="flex items-center gap-3 mt-4 mb-2">
+          <div className="flex-1 h-px bg-gray-100" />
+          <span className="text-xs text-gray-300">or</span>
+          <div className="flex-1 h-px bg-gray-100" />
+        </div>
         <p className="text-center text-sm text-gray-400 mt-2">
-          <Link to="/" className="hover:text-[#1e3a5f] transition-colors">
+          <Link to="/" className="hover:text-[#1e3a5f] transition-colors inline-flex items-center gap-1">
             Continue without signing in
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 8l4 4m0 0l-4 4m4-4H3" />
+            </svg>
           </Link>
         </p>
       </div>

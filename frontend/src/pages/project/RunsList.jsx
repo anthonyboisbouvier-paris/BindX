@@ -1,8 +1,11 @@
-import React, { useState, useCallback } from 'react'
+import React, { useState, useCallback, useMemo } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useProject } from '../../contexts/ProjectContext.jsx'
-import { createJob, getJobStatus } from '../../api.js'
+import { createJob, triggerRunAnalysis } from '../../api.js'
 import ProgressBar from '../../components/ProgressBar.jsx'
+import TimeEstimate from '../../components/TimeEstimate.jsx'
+import AgentAdvisorCard from '../../components/AgentAdvisorCard.jsx'
+import AnalysisToggles, { DEFAULT_VALUES } from '../../components/AnalysisToggles'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -23,9 +26,18 @@ function StatusBadge({ status }) {
   )
 }
 
-function TypeLabel({ mode }) {
-  if (mode === 'rapid') return <span className="text-xs font-medium text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded">HTS Screening</span>
-  if (mode === 'standard' || mode === 'deep') return <span className="text-xs font-medium text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded">Optimization (AI)</span>
+function TypeLabel({ mode, enableGeneration, hasCustomSmiles }) {
+  // Direct optimization mode (auto-created from lead optimization)
+  if (mode === 'optimization') {
+    return <span className="text-xs font-medium text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded">Lead Optimization</span>
+  }
+  // Optimization runs: standard mode with custom SMILES seed
+  if (hasCustomSmiles && (mode === 'standard' || mode === 'deep')) {
+    return <span className="text-xs font-medium text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded">Optimization</span>
+  }
+  if (mode === 'rapid') return <span className="text-xs font-medium text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded">Rapid Screening</span>
+  if (mode === 'standard') return <span className="text-xs font-medium text-teal-700 bg-teal-50 px-1.5 py-0.5 rounded">Standard + ADMET</span>
+  if (mode === 'deep') return <span className="text-xs font-medium text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded">Deep Screening</span>
   return <span className="text-xs text-gray-400">{mode || '—'}</span>
 }
 
@@ -36,21 +48,10 @@ function formatDate(iso) {
   })
 }
 
-const STRATEGY_OPTIONS = [
-  { value: 'rapid',    label: 'Fast',      description: 'Quick HTS screening',      defaultLigands: 50,  maxLigands: 200 },
-  { value: 'standard', label: 'Balanced',  description: 'ADMET + AI generation',    defaultLigands: 100, maxLigands: 500 },
-  { value: 'deep',     label: 'Precise',   description: '5-pass deep screening',    defaultLigands: 500, maxLigands: 5000 },
-]
-
-const ENGINE_OPTIONS = [
-  { value: 'auto', label: 'Auto' },
-  { value: 'vina', label: 'Vina' },
-  { value: 'gnina', label: 'GNINA' },
-]
-
 // Single-source ligand options
 const LIGAND_SOURCE_OPTIONS = [
   { value: 'chembl', label: 'ChEMBL', description: 'Known active compounds from ChEMBL database' },
+  { value: 'pubchem', label: 'PubChem', description: 'Bioactive compounds from NCBI PubChem' },
   { value: 'zinc',   label: 'ZINC',   description: 'Drug-like molecules from ZINC20' },
   { value: 'custom', label: 'Custom SMILES', description: 'Your own molecules (paste SMILES below)' },
 ]
@@ -63,38 +64,85 @@ export default function RunsList() {
   const { project, jobs, loading, error, isTargetConfigured, targetConfig, refresh } = useProject()
   const navigate = useNavigate()
 
-  // New run form state
+  // New run form state — V11 unified pipeline
   const [showForm, setShowForm] = useState(false)
-  const [mode, setMode] = useState('rapid')
-  const [maxLigands, setMaxLigands] = useState(50)
-  const [ligandSource, setLigandSource] = useState('chembl') // single source: 'chembl' | 'zinc' | 'custom'
+  const [maxLigands, setMaxLigands] = useState(20)
+  const [ligandSource, setLigandSource] = useState('chembl')
   const [customSmiles, setCustomSmiles] = useState('')
-  const [engine, setEngine] = useState('auto')
+  const [engine, setEngine] = useState('gnina')
+  const [analyses, setAnalyses] = useState(DEFAULT_VALUES)
+  const [boxSize, setBoxSize] = useState([null, null, null])
+  const [showAdvanced, setShowAdvanced] = useState(false)
   const [creating, setCreating] = useState(false)
   const [createError, setCreateError] = useState(null)
 
   // Active run tracking (inline progress)
   const [activeJobId, setActiveJobId] = useState(null)
 
-  const uniprotId = targetConfig?.uniprot_id || project?.uniprot_id || ''
+  // Agent 2: Run Analysis state
+  const [analysisJobId, setAnalysisJobId] = useState(null)
+  const [analysisResult, setAnalysisResult] = useState(null)
+  const [analysisLoading, setAnalysisLoading] = useState(false)
+
+  const handleRunAnalysis = useCallback(async (jobId) => {
+    if (analysisJobId === jobId) { setAnalysisJobId(null); return }
+    setAnalysisJobId(jobId)
+    setAnalysisLoading(true)
+    setAnalysisResult(null)
+    try {
+      const data = await triggerRunAnalysis(jobId)
+      setAnalysisResult(data)
+    } catch (err) {
+      setAnalysisResult({ available: false, fallback: err?.userMessage || 'Failed' })
+    } finally {
+      setAnalysisLoading(false)
+    }
+  }, [analysisJobId])
+
+  const canCreateRun = !!(project && isTargetConfigured && (targetConfig?.uniprot_id || targetConfig?.sequence))
+
+  // V11: Time estimation params
+  const timeEstimateParams = useMemo(() => ({
+    n_ligands: maxLigands,
+    mode: 'standard',
+    docking_engine: engine,
+    enable_dmpk: Object.values(analyses).every(v => v),
+    enable_generation: false,
+    enable_retrosynthesis: analyses.enable_synthesis,
+    use_chembl: ligandSource === 'chembl',
+    use_pubchem: ligandSource === 'pubchem',
+  }), [maxLigands, engine, analyses, ligandSource])
 
   const handleCreateRun = useCallback(async () => {
-    if (!uniprotId || !project) return
+    if (!canCreateRun) return
     setCreating(true)
     setCreateError(null)
 
     const params = {
-      uniprot_id: uniprotId,
-      mode,
+      mode: 'standard',
       max_ligands: maxLigands,
-      use_chembl: ligandSource === 'chembl',
+      use_chembl: ligandSource === 'chembl' || ligandSource === 'pubchem',
       use_zinc: ligandSource === 'zinc',
+      auto_strategy: ligandSource === 'pubchem' || ligandSource === 'chembl',
       project_id: project.id,
-      docking_engine: engine === 'auto' ? undefined : engine,
+      docking_engine: engine,
+      enable_dmpk: Object.values(analyses).every(v => v),
+      ...analyses,
+      enable_generation: false,
+      enable_retrosynthesis: analyses.enable_synthesis,
+      box_size: boxSize.some(v => v != null && v > 0) ? boxSize.map(v => v || 25) : null,
+      target_config_json: targetConfig ? JSON.stringify(targetConfig) : undefined,
+    }
+
+    // Set uniprot_id or sequence based on target mode
+    if (targetConfig?.uniprot_id) {
+      params.uniprot_id = targetConfig.uniprot_id
+    } else if (targetConfig?.sequence) {
+      params.sequence = targetConfig.sequence
     }
 
     if (ligandSource === 'custom' && customSmiles.trim()) {
-      params.custom_smiles = customSmiles.split('\n').map(s => s.trim()).filter(Boolean)
+      params.smiles_list = customSmiles.split('\n').map(s => s.trim()).filter(Boolean)
     }
 
     try {
@@ -109,7 +157,7 @@ export default function RunsList() {
     } finally {
       setCreating(false)
     }
-  }, [uniprotId, mode, maxLigands, ligandSource, customSmiles, engine, project, refresh])
+  }, [canCreateRun, targetConfig, maxLigands, ligandSource, customSmiles, engine, analyses, boxSize, project, refresh])
 
   const handleRunComplete = useCallback((results) => {
     setActiveJobId(null)
@@ -126,23 +174,33 @@ export default function RunsList() {
   if (!loading && !isTargetConfigured) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
-        <div className="bg-amber-50 border border-amber-200 rounded-xl p-8 max-w-sm text-center">
-          <svg className="w-12 h-12 text-amber-400 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <circle cx="12" cy="12" r="9" strokeWidth={1.8} />
-            <circle cx="12" cy="12" r="5" strokeWidth={1.8} />
-            <circle cx="12" cy="12" r="1.5" fill="currentColor" strokeWidth={0} />
-          </svg>
-          <p className="text-sm font-semibold text-amber-800 mb-2">Target not configured</p>
-          <p className="text-xs text-amber-600 mb-4">
-            You must configure a target protein before running screenings.
-          </p>
+        <div className="text-center max-w-md">
+          <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-amber-50 flex items-center justify-center">
+            <svg className="w-8 h-8 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="9" strokeWidth={1.8} />
+              <circle cx="12" cy="12" r="5" strokeWidth={1.8} />
+              <circle cx="12" cy="12" r="1.5" fill="currentColor" strokeWidth={0} />
+            </svg>
+          </div>
+          <h3 className="text-lg font-bold text-gray-700 mb-2">Target not configured</h3>
+          <p className="text-sm text-gray-400 mb-6">You must configure a target protein before running screenings.</p>
           <Link
-            to="../target"
-            relative="path"
-            className="inline-flex items-center gap-2 px-4 py-2 bg-[#1e3a5f] text-white text-sm font-semibold rounded-lg hover:bg-[#2a4f7c] transition-colors"
+            to={`/project/${project.id}/target`}
+            className="inline-flex items-center gap-2 px-5 py-2.5 bg-[#22c55e] text-white font-semibold rounded-xl hover:bg-[#16a34a] transition-colors"
           >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="9" strokeWidth={2} />
+              <circle cx="12" cy="12" r="5" strokeWidth={2} />
+            </svg>
             Go to Target Setup
           </Link>
+          <div className="mt-8 flex items-center gap-3 text-xs text-gray-300 justify-center">
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-[#22c55e]"></span> 1. Setup target</span>
+            <span className="w-4 h-px bg-gray-200"></span>
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-gray-200"></span> 2. Run screening</span>
+            <span className="w-4 h-px bg-gray-200"></span>
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-gray-200"></span> 3. View results</span>
+          </div>
         </div>
       </div>
     )
@@ -172,7 +230,7 @@ export default function RunsList() {
         <div>
           <h1 className="text-2xl font-bold text-[#1e3a5f]">Runs</h1>
           <p className="text-sm text-gray-400 mt-1">
-            {sortedJobs.length} run{sortedJobs.length !== 1 ? 's' : ''} for {uniprotId}
+            {sortedJobs.length} run{sortedJobs.length !== 1 ? 's' : ''} for {targetConfig?.uniprot_id || targetConfig?.protein_name || 'this target'}
           </p>
         </div>
         <button
@@ -209,39 +267,44 @@ export default function RunsList() {
           <div>
             <label className="block text-xs font-medium text-gray-500 mb-1">Target</label>
             <div className="flex items-center gap-2 px-3 py-2 bg-gray-50 rounded-lg border border-gray-200">
-              <span className="text-sm font-mono font-semibold text-[#1e3a5f]">{uniprotId}</span>
+              <span className="text-sm font-mono font-semibold text-[#1e3a5f]">
+                {targetConfig?.uniprot_id || `Sequence (${targetConfig?.sequence?.length || 0} aa)`}
+              </span>
               {targetConfig?.protein_name && (
                 <span className="text-xs text-gray-400">{targetConfig.protein_name}</span>
               )}
             </div>
           </div>
 
-          {/* Strategy */}
+          {/* Compounds count */}
           <div>
-            <label className="block text-xs font-medium text-gray-500 mb-2">Strategy</label>
-            <div className="grid grid-cols-3 gap-2">
-              {STRATEGY_OPTIONS.map((opt) => (
-                <button
-                  key={opt.value}
-                  type="button"
-                  onClick={() => {
-                    setMode(opt.value)
-                    setMaxLigands(opt.defaultLigands)
-                  }}
-                  className={`p-3 rounded-xl border-2 text-left transition-all ${
-                    mode === opt.value
-                      ? 'border-[#1e3a5f] bg-blue-50/50 shadow-sm'
-                      : 'border-gray-200 hover:border-gray-300'
-                  }`}
-                >
-                  <p className="text-sm font-semibold text-gray-800">{opt.label}</p>
-                  <p className="text-xs text-gray-400 mt-0.5">{opt.description}</p>
-                </button>
-              ))}
+            <label className="block text-xs font-medium text-gray-500 mb-1">
+              Compounds to screen: <span className="font-bold text-[#1e3a5f]">{maxLigands}</span>
+            </label>
+            <div className="flex items-center gap-3">
+              <input
+                type="range"
+                min={5}
+                max={500}
+                value={maxLigands}
+                onChange={(e) => setMaxLigands(Number(e.target.value))}
+                className="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-[#1e3a5f]"
+              />
+              <input
+                type="number"
+                min={5}
+                max={5000}
+                value={maxLigands}
+                onChange={(e) => setMaxLigands(Number(e.target.value))}
+                className="w-20 px-2 py-1 text-sm border rounded text-center"
+              />
             </div>
+            {maxLigands > 200 && (
+              <p className="text-xs text-amber-500 mt-1">Large library — will use extended screening (up to 4h)</p>
+            )}
           </div>
 
-          {/* Ligand Source — single selection */}
+          {/* Ligand Source */}
           <div>
             <label className="block text-xs font-medium text-gray-500 mb-2">Ligand Source</label>
             <div className="space-y-2">
@@ -278,8 +341,6 @@ export default function RunsList() {
                 </label>
               ))}
             </div>
-
-            {/* Custom SMILES — only shown when 'custom' selected */}
             {ligandSource === 'custom' && (
               <div className="mt-3">
                 <label className="text-xs font-medium text-gray-500">SMILES (one per line)</label>
@@ -294,46 +355,87 @@ export default function RunsList() {
             )}
           </div>
 
-          {/* Max ligands — range adaptatif selon strategy */}
-          <div>
-            <label className="block text-xs font-medium text-gray-500 mb-1">
-              Max Ligands: <span className="font-bold text-[#1e3a5f]">{maxLigands}</span>
-            </label>
-            <input
-              type="range"
-              min={5}
-              max={STRATEGY_OPTIONS.find(o => o.value === mode)?.maxLigands || 200}
-              step={mode === 'deep' ? 50 : 5}
-              value={maxLigands}
-              onChange={(e) => setMaxLigands(parseInt(e.target.value))}
-              className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-[#22c55e]"
-            />
-            <div className="flex justify-between text-xs text-gray-300 mt-1">
-              <span>5</span>
-              <span>{STRATEGY_OPTIONS.find(o => o.value === mode)?.maxLigands || 200}</span>
-            </div>
-          </div>
-
           {/* Docking engine */}
           <div>
             <label className="block text-xs font-medium text-gray-500 mb-2">Docking Engine</label>
-            <div className="flex gap-2">
-              {ENGINE_OPTIONS.map((opt) => (
-                <button
-                  key={opt.value}
-                  type="button"
-                  onClick={() => setEngine(opt.value)}
-                  className={`px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors ${
-                    engine === opt.value
-                      ? 'border-[#1e3a5f] bg-[#1e3a5f] text-white'
-                      : 'border-gray-200 text-gray-600 hover:border-gray-300'
-                  }`}
-                >
-                  {opt.label}
-                </button>
-              ))}
+            <div className="space-y-2">
+              <label className={`flex items-start gap-3 p-3 rounded-lg border-2 cursor-pointer transition-all ${
+                engine === 'gnina_gpu' ? 'border-green-500 bg-green-50/40' : 'border-gray-200 hover:border-gray-300'
+              }`}>
+                <input type="radio" name="engine" value="gnina_gpu" checked={engine === 'gnina_gpu'}
+                  onChange={() => setEngine('gnina_gpu')} className="mt-0.5 accent-[#22c55e]" />
+                <div>
+                  <span className="text-sm font-medium text-green-700">GNINA GPU</span>
+                  <span className="ml-1.5 text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700 font-medium">Cloud</span>
+                  <p className="text-xs text-gray-400">Cloud GPU — 10x faster, ~0.03 USD/run</p>
+                </div>
+              </label>
+              <label className={`flex items-start gap-3 p-3 rounded-lg border-2 cursor-pointer transition-all ${
+                engine === 'gnina' ? 'border-[#1e3a5f] bg-blue-50/40' : 'border-gray-200 hover:border-gray-300'
+              }`}>
+                <input type="radio" name="engine" value="gnina" checked={engine === 'gnina'}
+                  onChange={() => setEngine('gnina')} className="mt-0.5 accent-[#1e3a5f]" />
+                <div>
+                  <span className="text-sm font-medium text-gray-800">GNINA</span>
+                  <p className="text-xs text-gray-400">CNN-scored (~15s/mol) — Local CPU</p>
+                </div>
+              </label>
+              <label className={`flex items-start gap-3 p-3 rounded-lg border-2 cursor-pointer transition-all ${
+                engine === 'vina' ? 'border-[#1e3a5f] bg-blue-50/40' : 'border-gray-200 hover:border-gray-300'
+              }`}>
+                <input type="radio" name="engine" value="vina" checked={engine === 'vina'}
+                  onChange={() => setEngine('vina')} className="mt-0.5 accent-[#1e3a5f]" />
+                <div>
+                  <span className="text-sm font-medium text-gray-800">Vina</span>
+                  <p className="text-xs text-gray-400">Fast (~2s/mol) — Recommended for large libraries</p>
+                </div>
+              </label>
             </div>
           </div>
+
+          {/* Analysis Toggles */}
+          <div>
+            <label className="block text-xs font-medium text-gray-500 mb-2">Analyses</label>
+            <AnalysisToggles values={analyses} onChange={setAnalyses} />
+            <div className="mt-3">
+              <button
+                type="button"
+                onClick={() => setShowAdvanced(!showAdvanced)}
+                className="text-xs text-gray-400 hover:text-[#1e3a5f] transition-colors"
+              >
+                {showAdvanced ? '▼' : '▶'} Advanced settings
+              </button>
+              {showAdvanced && (
+                <div className="mt-2 p-3 bg-gray-50 rounded-lg space-y-2">
+                  <label className="block text-xs font-medium text-gray-600">Docking box size (auto if empty)</label>
+                  <div className="flex gap-2">
+                    {['X', 'Y', 'Z'].map((axis, i) => (
+                      <div key={axis} className="flex-1">
+                        <label className="text-[10px] text-gray-400">{axis} (A)</label>
+                        <input
+                          type="number"
+                          min="5"
+                          max="100"
+                          step="1"
+                          placeholder="auto"
+                          value={boxSize[i] || ''}
+                          onChange={e => {
+                            const v = [...boxSize]
+                            v[i] = e.target.value ? Number(e.target.value) : null
+                            setBoxSize(v)
+                          }}
+                          className="w-full px-2 py-1 text-sm border rounded"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* V9: Time Estimate */}
+          {showForm && <TimeEstimate params={timeEstimateParams} />}
 
           {/* Error */}
           {createError && (
@@ -346,7 +448,7 @@ export default function RunsList() {
           <div className="flex items-center gap-3">
             <button
               onClick={handleCreateRun}
-              disabled={creating || (ligandSource === 'custom' && !customSmiles.trim())}
+              disabled={creating || !canCreateRun || (ligandSource === 'custom' && !customSmiles.trim())}
               className="flex items-center gap-2 px-6 py-3 bg-[#22c55e] hover:bg-[#16a34a] disabled:bg-gray-300 text-white font-bold rounded-xl shadow transition-colors text-sm"
             >
               {creating ? (
@@ -395,7 +497,8 @@ export default function RunsList() {
               {sortedJobs.map((row) => {
                 const rowId = row.id || row.job_id
                 return (
-                  <tr key={rowId} className="border-b border-gray-50 last:border-0 hover:bg-gray-50 transition-colors">
+                  <React.Fragment key={rowId}>
+                  <tr className="border-b border-gray-50 last:border-0 hover:bg-gray-50 transition-colors">
                     <td className="py-3.5 px-4">
                       <StatusBadge status={row.status} />
                     </td>
@@ -405,7 +508,7 @@ export default function RunsList() {
                       </span>
                     </td>
                     <td className="py-3.5 px-4 hidden sm:table-cell">
-                      <TypeLabel mode={row.mode} />
+                      <TypeLabel mode={row.mode} enableGeneration={row.enable_generation} hasCustomSmiles={row.has_custom_smiles} />
                     </td>
                     <td className="py-3.5 px-4 hidden md:table-cell">
                       <span className="text-xs text-gray-500 capitalize">{row.mode || '—'}</span>
@@ -414,26 +517,72 @@ export default function RunsList() {
                       <span className="text-xs text-gray-400">{formatDate(row.created_at)}</span>
                     </td>
                     <td className="py-3.5 px-4 text-right">
-                      {row.status === 'completed' ? (
-                        <Link
-                          to={`../results?run=${rowId}`}
-                          relative="path"
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#22c55e] bg-green-50 border border-green-200 rounded-lg hover:bg-green-100 transition-colors"
-                        >
-                          Results
-                          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                          </svg>
-                        </Link>
-                      ) : row.status === 'running' ? (
-                        <span className="text-xs text-blue-600 font-medium">
-                          {row.progress || 0}%
-                        </span>
-                      ) : (
-                        <span className="text-xs text-gray-400">{row.status}</span>
-                      )}
+                      <div className="flex items-center justify-end gap-2">
+                        {row.status === 'completed' && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); handleRunAnalysis(rowId) }}
+                            className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-lg transition-colors border ${
+                              analysisJobId === rowId
+                                ? 'text-emerald-700 bg-emerald-50 border-emerald-200'
+                                : 'text-gray-500 bg-white border-gray-200 hover:border-emerald-300 hover:text-emerald-600'
+                            }`}
+                          >
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                                d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                            </svg>
+                            AI
+                          </button>
+                        )}
+                        {row.status === 'completed' ? (
+                          <Link
+                            to={`../results?run=${rowId}`}
+                            relative="path"
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#22c55e] bg-green-50 border border-green-200 rounded-lg hover:bg-green-100 transition-colors"
+                          >
+                            Results
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                            </svg>
+                          </Link>
+                        ) : row.status === 'running' ? (
+                          <span className="text-xs text-blue-600 font-medium">
+                            {row.progress || 0}%
+                          </span>
+                        ) : row.status === 'failed' ? (
+                          <span className="text-xs text-red-500 max-w-[200px] truncate block" title={row.error_message || 'Failed'}>
+                            {row.error_message ? row.error_message.replace(/^RuntimeError:\s*/, '') : 'Failed'}
+                          </span>
+                        ) : (
+                          <span className="text-xs text-gray-400">{row.status}</span>
+                        )}
+                      </div>
                     </td>
                   </tr>
+                  {/* Agent 2: Run Analysis expandable section */}
+                  {analysisJobId === rowId && (
+                    <tr>
+                      <td colSpan="6" className="px-4 py-3 bg-emerald-50/30">
+                        {analysisLoading ? (
+                          <div className="flex items-center gap-2 py-2 text-sm text-emerald-600">
+                            <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                            </svg>
+                            Analyzing run results...
+                          </div>
+                        ) : analysisResult ? (
+                          <AgentAdvisorCard
+                            agentName="run_analysis"
+                            context={{}}
+                            result={analysisResult}
+                            projectId={project?.id}
+                          />
+                        ) : null}
+                      </td>
+                    </tr>
+                  )}
+                  </React.Fragment>
                 )
               })}
             </tbody>

@@ -252,14 +252,15 @@ def compute_composite_score(
 ) -> float:
     """Compute a weighted composite docking score.
 
-    Higher is better.
+    Higher is better.  Docking affinity is the dominant term so that
+    known target-specific binders rank above generic druglike molecules.
 
     Formula
     -------
-    ``0.5 * norm_affinity + 0.3 * qed + 0.2 * logp_penalty``
+    ``0.65 * norm_affinity + 0.20 * qed + 0.15 * logp_penalty``
 
-    - ``norm_affinity``: ``min(-12, affinity) / -12`` clamped to [0, 1].
-    - ``logp_penalty``: 1.0 if 0 < logP < 5, else 0.5.
+    - ``norm_affinity``: ``min(-14, affinity) / -14`` clamped to [0, 1].
+    - ``logp_penalty``: Gaussian-like centered at 2.5 (sigma 2.5).
 
     Parameters
     ----------
@@ -275,20 +276,22 @@ def compute_composite_score(
     float
         Composite score in approximately [0, 1].
     """
-    # Normalise affinity: cap at -12 kcal/mol, map to [0, 1]
-    capped = min(-12.0, affinity) if affinity < 0 else affinity
-    norm_affinity = max(0.0, min(1.0, capped / -12.0))
+    import math
+
+    # Normalise affinity: cap at -14 kcal/mol, map to [0, 1]
+    capped = min(-14.0, affinity) if affinity < 0 else affinity
+    norm_affinity = max(0.0, min(1.0, capped / -14.0))
 
     # QED (default 0.5 if unknown)
     qed_val = qed if qed is not None else 0.5
 
-    # LogP penalty
-    if logp is not None and 0.0 < logp < 5.0:
-        logp_penalty = 1.0
+    # Continuous logP penalty: Gaussian centered at 2.5, sigma=2.5
+    if logp is not None:
+        logp_penalty = math.exp(-0.5 * ((logp - 2.5) / 2.5) ** 2)
     else:
         logp_penalty = 0.5
 
-    score = 0.5 * norm_affinity + 0.3 * qed_val + 0.2 * logp_penalty
+    score = 0.65 * norm_affinity + 0.20 * qed_val + 0.15 * logp_penalty
     return round(score, 4)
 
 
@@ -304,7 +307,9 @@ def compute_composite_score_v2(
 ) -> float:
     """Compute the V2 weighted composite score.
 
-    Formula: vina * 0.4 + admet * 0.3 + drug_likeness * 0.2 + novelty * 0.1
+    Formula: vina * 0.55 + admet * 0.20 + drug_likeness * 0.15 + novelty * 0.10
+
+    Docking affinity is the dominant term.
 
     Parameters
     ----------
@@ -322,14 +327,14 @@ def compute_composite_score_v2(
     float
         Composite V2 score in [0, 1].
     """
-    capped = min(-12.0, affinity) if affinity < 0 else affinity
-    norm_affinity = max(0.0, min(1.0, capped / -12.0))
+    capped = min(-14.0, affinity) if affinity < 0 else affinity
+    norm_affinity = max(0.0, min(1.0, capped / -14.0))
 
     admet_val = admet_score if admet_score is not None else 0.5
     qed_val = qed if qed is not None else 0.5
     novelty_val = novelty if novelty is not None else 0.0
 
-    score = 0.4 * norm_affinity + 0.3 * admet_val + 0.2 * qed_val + 0.1 * novelty_val
+    score = 0.55 * norm_affinity + 0.20 * admet_val + 0.15 * qed_val + 0.10 * novelty_val
     return round(score, 4)
 
 
@@ -548,7 +553,7 @@ def apply_hard_cutoffs(molecules: list[dict]) -> tuple[list[dict], list[dict]]:
                 violations += 1
             if hba > 10:
                 violations += 1
-            if violations > 1:
+            if violations > 2:
                 reason = f"Lipinski violations ({violations})"
 
         # QED
