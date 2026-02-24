@@ -53,6 +53,122 @@ def _check_vina() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Initial ligand placement (standard docking preprocessing)
+# ---------------------------------------------------------------------------
+
+def _place_ligand_at_box_center(ligand_path: str, center: list[float]) -> str:
+    """Place initial ligand conformer at the search box center.
+
+    Standard docking preprocessing: GNINA/Vina require the initial ligand
+    pose to be within the search space for the stochastic search to converge.
+    RDKit-generated conformers are centered at the origin (0,0,0), which may
+    be far from the binding pocket.
+
+    This translates the ligand centroid to the box center as a starting
+    point for docking. The OUTPUT coordinates from the docking engine are
+    the final binding pose and are never modified.
+
+    Parameters
+    ----------
+    ligand_path : str
+        Path to the input ligand (SDF or PDBQT).
+    center : list[float]
+        [x, y, z] centre of the docking search box.
+
+    Returns
+    -------
+    str
+        Path to the placed ligand file (same format as input).
+    """
+    try:
+        path = Path(ligand_path)
+
+        if path.suffix.lower() in ('.sdf', '.mol'):
+            return _place_sdf_at_center(ligand_path, center)
+        elif path.suffix.lower() == '.pdbqt':
+            return _place_pdbqt_at_center(ligand_path, center)
+        else:
+            return ligand_path
+
+    except Exception as exc:
+        logger.debug("Ligand placement failed for %s: %s", ligand_path, exc)
+        return ligand_path
+
+
+def _place_sdf_at_center(sdf_path: str, center: list[float]) -> str:
+    """Place SDF ligand at box center using RDKit."""
+    from rdkit import Chem
+    from rdkit.Geometry import Point3D
+    import numpy as np
+
+    suppl = Chem.SDMolSupplier(sdf_path, removeHs=False)
+    mol = next(iter(suppl), None)
+    if mol is None or mol.GetNumConformers() == 0:
+        return sdf_path
+
+    conf = mol.GetConformer()
+    n = mol.GetNumAtoms()
+    coords = np.array([[conf.GetAtomPosition(i).x,
+                         conf.GetAtomPosition(i).y,
+                         conf.GetAtomPosition(i).z] for i in range(n)])
+
+    centroid = coords.mean(axis=0)
+    shift = np.array(center) - centroid
+
+    if np.linalg.norm(shift) < 3.0:
+        return sdf_path  # Already at center
+
+    for i in range(n):
+        new = coords[i] + shift
+        conf.SetAtomPosition(i, Point3D(float(new[0]), float(new[1]), float(new[2])))
+
+    out_path = str(Path(sdf_path).with_suffix(".placed.sdf"))
+    writer = Chem.SDWriter(out_path)
+    writer.write(mol)
+    writer.close()
+    return out_path
+
+
+def _place_pdbqt_at_center(pdbqt_path: str, center: list[float]) -> str:
+    """Place PDBQT ligand at box center by shifting ATOM coordinates."""
+    import numpy as np
+
+    path = Path(pdbqt_path)
+    lines = path.read_text().split("\n")
+
+    coords, atom_indices = [], []
+    for i, line in enumerate(lines):
+        if line.startswith(("ATOM", "HETATM")) and len(line) >= 54:
+            try:
+                coords.append([float(line[30:38]), float(line[38:46]), float(line[46:54])])
+                atom_indices.append(i)
+            except ValueError:
+                continue
+
+    if not coords:
+        return pdbqt_path
+
+    coords = np.array(coords)
+    centroid = coords.mean(axis=0)
+    shift = np.array(center) - centroid
+
+    if np.linalg.norm(shift) < 3.0:
+        return pdbqt_path
+
+    new_lines = list(lines)
+    for idx, line_i in enumerate(atom_indices):
+        line = lines[line_i]
+        new_c = coords[idx] + shift
+        new_lines[line_i] = (
+            line[:30] + f"{new_c[0]:8.3f}{new_c[1]:8.3f}{new_c[2]:8.3f}" + line[54:]
+        )
+
+    out_path = str(path.with_suffix(".placed.pdbqt"))
+    Path(out_path).write_text("\n".join(new_lines))
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # GNINA docking (V5bis)
 # ---------------------------------------------------------------------------
 
@@ -99,10 +215,16 @@ def dock_gnina(
 
     output_sdf = str(Path(ligand_sdf).with_suffix(".docked.sdf"))
 
+    # Standard docking preprocessing: place initial ligand conformer at the
+    # search box center. GNINA/Vina require the starting pose to be within
+    # the search space. This is standard practice per GNINA documentation.
+    # The OUTPUT pose coordinates from the docking engine are used as-is.
+    actual_ligand = _place_ligand_at_box_center(ligand_sdf, center)
+
     cmd = [
         gnina_bin,
         "--receptor", receptor_pdb,
-        "--ligand", ligand_sdf,
+        "--ligand", actual_ligand,
         "--center_x", str(center[0]),
         "--center_y", str(center[1]),
         "--center_z", str(center[2]),
@@ -151,11 +273,16 @@ def dock_gnina(
 def _parse_gnina_output(stdout: str, output_sdf: str) -> list[dict]:
     """Parse GNINA stdout and output SDF for scores.
 
-    GNINA stdout format (per mode):
-        mode |   affinity   |  CNN score  | CNN affinity
-        -----+--------------+-------------+-----------
-          1       -8.3          0.82           7.1
-          2       -7.9          0.75           6.8
+    GNINA v1.1 with ``--cnn_scoring rescore`` outputs 5 columns:
+        mode |  affinity  |  intramol  |    CNN     |   CNN
+             | (kcal/mol) | (kcal/mol) | pose score | affinity
+        -----+------------+------------+------------+----------
+          1       -8.3         -0.32       0.82        7.1
+
+    Without rescore, outputs 4 columns (no intramol):
+        mode |  affinity  |    CNN     |   CNN
+             | (kcal/mol) | pose score | affinity
+          1       -8.3        0.82        7.1
 
     Parameters
     ----------
@@ -171,25 +298,47 @@ def _parse_gnina_output(stdout: str, output_sdf: str) -> list[dict]:
     """
     poses: list[dict] = []
 
+    # Detect whether output has 5 columns (with intramol) or 4 columns
+    has_intramol = "intramol" in stdout
+
     # Parse table from stdout
     for line in stdout.split("\n"):
         line = line.strip()
-        # Match lines like: "  1     -8.3      0.82      7.1"
-        match = re.match(
-            r"^\s*(\d+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)", line
-        )
-        if match:
-            mode = int(match.group(1))
-            vina_score = float(match.group(2))
-            cnn_score = float(match.group(3))
-            cnn_affinity = float(match.group(4))
-            poses.append({
-                "mode": mode,
-                "vina_score": vina_score,
-                "cnn_score": cnn_score,
-                "cnn_affinity": cnn_affinity,
-                "pose_path": output_sdf if Path(output_sdf).exists() else None,
-            })
+        if has_intramol:
+            # 5-column format: mode, affinity, intramol, CNN score, CNN affinity
+            match = re.match(
+                r"^\s*(\d+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)", line
+            )
+            if match:
+                mode = int(match.group(1))
+                vina_score = float(match.group(2))
+                # group(3) is intramol energy -- skip
+                cnn_score = float(match.group(4))
+                cnn_affinity = float(match.group(5))
+                poses.append({
+                    "mode": mode,
+                    "vina_score": vina_score,
+                    "cnn_score": cnn_score,
+                    "cnn_affinity": cnn_affinity,
+                    "pose_path": output_sdf if Path(output_sdf).exists() else None,
+                })
+        else:
+            # 4-column format: mode, affinity, CNN score, CNN affinity
+            match = re.match(
+                r"^\s*(\d+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)", line
+            )
+            if match:
+                mode = int(match.group(1))
+                vina_score = float(match.group(2))
+                cnn_score = float(match.group(3))
+                cnn_affinity = float(match.group(4))
+                poses.append({
+                    "mode": mode,
+                    "vina_score": vina_score,
+                    "cnn_score": cnn_score,
+                    "cnn_affinity": cnn_affinity,
+                    "pose_path": output_sdf if Path(output_sdf).exists() else None,
+                })
 
     return poses
 
@@ -314,11 +463,23 @@ def _try_gnina_single(
     size: tuple[float, float, float],
     exhaustiveness: int,
 ) -> Optional[dict]:
-    """Attempt GNINA docking for a single ligand, return result dict or None."""
+    """Attempt GNINA docking for a single ligand, return result dict or None.
+
+    GNINA accepts both SDF and PDBQT input. SDF is preferred because
+    PDBQT torsion trees from Meeko/obabel can cause "ligand outside box"
+    errors even when coordinates are correct. SDF avoids this issue.
+    """
     try:
-        # GNINA can accept PDBQT files as well
+        # Prefer SDF input: GNINA handles SDF natively and avoids PDBQT
+        # torsion tree issues that cause "ligand outside box" errors.
+        ligand_input = str(ligand_pdbqt)
+        sdf_sibling = ligand_pdbqt.with_suffix(".sdf")
+        if sdf_sibling.exists() and sdf_sibling.stat().st_size > 50:
+            ligand_input = str(sdf_sibling)
+            logger.debug("Using SDF input for GNINA: %s", sdf_sibling.name)
+
         poses = dock_gnina(
-            ligand_sdf=str(ligand_pdbqt),
+            ligand_sdf=ligand_input,
             receptor_pdb=str(receptor_pdbqt),
             center=list(center),
             size=list(size),
@@ -326,17 +487,31 @@ def _try_gnina_single(
         )
         if poses and len(poses) > 0:
             best = poses[0]
-            pose_path = ligand_pdbqt.parent / f"{ligand_pdbqt.stem}_out.pdbqt"
-            # Copy output if available
+
+            # Sanity check: positive Vina score = repulsive interaction = failed docking
+            if best["vina_score"] > 0:
+                logger.warning(
+                    "GNINA returned positive Vina score (%.2f) for %s — "
+                    "rejecting (likely steric clash or bad receptor prep)",
+                    best["vina_score"], ligand_pdbqt.name,
+                )
+                return None
+
+            # GNINA outputs docked poses as SDF — use directly for 3D viewing
+            pose_sdf = ligand_pdbqt.parent / f"{ligand_pdbqt.stem}.docked.sdf"
+            pose_path = pose_sdf  # Prefer SDF for 3D rendering
             if best.get("pose_path") and Path(best["pose_path"]).exists():
                 try:
-                    shutil.copy2(best["pose_path"], pose_path)
-                    _extract_first_model_sdf(pose_path)
+                    # Keep only first model from multi-model SDF
+                    src = Path(best["pose_path"])
+                    if src != pose_sdf:
+                        shutil.copy2(src, pose_sdf)
+                    _extract_first_model_sdf(pose_sdf)
+                    pose_path = pose_sdf
                 except Exception:
                     pass
 
-            # Clamp CNN score to valid [0, 1] range (GNINA may produce
-            # out-of-range values when input format is suboptimal)
+            # Clamp CNN score to valid [0, 1] range
             raw_cnn = best.get("cnn_score", 0.0) or 0.0
             clamped_cnn = max(0.0, min(1.0, raw_cnn))
             return {
@@ -479,19 +654,22 @@ def _parse_vina_affinity_from_pdbqt(pdbqt_path: Path) -> Optional[float]:
 # Mock docking with 3-score system (V5bis)
 # ---------------------------------------------------------------------------
 
-def _run_mock_docking(ligand_pdbqt: Path) -> dict:
+def _run_mock_docking(ligand_pdbqt: Path, center: tuple = None) -> dict:
     """Generate a mock docking result with 3 GNINA-style scores.
 
     Uses deterministic hash-based generation so repeated runs produce
     the same results for the same input.
 
-    Mock docking does NOT produce a valid 3D pose — the pose file is
-    not generated because coordinates would be scientifically meaningless.
+    Mock docking does NOT produce a valid 3D pose — no pose file is
+    generated because coordinates would be scientifically meaningless.
+    Frontend shows 2D structure only when pose_pdbqt_path is None.
 
     Parameters
     ----------
     ligand_pdbqt : Path
         Ligand file used for hash-based score generation.
+    center : tuple, optional
+        Ignored (kept for API compat).
 
     Returns
     -------

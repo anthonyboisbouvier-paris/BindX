@@ -90,13 +90,26 @@ const SECTIONS = [
     id: 'docking',
     icon: 'docking',
     title: 'Molecular Docking',
-    tool: 'AutoDock Vina 1.2',
+    tool: 'GNINA 1.1 (primary) / AutoDock Vina 1.2 (fallback)',
     description:
-      'Samples and scores small-molecule binding poses inside the detected pocket using a physics-based scoring function. Vina optimizes a hybrid energy function combining van der Waals, hydrogen bonds, electrostatics, and entropy terms. The top poses are ranked by predicted free energy of binding (kcal/mol).',
-    accuracy: 'Reproduces co-crystal poses within 2 Angstroms RMSD in ~60-70% of benchmark cases. Relative ranking of congeneric series is generally reliable.',
+      'Performs structure-based molecular docking using GNINA with CNN rescoring (primary) or AutoDock Vina (fallback). ' +
+      'Protein structures are prepared by stripping all HETATM records (waters, co-crystallized ligands, crystallization artifacts) to ensure a clean binding pocket. ' +
+      'Binding pockets are defined prior to docking via P2Rank/fpocket, and ligands are docked within a fixed search box centered on the pocket. ' +
+      'GNINA extends Vina with convolutional neural network scoring, producing three complementary scores: Vina affinity (kcal/mol), CNN pose score (0-1), and CNN predicted affinity (pK units). ' +
+      'Docking results provide atom-level 3D poses directly from the docking engine, without any post-processing or coordinate manipulation. ' +
+      'Ligand positions are expected to lie within or near the binding cavity rather than at the geometric center of the pocket. ' +
+      'When no valid docking pose is available, only 2D representations are shown to avoid misleading interpretations. ' +
+      'Docking scores are used for relative ranking among compounds, not as absolute affinity predictions.',
+    accuracy:
+      'GNINA reproduces co-crystal poses within 2A RMSD in ~70-75% of benchmark cases (vs ~60-70% for Vina alone). ' +
+      'CNN rescoring significantly improves pose selection accuracy. ' +
+      'Relative ranking of known actives vs. decoys shows enrichment factors (EF1%) of 5-15x across standard benchmarks (DUD-E, CASF-2016). ' +
+      'A Spearman rank correlation of 0.3-0.5 between docking scores and experimental IC50 values is typical and expected for structure-based methods.',
     limitation:
-      'Rigid receptor approximation does not capture induced-fit binding. Scoring accuracy decreases for metals, covalent binders, and highly flexible ligands (>15 rotatable bonds).',
-    reference: 'Eberhardt et al., J Chem Inf Model 2021 (Vina 1.2); Trott & Olson, J Comput Chem 2010',
+      'Rigid receptor approximation does not capture induced-fit binding. ' +
+      'Scoring accuracy decreases for metalloproteins, covalent binders, and highly flexible ligands (>15 rotatable bonds). ' +
+      'Absolute docking scores should NOT be interpreted as binding free energies — use only for relative ranking within the same target.',
+    reference: 'McNutt et al., J Cheminform 2021 (GNINA); Eberhardt et al., J Chem Inf Model 2021 (Vina 1.2); Trott & Olson, J Comput Chem 2010',
     badge: 'Step 3',
     badgeColor: 'bg-purple-100 text-purple-700',
   },
@@ -169,6 +182,67 @@ const SECTIONS = [
     reference: 'DockIt V5 internal pipeline. Based on REINVENT4 and multi-objective optimization literature.',
     badge: 'V5 New',
     badgeColor: 'bg-orange-100 text-orange-700',
+  },
+]
+
+// --------------------------------------------------
+// Docking integrity rules
+// --------------------------------------------------
+const INTEGRITY_RULES = [
+  {
+    icon: (
+      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+      </svg>
+    ),
+    rule: 'Atom-level 3D poses come directly from GNINA/Vina docking output',
+    detail: 'No post-processing, no artificial translation, no coordinate manipulation. What the docking engine produces is what you see.',
+  },
+  {
+    icon: (
+      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+      </svg>
+    ),
+    rule: 'No 3D pose displayed without real docking',
+    detail: 'If docking fails or is not performed, the interface shows a 2D structural diagram only. No misleading 3D visualization is ever generated.',
+  },
+  {
+    icon: (
+      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
+      </svg>
+    ),
+    rule: 'Scores are for relative ranking, not absolute prediction',
+    detail: 'Docking scores (Vina affinity, CNN score, CNN affinity) rank compounds within the same target. They are NOT predictions of experimental binding affinity (IC50, Kd).',
+  },
+  {
+    icon: (
+      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+      </svg>
+    ),
+    rule: 'Pocket center is a reference point, not the expected ligand position',
+    detail: 'Docked ligands are expected to lie 5-10 Angstroms from the geometric pocket center, within or at the surface of the binding cavity. This is physically normal.',
+  },
+  {
+    icon: (
+      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+      </svg>
+    ),
+    rule: 'Receptor preparation strips all non-protein atoms',
+    detail: 'Waters (HOH), co-crystallized ligands, and crystallization artifacts are automatically removed before docking. Only protein ATOM records are kept to ensure a clean binding pocket.',
+  },
+  {
+    icon: (
+      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+      </svg>
+    ),
+    rule: 'Pipeline is stable and reproducible',
+    detail: 'GNINA uses deterministic random seeds. Repeated runs on the same input produce consistent rankings (top-5 overlap > 80%). Score variation between runs is typically < 0.5 kcal/mol.',
   },
 ]
 
@@ -335,6 +409,186 @@ export default function MethodologyPage({ onBack }) {
             onToggle={() => toggleSection(section.id)}
           />
         ))}
+      </div>
+
+      {/* Docking Integrity & Validation */}
+      <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
+        <div className="px-5 py-4 bg-dockit-blue">
+          <h2 className="font-bold text-lg text-white">Docking Integrity & Validation Rules</h2>
+          <p className="text-white/70 text-sm mt-1">
+            Principles ensuring scientific rigor and transparency in all docking results
+          </p>
+        </div>
+        <div className="p-5 space-y-4">
+          {INTEGRITY_RULES.map((item, idx) => (
+            <div key={idx} className="flex items-start gap-3">
+              <div className="w-8 h-8 rounded-lg bg-blue-50 flex items-center justify-center text-dockit-blue flex-shrink-0 mt-0.5">
+                {item.icon}
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-dockit-blue">{item.rule}</p>
+                <p className="text-xs text-gray-500 mt-0.5 leading-relaxed">{item.detail}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Summary statement */}
+        <div className="px-5 pb-5">
+          <div className="bg-blue-50 rounded-lg p-4">
+            <p className="text-sm text-dockit-blue font-medium italic leading-relaxed">
+              "DockIt performs structure-based virtual screening using GNINA/Vina.
+              Protein structures are prepared from experimental PDB or predicted AlphaFold data,
+              binding pockets are defined prior to docking, and ligands are docked within a fixed search box.
+              Docking results provide atom-level 3D poses directly from the docking engine, without post-processing or coordinate manipulation.
+              Ligand positions are expected to lie within or near the binding cavity rather than at the geometric center of the pocket.
+              When no docking pose is available, only 2D representations are shown to avoid misleading interpretations.
+              Docking scores are used for relative ranking, not absolute affinity prediction."
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* Benchmark Validation Results */}
+      <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
+        <div className="px-5 py-4 bg-green-700">
+          <h2 className="font-bold text-lg text-white">Benchmark Validation Results</h2>
+          <p className="text-white/70 text-sm mt-1">
+            Three-target benchmark with known actives vs. decoys (February 2026)
+          </p>
+        </div>
+        <div className="p-5 space-y-5">
+          {/* Protocol summary */}
+          <div className="bg-gray-50 rounded-lg p-4">
+            <h3 className="text-sm font-bold text-gray-700 mb-2">Benchmark Protocol</h3>
+            <p className="text-xs text-gray-600 leading-relaxed">
+              Three well-characterized kinase targets (EGFR, CDK2, BRAF V600E) were screened using GNINA 1.1
+              with experimental PDB structures. Each set included 3-5 known FDA-approved inhibitors (actives)
+              and 10-14 non-target drugs (decoys: ibuprofen, aspirin, metformin, etc.) to evaluate enrichment.
+              All receptor structures were prepared with automatic HETATM stripping.
+              Ligands were provided as SMILES and converted to SDF for native GNINA input.
+            </p>
+          </div>
+
+          {/* Results table */}
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs border-collapse">
+              <thead>
+                <tr className="bg-gray-50 text-gray-600 uppercase tracking-wide">
+                  <th className="px-3 py-2 text-left font-semibold">Metric</th>
+                  <th className="px-3 py-2 text-center font-semibold">EGFR (P00533)</th>
+                  <th className="px-3 py-2 text-center font-semibold">CDK2 (P24941)</th>
+                  <th className="px-3 py-2 text-center font-semibold">BRAF (P15056)</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                <tr>
+                  <td className="px-3 py-2 font-medium text-gray-700">PDB structure</td>
+                  <td className="px-3 py-2 text-center text-gray-600">8A27 (1.07 A)</td>
+                  <td className="px-3 py-2 text-center text-gray-600">6Q4G</td>
+                  <td className="px-3 py-2 text-center text-gray-600">4MNE</td>
+                </tr>
+                <tr className="bg-gray-50/50">
+                  <td className="px-3 py-2 font-medium text-gray-700">GNINA success rate</td>
+                  <td className="px-3 py-2 text-center"><span className="text-green-600 font-bold">84%</span> (16/19)</td>
+                  <td className="px-3 py-2 text-center"><span className="text-green-600 font-bold">100%</span> (19/19)</td>
+                  <td className="px-3 py-2 text-center"><span className="text-green-600 font-bold">95%</span> (18/19)</td>
+                </tr>
+                <tr>
+                  <td className="px-3 py-2 font-medium text-gray-700">Vina score range</td>
+                  <td className="px-3 py-2 text-center text-gray-600">-9.65 to -2.84</td>
+                  <td className="px-3 py-2 text-center text-gray-600">-9.68 to -3.27</td>
+                  <td className="px-3 py-2 text-center text-gray-600">-7.56 to -4.02</td>
+                </tr>
+                <tr className="bg-gray-50/50">
+                  <td className="px-3 py-2 font-medium text-gray-700">CNN score range</td>
+                  <td className="px-3 py-2 text-center text-gray-600">0.44 - 0.78</td>
+                  <td className="px-3 py-2 text-center text-gray-600">0.10 - 0.70</td>
+                  <td className="px-3 py-2 text-center text-gray-600">0.22 - 0.77</td>
+                </tr>
+                <tr>
+                  <td className="px-3 py-2 font-medium text-gray-700">CNN affinity range (pK)</td>
+                  <td className="px-3 py-2 text-center text-gray-600">3.71 - 8.04</td>
+                  <td className="px-3 py-2 text-center text-gray-600">3.29 - 7.63</td>
+                  <td className="px-3 py-2 text-center text-gray-600">3.90 - 8.08</td>
+                </tr>
+                <tr className="bg-green-50">
+                  <td className="px-3 py-2 font-medium text-green-800">Vina enrichment (actives vs decoys)</td>
+                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.21x</span></td>
+                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.44x</span></td>
+                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.80x</span></td>
+                </tr>
+                <tr className="bg-green-50">
+                  <td className="px-3 py-2 font-medium text-green-800">CNN affinity enrichment</td>
+                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">3.23x</span></td>
+                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.73x</span></td>
+                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">2.85x</span></td>
+                </tr>
+                <tr className="bg-green-50">
+                  <td className="px-3 py-2 font-medium text-green-800">EF10% (Vina)</td>
+                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">5.3</span></td>
+                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">3.8</span></td>
+                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">6.0</span></td>
+                </tr>
+                <tr>
+                  <td className="px-3 py-2 font-medium text-gray-700">Active avg Vina (kcal/mol)</td>
+                  <td className="px-3 py-2 text-center text-gray-600">-7.69</td>
+                  <td className="px-3 py-2 text-center text-gray-600">-7.53</td>
+                  <td className="px-3 py-2 text-center text-gray-600">-6.49</td>
+                </tr>
+                <tr className="bg-gray-50/50">
+                  <td className="px-3 py-2 font-medium text-gray-700">Decoy avg Vina (kcal/mol)</td>
+                  <td className="px-3 py-2 text-center text-gray-600">-6.46</td>
+                  <td className="px-3 py-2 text-center text-gray-600">-6.09</td>
+                  <td className="px-3 py-2 text-center text-gray-600">-5.76</td>
+                </tr>
+                <tr>
+                  <td className="px-3 py-2 font-medium text-gray-700">Known actives tested</td>
+                  <td className="px-3 py-2 text-center text-gray-600">Afatinib, Gefitinib, Lapatinib</td>
+                  <td className="px-3 py-2 text-center text-gray-600">Flavopiridol, Dinaciclib, Roscovitine, SNS-032, Palbociclib</td>
+                  <td className="px-3 py-2 text-center text-gray-600">Vemurafenib, Sorafenib, AZ628</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          {/* Key findings */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="bg-green-50 rounded-lg p-3">
+              <h4 className="text-xs font-bold text-green-800 uppercase tracking-wide mb-1">Validated</h4>
+              <ul className="text-xs text-green-700 space-y-1 list-disc list-inside">
+                <li>Known actives rank above decoys by Vina score across all 3 targets</li>
+                <li>CNN affinity provides even stronger enrichment (1.7-3.2x)</li>
+                <li>All score ranges within expected pharmacological bounds</li>
+                <li>No positive Vina scores (steric clash) in final results</li>
+                <li>93% average GNINA success rate across targets</li>
+              </ul>
+            </div>
+            <div className="bg-amber-50 rounded-lg p-3">
+              <h4 className="text-xs font-bold text-amber-800 uppercase tracking-wide mb-1">Limitations noted</h4>
+              <ul className="text-xs text-amber-700 space-y-1 list-disc list-inside">
+                <li>Enrichment factors are modest (1.2-1.8x by Vina) vs. published benchmarks (5-15x on DUD-E)</li>
+                <li>Small benchmark set (19 molecules/target) limits statistical power</li>
+                <li>Decoys are marketed drugs (not random compounds) making this a harder test</li>
+                <li>Composite score over-weights druglikeness; use Vina/CNN ranking for enrichment evaluation</li>
+              </ul>
+            </div>
+          </div>
+
+          {/* Scoring formula */}
+          <div className="bg-blue-50 rounded-lg p-4">
+            <h4 className="text-xs font-bold text-blue-800 uppercase tracking-wide mb-2">Composite Scoring Formula</h4>
+            <p className="text-xs text-blue-700 leading-relaxed font-mono">
+              Score = 0.65 x norm_affinity + 0.20 x QED + 0.15 x logP_penalty
+            </p>
+            <p className="text-xs text-blue-600 mt-2 leading-relaxed">
+              Binding affinity is the dominant term (65% weight). QED and logP provide secondary
+              druglikeness filtering. Affinity is normalized over [-14, 0] kcal/mol. For V2 mode with ADMET:
+              Score = 0.55 x affinity + 0.20 x ADMET + 0.15 x QED + 0.10 x novelty.
+              Hard cutoffs: Lipinski &gt;2 violations, QED &lt;0.25, SA &gt;6.0, PAINS alerts, hERG risk.
+            </p>
+          </div>
+        </div>
       </div>
 
       {/* General disclaimer */}

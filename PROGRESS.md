@@ -445,3 +445,48 @@
 - V6.3: Combined off-target screening (SEA broad + 10-panel docking), specialized hERG IC50, ENAMINE REAL fragments, reagent availability + cost estimation
 - Frontend: ParetoFront SVG scatter plot, InteractionDiagram radial SVG, collapsible CandidateCard, Badge component, SEA section in SafetyReport, cost/availability in SynthesisTree
 - Total V6 new code: ~1,500 lines backend + ~1,200 lines frontend + model/serialization updates
+
+---
+
+## Scientific Validation — 3-Target Benchmark (February 2026)
+
+### Critical Bug Fixes Applied Before Benchmark
+1. **HETATM stripping** — Co-crystallized ligands (HOH, KY9, EDO, NO3) in receptor PDB caused massive steric clashes and positive Vina scores. Fix: `_strip_hetatm()` removes all HETATM before receptor conversion.
+2. **SDF input for GNINA** — PDBQT torsion trees from Meeko/obabel caused "ligand outside box" errors. Fix: GNINA now uses SDF input natively.
+3. **Positive Vina score rejection** — Repulsive scores (>0 kcal/mol) are rejected with clear warning.
+4. **Composite score rebalance** — V1: 0.65*affinity + 0.20*QED + 0.15*logP (was 0.50/0.30/0.20). V2: 0.55*affinity + 0.20*ADMET + 0.15*QED + 0.10*novelty (was 0.40/0.30/0.20/0.10). Affinity normalization extended from [-12,0] to [-14,0]. Lipinski cutoff relaxed from >1 to >2 violations.
+
+### Benchmark Protocol
+- 3 targets: EGFR (P00533, PDB 8A27), CDK2 (P24941), BRAF (P15056)
+- Each: 3-5 known actives + 10-14 non-target decoys (marketed OTC drugs)
+- Docking: GNINA 1.1 (CPU), exhaustiveness=8, 3 poses
+- Evaluation: Enrichment factor, EF10%, Vina/CNN score ranges, active vs decoy ranking
+
+### Results Summary (Pre-Rebalance Scoring, Docking Scores)
+
+| Metric | EGFR | CDK2 | BRAF |
+|--------|------|------|------|
+| GNINA success rate | 84% (16/19) | 100% (19/19) | 95% (18/19) |
+| Vina enrichment (actives/decoys) | 1.21x | 1.44x | 1.80x |
+| CNN affinity enrichment | 3.23x | 1.73x | 2.85x |
+| EF10% (Vina) | 5.3 | 3.8 | 6.0 |
+| Active avg Vina | -7.69 | -7.53 | -6.49 |
+| Decoy avg Vina | -6.46 | -6.09 | -5.76 |
+| Vina range | [-9.65, -2.84] | [-9.68, -3.27] | [-7.56, -4.02] |
+| CNN range | [0.44, 0.78] | [0.10, 0.70] | [0.22, 0.77] |
+| CNN affinity range (pK) | [3.71, 8.04] | [3.29, 7.63] | [3.90, 8.08] |
+
+### Validation Status
+- **Docking scores correctly rank actives above decoys** across all 3 targets (Vina + CNN)
+- **All score ranges within expected pharmacological bounds**
+- **No positive Vina scores** in final results (HETATM fix validated)
+- **93% average GNINA success rate** across targets
+- **Molecular descriptors accurate**: MW within 1-2%, TPSA within 2%, logP Crippen bias ~0.8
+- **Composite score rebalanced**: docking affinity now dominant (65% V1, 55% V2)
+
+### Known Limitations
+- Small benchmark set (19 molecules/target) — insufficient for statistical significance tests
+- Decoys are marketed drugs with excellent druglikeness — harder test than DUD-E random decoys
+- Enrichment factors modest (1.2-1.8x Vina) vs published benchmarks (5-15x on DUD-E)
+- Some known actives fell back to mock docking (Erlotinib, Atorvastatin) — PDBQT conversion issue
+- Rigid receptor approximation — no induced-fit effects captured
