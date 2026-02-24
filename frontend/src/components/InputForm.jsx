@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { createJob, previewTarget } from '../api.js'
 import InfoTip from './InfoTip.jsx'
+import AnalysisToggles, { DEFAULT_VALUES } from './AnalysisToggles'
 
 const EXAMPLE_UNIPROT = 'P00533'
 const VALID_AA = /^[ACDEFGHIKLMNPQRSTVWY]+$/
@@ -34,7 +35,6 @@ function TargetPreviewCard({ preview, loading }) {
     chembl_ic50,
   } = preview
 
-  // Label for the structure source
   const sourceLabel = structure_source === 'experimental'
     ? 'PDB Experimental'
     : structure_source === 'alphafold'
@@ -139,108 +139,6 @@ function TargetPreviewCard({ preview, loading }) {
 }
 
 // ---------------------------------------------------------------------------
-// CompoundLibrarySelector — radio group for compound source
-// ---------------------------------------------------------------------------
-function CompoundLibrarySelector({ value, onChange, preview, loading }) {
-  const chemblActives = preview?.chembl_actives ?? null
-  const chemblIc50    = preview?.chembl_ic50 ?? null
-  const uniprotId     = preview?.uniprot_id ?? ''
-
-  const options = [
-    {
-      id: 'auto',
-      label: 'Auto (Recommended)',
-      description: 'Let the system automatically choose the best strategy based on available data.',
-      tip: 'The system picks ChEMBL when the target has >10 known actives, otherwise falls back to ZINC.',
-      badge: 'Default',
-    },
-    {
-      id: 'chembl',
-      label: 'ChEMBL Known Actives',
-      description: 'Screen known active compounds from the ChEMBL database. Best when the target has known ligands.',
-      tip: 'Recommended when your target has >10 known active compounds in ChEMBL.',
-      meta: chemblActives != null
-        ? `${chemblActives.toLocaleString()} actives found${chemblIc50 != null ? ` (${chemblIc50.toLocaleString()} with IC50)` : ''}${uniprotId ? ` for ${uniprotId}` : ''}`
-        : loading ? 'Loading ChEMBL data...' : null,
-    },
-    {
-      id: 'zinc',
-      label: 'ZINC Drug-like',
-      description: 'Screen a diverse library of commercially available drug-like molecules from ZINC.',
-      tip: 'Good for targets with few or no known actives. Provides diverse chemical space.',
-    },
-    {
-      id: 'custom',
-      label: 'Custom SMILES',
-      description: 'Provide your own molecules to screen.',
-      tip: 'Enter one SMILES string per line. Only these molecules will be docked.',
-    },
-  ]
-
-  return (
-    <div className="space-y-2">
-      {options.map((opt) => (
-        <label
-          key={opt.id}
-          className={`flex items-start gap-3 p-3 rounded-lg cursor-pointer border transition-all ${
-            value === opt.id
-              ? 'border-dockit-blue bg-blue-50/50'
-              : 'border-gray-100 hover:border-gray-200'
-          }`}
-        >
-          <input
-            type="radio"
-            name="compound_source"
-            value={opt.id}
-            checked={value === opt.id}
-            onChange={() => onChange(opt.id)}
-            className="mt-0.5 text-dockit-blue shrink-0"
-          />
-          <div className="min-w-0">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-sm font-medium text-gray-700">{opt.label}</span>
-              {opt.badge && (
-                <span className="text-xs px-2 py-0.5 bg-dockit-blue text-white rounded-full">
-                  {opt.badge}
-                </span>
-              )}
-              <InfoTip text={opt.tip} />
-            </div>
-            <p className="text-xs text-gray-400 mt-0.5">{opt.description}</p>
-            {opt.meta && (
-              <p className="text-xs text-dockit-green font-medium mt-0.5">{opt.meta}</p>
-            )}
-          </div>
-        </label>
-      ))}
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// CompoundSourceSummary — one-line badge shown below the accordion header
-// ---------------------------------------------------------------------------
-function CompoundSourceSummary({ source, preview }) {
-  const chemblActives = preview?.chembl_actives
-  const uniprotId     = preview?.uniprot_id ?? ''
-
-  const labels = {
-    auto:    'Auto (system decides)',
-    chembl:  chemblActives != null
-               ? `ChEMBL (${chemblActives.toLocaleString()} known actives${uniprotId ? ` for ${uniprotId}` : ''})`
-               : 'ChEMBL known actives',
-    zinc:    'ZINC drug-like library',
-    custom:  'Custom SMILES input',
-  }
-
-  return (
-    <span className="text-xs text-dockit-blue font-medium bg-blue-50 px-2 py-0.5 rounded-full">
-      Source: {labels[source] || source}
-    </span>
-  )
-}
-
-// ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
 export default function InputForm({ onJobCreated }) {
@@ -255,17 +153,13 @@ export default function InputForm({ onJobCreated }) {
   const [previewLoading, setPreviewLoading] = useState(false)
   const debounceRef = useRef(null)
 
+  // Screening options
+  const [maxLigands, setMaxLigands] = useState(20)
+  const [dockingEngine, setDockingEngine] = useState('gnina')
+  const [analyses, setAnalyses] = useState(DEFAULT_VALUES)
+  const [boxSize, setBoxSize] = useState([null, null, null])
   const [showAdvanced, setShowAdvanced] = useState(false)
-  const [precision, setPrecision] = useState('standard')
-  const [compoundSource, setCompoundSource] = useState('auto')
-  const [customSmiles, setCustomSmiles] = useState('')
-  const [dockingEngine, setDockingEngine] = useState('auto')
-  const [maxLigands, setMaxLigands] = useState(50)
   const [notificationEmail, setNotificationEmail] = useState('')
-
-  const maxLigandsRange = precision === 'deep'
-    ? { min: 10, max: 5000 }
-    : { min: 10, max: 500 }
 
   // ------------------------------------------------------------------
   // Debounced preview fetch whenever uniprotId changes (uniprot mode)
@@ -275,7 +169,6 @@ export default function InputForm({ onJobCreated }) {
 
     const trimmed = uniprotId.trim().toUpperCase()
 
-    // Clear stale preview immediately when input is too short
     if (trimmed.length < 4) {
       setTargetPreview(null)
       setPreviewLoading(false)
@@ -283,14 +176,12 @@ export default function InputForm({ onJobCreated }) {
       return
     }
 
-    // Show loading skeleton after a short delay so fast typers don't flicker
     if (debounceRef.current) clearTimeout(debounceRef.current)
 
     debounceRef.current = setTimeout(async () => {
       setPreviewLoading(true)
       try {
         const raw = await previewTarget(trimmed)
-        // Flatten nested backend response into the shape our components expect
         const struct = raw.structure || {}
         const chembl = raw.chembl_info || {}
         const pocketsList = (raw.pockets || [])
@@ -315,7 +206,6 @@ export default function InputForm({ onJobCreated }) {
           chembl_ic50: chembl.has_data ? chembl.n_with_ic50 : null,
         })
       } catch {
-        // Preview is non-critical — fail silently
         setTargetPreview(null)
       } finally {
         setPreviewLoading(false)
@@ -334,12 +224,6 @@ export default function InputForm({ onJobCreated }) {
       setPreviewLoading(false)
     }
   }, [inputMode])
-
-  const handlePrecisionChange = (value) => {
-    setPrecision(value)
-    if (value === 'deep') setMaxLigands(500)
-    else setMaxLigands(50)
-  }
 
   const validateSequence = (seq) => {
     const clean = seq.replace(/^>.*\n?/gm, '').replace(/\s/g, '').toUpperCase()
@@ -367,39 +251,22 @@ export default function InputForm({ onJobCreated }) {
       submitSequence = sequence.replace(/^>.*\n?/gm, '').replace(/\s/g, '').toUpperCase()
     }
 
-    // Build compound source params
-    const smilesLines = customSmiles.trim()
-      ? customSmiles.split('\n').map(s => s.trim()).filter(s => s.length > 0)
-      : null
-
     setLoading(true)
     try {
       const params = {
-        mode: precision,
+        mode: 'standard',
         docking_engine: dockingEngine,
+        max_ligands: Number(maxLigands),
+        enable_dmpk: Object.values(analyses).every(v => v),
+        ...analyses,
+        enable_generation: false,
+        enable_retrosynthesis: analyses.enable_synthesis,
+        box_size: boxSize.some(v => v != null && v > 0) ? boxSize.map(v => v || 25) : null,
       }
 
-      if (precision !== 'rapid') {
-        params.max_ligands = Number(maxLigands)
-      }
       if (submitUniprotId) params.uniprot_id = submitUniprotId
       if (submitSequence)  params.sequence   = submitSequence
-
-      // Compound source
-      if (compoundSource === 'chembl') {
-        params.use_chembl = true
-        params.use_zinc   = false
-      } else if (compoundSource === 'zinc') {
-        params.use_chembl = false
-        params.use_zinc   = true
-      } else if (compoundSource === 'custom') {
-        if (smilesLines) params.smiles_list = smilesLines
-      }
-      // 'auto': let backend decide — don't set use_chembl / use_zinc
-
-      if (precision === 'deep' && notificationEmail.trim()) {
-        params.notification_email = notificationEmail.trim()
-      }
+      if (notificationEmail.trim()) params.notification_email = notificationEmail.trim()
 
       const result = await createJob(params)
       onJobCreated(result.job_id)
@@ -411,8 +278,6 @@ export default function InputForm({ onJobCreated }) {
   }
 
   const cleanSequence = sequence.replace(/^>.*\n?/gm, '').replace(/\s/g, '')
-
-  // Show preview section when: uniprot mode AND (loading OR we have data)
   const showPreview = inputMode === 'uniprot' && (previewLoading || targetPreview !== null)
 
   return (
@@ -426,6 +291,8 @@ export default function InputForm({ onJobCreated }) {
 
       <div className="card p-8">
         <form onSubmit={handleSubmit} className="space-y-6">
+
+          {/* --- 1. Target input --- */}
 
           {/* Segmented control */}
           <div className="flex bg-gray-100 rounded-lg p-1">
@@ -455,7 +322,7 @@ export default function InputForm({ onJobCreated }) {
             </button>
           </div>
 
-          {/* Input field — changes based on mode */}
+          {/* Input field */}
           {inputMode === 'uniprot' ? (
             <div>
               <div className="flex gap-2">
@@ -501,221 +368,145 @@ export default function InputForm({ onJobCreated }) {
             </div>
           )}
 
-          {/* ----------------------------------------------------------------
-              Target Preview Card — shown between input and advanced options
-          ---------------------------------------------------------------- */}
+          {/* Target Preview Card */}
           {showPreview && (
             <TargetPreviewCard preview={targetPreview} loading={previewLoading} />
           )}
 
-          {/* Advanced options accordion */}
-          <div className="border border-gray-200 rounded-xl overflow-hidden">
+          {/* --- 2. Compounds count slider --- */}
+          <div className="space-y-2">
+            <label className="block text-sm font-medium text-gray-700">
+              How many compounds to screen?
+            </label>
+            <div className="flex items-center gap-4">
+              <input
+                type="range"
+                min={5}
+                max={500}
+                value={maxLigands}
+                onChange={(e) => setMaxLigands(Number(e.target.value))}
+                disabled={loading}
+                className="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-[#1e3a5f]"
+              />
+              <input
+                type="number"
+                min={5}
+                max={5000}
+                value={maxLigands}
+                onChange={(e) => setMaxLigands(Number(e.target.value))}
+                disabled={loading}
+                className="w-20 px-2 py-1 text-sm border rounded text-center"
+              />
+            </div>
+            {maxLigands > 200 && (
+              <p className="text-xs text-gray-400">
+                Large library -- will use extended screening (up to 4h)
+              </p>
+            )}
+          </div>
+
+          {/* --- 3. Docking engine --- */}
+          <div className="space-y-2">
+            <label className="block text-sm font-medium text-gray-700">Docking engine</label>
+            <div className="space-y-2">
+              <label
+                className="flex items-start gap-3 p-3 border rounded-lg cursor-pointer hover:bg-gray-50 transition-colors"
+                style={dockingEngine === 'gnina' ? { borderColor: '#1e3a5f', backgroundColor: '#f0f4f8' } : {}}
+              >
+                <input
+                  type="radio"
+                  name="engine"
+                  value="gnina"
+                  checked={dockingEngine === 'gnina'}
+                  onChange={() => setDockingEngine('gnina')}
+                  disabled={loading}
+                  className="mt-0.5 accent-[#1e3a5f]"
+                />
+                <div>
+                  <span className="font-medium text-sm">GNINA</span>
+                  <p className="text-xs text-gray-500">CNN-scored (~15s/mol) -- More accurate poses</p>
+                </div>
+              </label>
+              <label
+                className="flex items-start gap-3 p-3 border rounded-lg cursor-pointer hover:bg-gray-50 transition-colors"
+                style={dockingEngine === 'vina' ? { borderColor: '#1e3a5f', backgroundColor: '#f0f4f8' } : {}}
+              >
+                <input
+                  type="radio"
+                  name="engine"
+                  value="vina"
+                  checked={dockingEngine === 'vina'}
+                  onChange={() => setDockingEngine('vina')}
+                  disabled={loading}
+                  className="mt-0.5 accent-[#1e3a5f]"
+                />
+                <div>
+                  <span className="font-medium text-sm">Vina</span>
+                  <p className="text-xs text-gray-500">Fast (~2s/mol) -- Recommended for large libraries</p>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          {/* --- 4. Analysis toggles --- */}
+          <div className="space-y-2">
+            <label className="block text-sm font-medium text-gray-700">Analyses</label>
+            <AnalysisToggles values={analyses} onChange={setAnalyses} />
+          </div>
+
+          {/* --- 4b. Advanced settings (collapsible) --- */}
+          <div className="mt-3">
             <button
               type="button"
               onClick={() => setShowAdvanced(!showAdvanced)}
-              className="w-full flex items-center justify-between px-4 py-3 text-sm text-gray-600 hover:bg-gray-50 transition-colors"
+              className="text-xs text-gray-400 hover:text-[#1e3a5f] transition-colors"
             >
-              <span className="font-medium">Advanced Options</span>
-              <div className="flex items-center gap-2">
-                {/* Source badge — visible even when accordion is collapsed */}
-                {!showAdvanced && (
-                  <CompoundSourceSummary source={compoundSource} preview={targetPreview} />
-                )}
-                <svg
-                  className={`w-4 h-4 transition-transform ${showAdvanced ? 'rotate-180' : ''}`}
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                </svg>
-              </div>
+              {showAdvanced ? '▼' : '▶'} Advanced settings
             </button>
-
             {showAdvanced && (
-              <div className="px-4 pb-4 border-t border-gray-100 pt-4 space-y-5">
-
-                {/* Precision */}
-                <div>
-                  <label className="text-sm font-medium text-gray-700 mb-2 block flex items-center">
-                    Analysis Precision
-                    <InfoTip text="Choose the depth of analysis. Higher precision includes more features but takes longer." />
-                  </label>
-                  <div className="space-y-2">
-                    {[
-                      { value: 'rapid',    label: 'Quick',    desc: '50 molecules, ~5 min — docking + scoring', icon: 'Quick' },
-                      { value: 'standard', label: 'Standard', desc: '500 molecules, ~15 min — docking + ADMET + retrosynthesis', icon: 'Std', recommended: true },
-                      { value: 'deep',     label: 'Deep',     desc: 'Full ChEMBL database 2.4M, ~3h — 5 passes + ADMET + retrosynthesis', icon: 'Deep' },
-                    ].map(opt => (
-                      <label
-                        key={opt.value}
-                        className={`flex items-start gap-3 p-3 rounded-lg cursor-pointer border transition-all ${
-                          precision === opt.value
-                            ? 'border-dockit-blue bg-blue-50/50'
-                            : 'border-gray-100 hover:border-gray-200'
-                        }`}
-                      >
-                        <input
-                          type="radio"
-                          name="precision"
-                          value={opt.value}
-                          checked={precision === opt.value}
-                          onChange={() => handlePrecisionChange(opt.value)}
-                          className="mt-0.5 text-dockit-blue"
-                        />
-                        <div>
-                          <span className="text-sm font-medium text-gray-700">
-                            {opt.label}
-                            {opt.recommended && (
-                              <span className="ml-2 text-xs px-2 py-0.5 bg-dockit-blue text-white rounded-full">
-                                Recommended
-                              </span>
-                            )}
-                          </span>
-                          <p className="text-xs text-gray-400 mt-0.5">{opt.desc}</p>
-                        </div>
-                      </label>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Email notification for deep mode */}
-                {precision === 'deep' && (
-                  <div>
-                    <label className="text-sm font-medium text-gray-700 mb-1 block">
-                      Email for notification (optional)
-                    </label>
-                    <input
-                      type="email"
-                      value={notificationEmail}
-                      onChange={(e) => setNotificationEmail(e.target.value)}
-                      placeholder="you@email.com"
-                      className="input-field text-sm"
-                      disabled={loading}
-                    />
-                    <p className="text-xs text-gray-400 mt-1">
-                      Receive a link to results when the screening is complete.
-                    </p>
-                  </div>
-                )}
-
-                {/* Compound Library Selector */}
-                <div>
-                  <label className="text-sm font-medium text-gray-700 mb-2 block flex items-center">
-                    Compound Library
-                    <InfoTip text="Choose the source of molecules to screen against your target. 'Auto' is recommended for most use cases." />
-                  </label>
-                  <CompoundLibrarySelector
-                    value={compoundSource}
-                    onChange={setCompoundSource}
-                    preview={targetPreview}
-                    loading={previewLoading}
-                  />
-
-                  {/* Custom SMILES textarea — only shown when custom is selected */}
-                  {compoundSource === 'custom' && (
-                    <div className="mt-3">
-                      <label className="text-xs font-medium text-gray-600 mb-1 block">
-                        SMILES — one molecule per line
-                      </label>
-                      <textarea
-                        value={customSmiles}
-                        onChange={(e) => setCustomSmiles(e.target.value)}
-                        placeholder={"CCO\nCCN\n..."}
-                        rows={4}
-                        disabled={loading}
-                        className="input-field font-mono text-xs resize-none w-full"
+              <div className="mt-2 p-3 bg-gray-50 rounded-lg space-y-2">
+                <label className="block text-xs font-medium text-gray-600">Docking box size (auto if empty)</label>
+                <div className="flex gap-2">
+                  {['X', 'Y', 'Z'].map((axis, i) => (
+                    <div key={axis} className="flex-1">
+                      <label className="text-[10px] text-gray-400">{axis} (A)</label>
+                      <input
+                        type="number"
+                        min="5"
+                        max="100"
+                        step="1"
+                        placeholder="auto"
+                        value={boxSize[i] || ''}
+                        onChange={e => {
+                          const v = [...boxSize]
+                          v[i] = e.target.value ? Number(e.target.value) : null
+                          setBoxSize(v)
+                        }}
+                        className="w-full px-2 py-1 text-sm border rounded"
                       />
-                      <p className="text-xs text-gray-400 mt-1">
-                        {customSmiles.trim()
-                          ? `${customSmiles.split('\n').filter(l => l.trim()).length} molecule(s) entered`
-                          : 'Enter at least one valid SMILES string.'}
-                      </p>
                     </div>
-                  )}
+                  ))}
                 </div>
-
-                {/* Docking engine + Max candidates — standard and deep only */}
-                {(precision === 'standard' || precision === 'deep') && (
-                  <>
-                    {/* Docking engine */}
-                    <div>
-                      <label className="text-sm font-medium text-gray-700 mb-2 block flex items-center">
-                        Docking Engine
-                        <InfoTip text="Algorithm used to predict how molecules bind to the protein pocket. Auto selects GNINA when available, falling back to Vina." />
-                      </label>
-                      <div className="flex gap-3">
-                        {[
-                          { value: 'auto',  label: 'Auto',  desc: 'GNINA if available' },
-                          { value: 'gnina', label: 'GNINA', desc: 'CNN-scored, slow ~15s/mol' },
-                          { value: 'vina',  label: 'Vina',  desc: 'Fast ~2s/mol' },
-                        ].map(opt => (
-                          <label
-                            key={opt.value}
-                            className={`flex-1 flex items-center gap-2 p-3 rounded-lg cursor-pointer border transition-all ${
-                              dockingEngine === opt.value
-                                ? 'border-dockit-blue bg-blue-50/50'
-                                : 'border-gray-100 hover:border-gray-200'
-                            }`}
-                          >
-                            <input
-                              type="radio"
-                              name="docking_engine"
-                              value={opt.value}
-                              checked={dockingEngine === opt.value}
-                              onChange={() => setDockingEngine(opt.value)}
-                              className="text-dockit-blue"
-                            />
-                            <div>
-                              <span className="text-sm font-medium text-gray-700">{opt.label}</span>
-                              <p className="text-xs text-gray-400">{opt.desc}</p>
-                            </div>
-                          </label>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* Max candidates */}
-                    <div>
-                      <label className="text-sm font-medium text-gray-700 mb-1 block flex items-center">
-                        Max Candidates
-                        <InfoTip text={`Maximum number of molecules to screen. Range: ${maxLigandsRange.min}–${maxLigandsRange.max} for ${precision} mode.`} />
-                      </label>
-                      <div className="flex items-center gap-3">
-                        <input
-                          type="number"
-                          value={maxLigands}
-                          min={maxLigandsRange.min}
-                          max={maxLigandsRange.max}
-                          step={precision === 'deep' ? 100 : 10}
-                          onChange={(e) => {
-                            const v = Math.max(maxLigandsRange.min, Math.min(maxLigandsRange.max, Number(e.target.value)))
-                            setMaxLigands(v)
-                          }}
-                          disabled={loading}
-                          className="input-field w-36 text-sm font-mono"
-                        />
-                        <input
-                          type="range"
-                          value={maxLigands}
-                          min={maxLigandsRange.min}
-                          max={maxLigandsRange.max}
-                          step={precision === 'deep' ? 100 : 10}
-                          onChange={(e) => setMaxLigands(Number(e.target.value))}
-                          disabled={loading}
-                          className="flex-1 accent-dockit-blue"
-                        />
-                      </div>
-                      <p className="text-xs text-gray-400 mt-1">
-                        {precision === 'deep'
-                          ? 'Deep mode: 10 to 5000 candidates. Large values significantly increase run time.'
-                          : 'Standard mode: 10 to 500 candidates.'}
-                      </p>
-                    </div>
-                  </>
-                )}
               </div>
             )}
+          </div>
+
+          {/* --- 5. Notification email --- */}
+          <div>
+            <label className="text-sm font-medium text-gray-700 mb-1 block">
+              Email for notification (optional)
+            </label>
+            <input
+              type="email"
+              value={notificationEmail}
+              onChange={(e) => setNotificationEmail(e.target.value)}
+              placeholder="you@email.com"
+              className="input-field text-sm"
+              disabled={loading}
+            />
+            <p className="text-xs text-gray-400 mt-1">
+              Receive a link to results when the screening is complete.
+            </p>
           </div>
 
           {/* Error */}
@@ -728,21 +519,7 @@ export default function InputForm({ onJobCreated }) {
             </div>
           )}
 
-          {/* Mode summary */}
-          <div className="flex items-center gap-2 text-xs text-gray-400 bg-gray-50 rounded-lg px-4 py-2.5">
-            <svg className="w-4 h-4 text-gray-300 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-            {precision === 'rapid' ? (
-              <span>Mode <strong className="text-gray-600">Quick</strong>: docking + scoring only. Switch to Standard mode for ADMET analysis and retrosynthesis.</span>
-            ) : precision === 'standard' ? (
-              <span>Mode <strong className="text-dockit-blue">Standard</strong>: docking + <strong className="text-dockit-blue">ADMET</strong> (toxicity) + <strong className="text-dockit-blue">retrosynthesis</strong> (feasibility).</span>
-            ) : (
-              <span>Mode <strong className="text-purple-600">Deep</strong>: massive screening 5 passes + <strong className="text-purple-600">ADMET</strong> + <strong className="text-purple-600">retrosynthesis</strong> on top 50.</span>
-            )}
-          </div>
-
-          {/* Submit */}
+          {/* --- 6. Submit --- */}
           <button
             type="submit"
             disabled={loading || (inputMode === 'uniprot' ? !uniprotId.trim() : cleanSequence.length < 50)}

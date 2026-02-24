@@ -4,20 +4,22 @@ DockIt pipeline -- Lead optimization via iterative molecular modification.
 Implements a multi-objective optimization loop:
   1. Generate structural variants of the starting molecule.
   2. Validate (sanitize, QED, Tanimoto similarity to parent).
-  3. Mock dock each variant against the target.
-  4. Mock ADMET for each variant.
+  3. Dock each variant against the target (real Vina/GNINA or mock).
+  4. ADMET prediction for each variant (real or mock).
   5. Score with multi-objective function (affinity, toxicity, bioavailability, synthesis).
   6. Keep top variants, use best as parent for next iteration.
   7. Return final lead with improvement metrics.
 
 Uses RDKit for molecular manipulation where available; falls back to a
 deterministic mock that simulates gradual improvement across iterations.
+Real docking mode uses pipeline.prepare + pipeline.docking for actual Vina/GNINA scoring.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import random
 from pathlib import Path
 from typing import Callable, Optional
@@ -54,6 +56,147 @@ DEFAULT_WEIGHTS: dict[str, float] = {
 
 
 # =====================================================================
+# REAL DOCKING / ADMET / PREFILTER
+# =====================================================================
+
+def _real_dock(
+    smiles: str,
+    name: str,
+    receptor_pdbqt: Path,
+    pocket_center: list[float],
+    pocket_size: list[float],
+    exhaustiveness: int,
+    docking_engine: str,
+    work_dir: Path,
+) -> Optional[dict]:
+    """Dock a single molecule using the real pipeline (prepare + dock).
+
+    Returns a dict with docking results or None on failure.
+    """
+    try:
+        from pipeline.prepare import prepare_ligand
+        from pipeline.docking import run_docking
+
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        # Prepare ligand: SMILES -> 3D PDBQT
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:50]
+        pdbqt_path = prepare_ligand(smiles, safe_name, work_dir)
+        if pdbqt_path is None:
+            logger.debug("Ligand preparation failed for %s", name)
+            return None
+
+        # Dock
+        center = tuple(pocket_center[:3])
+        size = tuple(pocket_size[:3])
+        result = run_docking(
+            receptor_pdbqt=receptor_pdbqt,
+            ligand_pdbqt=pdbqt_path,
+            center=center,
+            size=size,
+            exhaustiveness=exhaustiveness,
+            docking_engine=docking_engine,
+        )
+
+        return {
+            "affinity": result.get("affinity", 0.0),
+            "vina_score": result.get("vina_score", result.get("affinity", 0.0)),
+            "cnn_score": result.get("cnn_score", 0.0),
+            "cnn_affinity": result.get("cnn_affinity", 0.0),
+            "pose_pdbqt_path": str(result.get("pose_pdbqt_path", "")),
+            "docking_engine": result.get("docking_engine", "mock"),
+        }
+    except Exception as exc:
+        logger.warning("Real docking failed for %s: %s", name, exc)
+        return None
+
+
+def _real_admet_batch(smiles_list: list[str]) -> dict[str, dict]:
+    """Run real ADMET prediction on a batch of SMILES.
+
+    Returns {smiles: admet_dict} with fields compatible with _multi_objective_score().
+    """
+    try:
+        from pipeline.admet import predict_admet
+
+        results = predict_admet(smiles_list)
+        output: dict[str, dict] = {}
+        for admet_entry in results:
+            smi = admet_entry.get("smiles", "")
+            if not smi:
+                continue
+            # Extract the scores _multi_objective_score expects
+            toxicity_data = admet_entry.get("toxicity", {})
+            absorption_data = admet_entry.get("absorption", {})
+            output[smi] = {
+                "toxicity_score": 1.0 - max(
+                    toxicity_data.get("hepatotoxicity", 0.0),
+                    toxicity_data.get("herg_inhibition", 0.0),
+                    toxicity_data.get("ames_mutagenicity", 0.0),
+                ),  # higher = safer
+                "bioavailability_score": absorption_data.get("oral_bioavailability", 0.5),
+                "synthesis_score": 1.0 - admet_entry.get("composite_score", 0.5) * 0.3,  # proxy
+                "herg_risk": toxicity_data.get("herg_inhibition", 0.0),
+                "hepatotoxicity_risk": toxicity_data.get("hepatotoxicity", 0.0),
+                "composite_score": admet_entry.get("composite_score", 0.5),
+                # Preserve full ADMET data for enrichment
+                "_full_admet": admet_entry,
+            }
+        return output
+    except Exception as exc:
+        logger.warning("Real ADMET batch failed: %s", exc)
+        return {}
+
+
+def _prefilter_variants(
+    variants: list[str],
+    parent_smiles: str,
+    top_n: int,
+) -> list[str]:
+    """Pre-filter variants by QED x Tanimoto score, return top_n."""
+    if not _check_rdkit() or len(variants) <= top_n:
+        return variants[:top_n]
+
+    try:
+        from rdkit import Chem, DataStructs
+        from rdkit.Chem import AllChem, QED as QED_module
+
+        parent_mol = Chem.MolFromSmiles(parent_smiles)
+        if parent_mol is None:
+            return variants[:top_n]
+
+        try:
+            from rdkit.Chem import rdFingerprintGenerator
+            fp_gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+            parent_fp = fp_gen.GetFingerprint(parent_mol)
+        except (ImportError, AttributeError):
+            parent_fp = AllChem.GetMorganFingerprintAsBitVect(parent_mol, 2, nBits=2048)
+            fp_gen = None
+
+        scored: list[tuple[float, str]] = []
+        for smi in variants:
+            try:
+                mol = Chem.MolFromSmiles(smi)
+                if mol is None:
+                    continue
+                qed_val = QED_module.qed(mol)
+                if fp_gen is not None:
+                    fp = fp_gen.GetFingerprint(mol)
+                else:
+                    fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
+                sim = DataStructs.TanimotoSimilarity(parent_fp, fp)
+                scored.append((qed_val * sim, smi))
+            except Exception:
+                continue
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [smi for _, smi in scored[:top_n]]
+    except Exception as exc:
+        logger.warning("Pre-filter failed: %s", exc)
+        return variants[:top_n]
+
+
+# =====================================================================
 # PUBLIC API
 # =====================================================================
 
@@ -68,6 +211,10 @@ def run_optimization(
     work_dir: Optional[Path] = None,
     progress_callback: Optional[Callable[[int, float, str], None]] = None,
     structural_rules: Optional[dict] = None,
+    docking_engine: str = "auto",
+    pocket_size: Optional[list[float]] = None,
+    exhaustiveness: int = 8,
+    dock_top_n: int = 20,
 ) -> dict:
     """Run iterative lead optimization on a starting molecule.
 
@@ -101,6 +248,15 @@ def run_optimization(
     progress_callback : callable, optional
         Called as ``progress_callback(iteration, best_score, message)``
         after each iteration.
+    docking_engine : str
+        "vina", "gnina", "auto", or "mock". Controls whether real docking
+        is used. Default "auto" uses real docking if receptor exists.
+    pocket_size : list[float], optional
+        [sx, sy, sz] search box size in Angstroms. Default [25, 25, 25].
+    exhaustiveness : int
+        Docking search exhaustiveness. Default 8.
+    dock_top_n : int
+        Number of pre-filtered variants to actually dock per iteration.
 
     Returns
     -------
@@ -118,6 +274,11 @@ def run_optimization(
         work_dir.mkdir(parents=True, exist_ok=True)
 
     w = weights or DEFAULT_WEIGHTS.copy()
+    # Accept frontend key "binding_affinity" as alias for "affinity"
+    if "binding_affinity" in w and "affinity" not in w:
+        w["affinity"] = w.pop("binding_affinity")
+    elif "binding_affinity" in w:
+        w.pop("binding_affinity")
     # Normalize weights
     total_w = sum(w.values())
     if total_w > 0:
@@ -127,14 +288,60 @@ def run_optimization(
     seed_val = int(hashlib.sha256(starting_smiles.encode()).hexdigest()[:8], 16)
     rng = random.Random(seed_val)
 
+    # Determine docking mode: real vs none vs mock
+    _pocket_size = pocket_size or [25.0, 25.0, 25.0]
+    receptor_path = Path(target_pdbqt)
+
+    # "none" engine: skip docking entirely, score on properties only
+    use_no_docking = docking_engine == "none"
+
+    use_real_docking = (
+        not use_no_docking
+        and docking_engine != "mock"
+        and receptor_path.exists()
+        and receptor_path.stat().st_size > 100
+    )
+
+    if use_no_docking:
+        logger.info("Lead optimization: NO-DOCKING mode — property-based scoring only")
+    elif use_real_docking:
+        logger.info("Lead optimization: REAL docking mode (engine=%s)", docking_engine)
+    else:
+        if docking_engine not in ("mock", "none") and not receptor_path.exists():
+            logger.warning("Receptor %s not found; falling back to mock docking", target_pdbqt)
+        logger.info("Lead optimization: MOCK docking mode")
+
     # Compute starting molecule scores
-    start_affinity = _mock_dock(starting_smiles, pocket_center, rng)
-    start_admet = _mock_admet_simple(starting_smiles, rng)
+    if use_no_docking:
+        # No docking: affinity is 0 (unused), score based on ADMET only
+        start_affinity = 0.0
+        start_admet = _mock_admet_simple(starting_smiles, rng)
+        start_dock_meta = {"docking_engine": "none"}
+    elif use_real_docking:
+        start_dock = _real_dock(
+            starting_smiles, starting_name, receptor_path, pocket_center,
+            _pocket_size, exhaustiveness, docking_engine,
+            work_dir / "iter_0" / "ligands" if work_dir else Path("/tmp/opt_start"),
+        )
+        if start_dock:
+            start_affinity = start_dock["affinity"]
+            start_dock_meta = start_dock
+        else:
+            start_affinity = _mock_dock(starting_smiles, pocket_center, rng)
+            start_dock_meta = {"docking_engine": "mock"}
+        admet_batch = _real_admet_batch([starting_smiles])
+        start_admet = admet_batch.get(starting_smiles, _mock_admet_simple(starting_smiles, rng))
+    else:
+        start_affinity = _mock_dock(starting_smiles, pocket_center, rng)
+        start_admet = _mock_admet_simple(starting_smiles, rng)
+        start_dock_meta = {"docking_engine": "mock"}
+
     start_score = _multi_objective_score(start_affinity, start_admet, w)
 
     logger.info(
-        "Lead optimization starting: %s (score=%.3f, affinity=%.1f)",
+        "Lead optimization starting: %s (score=%.3f, affinity=%.1f, engine=%s)",
         starting_name, start_score, start_affinity,
+        start_dock_meta.get("docking_engine", "none" if use_no_docking else "mock"),
     )
 
     # Track results across iterations
@@ -148,10 +355,16 @@ def run_optimization(
     total_valid = 0
     total_improved = 0
 
+    seen_smiles: set[str] = {starting_smiles}
+    all_top_molecules: list[dict] = []
+
     best_ever_smiles = starting_smiles
     best_ever_score = start_score
     best_ever_affinity = start_affinity
     best_ever_admet = start_admet
+    best_ever_dock_meta: dict = start_dock_meta
+
+    stale_iterations = 0  # count consecutive iterations with no improvement
 
     for iteration in range(1, n_iterations + 1):
         iter_rng = random.Random(seed_val + iteration * 1000)
@@ -166,26 +379,78 @@ def run_optimization(
 
         # Score each valid variant
         scored_variants: list[dict] = []
-        for v_smiles in variants:
-            v_affinity = _mock_dock(v_smiles, pocket_center, iter_rng)
-            v_admet = _mock_admet_simple(v_smiles, iter_rng)
-            v_score = _multi_objective_score(v_affinity, v_admet, w)
 
-            scored_variants.append({
-                "smiles": v_smiles,
-                "affinity": v_affinity,
-                "admet": v_admet,
-                "score": v_score,
-            })
+        if use_no_docking:
+            # --- NO-DOCKING MODE: property-based scoring only ---
+            admet_map = _real_admet_batch(variants) if variants else {}
+            for v_smiles in variants:
+                v_admet = admet_map.get(v_smiles, _mock_admet_simple(v_smiles, iter_rng))
+                # With no affinity signal, use affinity=0 and down-weight it
+                v_score = _multi_objective_score(0.0, v_admet, w)
+                scored_variants.append({
+                    "smiles": v_smiles,
+                    "affinity": 0.0,
+                    "admet": v_admet,
+                    "score": v_score,
+                    "docking_engine": "none",
+                })
+
+        elif use_real_docking:
+            # --- REAL DOCKING MODE: dock ALL variants ---
+            logger.info("Iter %d: docking all %d variants (engine=%s)",
+                        iteration, len(variants), docking_engine)
+
+            iter_work_dir = (work_dir / f"iter_{iteration}" / "ligands") if work_dir else Path(f"/tmp/opt_iter_{iteration}")
+            docked: list[dict] = []
+            for vi, v_smiles in enumerate(variants):
+                dock_result = _real_dock(
+                    v_smiles, f"{starting_name}_i{iteration}_v{vi}",
+                    receptor_path, pocket_center, _pocket_size,
+                    exhaustiveness, docking_engine, iter_work_dir,
+                )
+                if dock_result:
+                    docked.append({"smiles": v_smiles, **dock_result})
+
+            # Real ADMET on docked variants
+            docked_smiles = [d["smiles"] for d in docked]
+            admet_map = _real_admet_batch(docked_smiles) if docked_smiles else {}
+
+            # Score
+            for d in docked:
+                v_admet = admet_map.get(d["smiles"], _mock_admet_simple(d["smiles"], iter_rng))
+                v_score = _multi_objective_score(d["affinity"], v_admet, w)
+                scored_variants.append({
+                    "smiles": d["smiles"],
+                    "affinity": d["affinity"],
+                    "admet": v_admet,
+                    "score": v_score,
+                    "vina_score": d.get("vina_score"),
+                    "cnn_score": d.get("cnn_score"),
+                    "cnn_affinity": d.get("cnn_affinity"),
+                    "docking_engine": d.get("docking_engine"),
+                    "pose_pdbqt_path": d.get("pose_pdbqt_path"),
+                })
+
+        else:
+            # --- MOCK DOCKING MODE ---
+            for v_smiles in variants:
+                v_affinity = _mock_dock(v_smiles, pocket_center, iter_rng)
+                v_admet = _mock_admet_simple(v_smiles, iter_rng)
+                v_score = _multi_objective_score(v_affinity, v_admet, w)
+                scored_variants.append({
+                    "smiles": v_smiles,
+                    "affinity": v_affinity,
+                    "admet": v_admet,
+                    "score": v_score,
+                })
+
+            # Mock mode: add artificial improvement bonus
+            improvement_bonus = iteration * 0.008 * (1.0 + rng.random() * 0.5)
+            for sv in scored_variants:
+                sv["score"] = min(1.0, sv["score"] + improvement_bonus)
 
         n_valid = len(scored_variants)
         total_valid += n_valid
-
-        # Bias: improve scores across iterations (simulating optimization)
-        # Add a small improvement bonus that grows with iteration number
-        improvement_bonus = iteration * 0.008 * (1.0 + rng.random() * 0.5)
-        for sv in scored_variants:
-            sv["score"] = min(1.0, sv["score"] + improvement_bonus)
 
         # Sort by score descending
         scored_variants.sort(key=lambda x: x["score"], reverse=True)
@@ -199,6 +464,25 @@ def run_optimization(
         # Keep top 5
         top5 = scored_variants[:5]
 
+        # Collect unique top molecules across iterations
+        for sv in top5:
+            if sv["smiles"] not in seen_smiles:
+                seen_smiles.add(sv["smiles"])
+                mol_entry: dict = {
+                    "name": f"{starting_name}_iter{iteration}_{len(all_top_molecules)+1}",
+                    "smiles": sv["smiles"],
+                    "score": round(sv["score"], 4),
+                    "affinity": round(sv["affinity"], 2),
+                    "admet": sv["admet"],
+                    "iteration": iteration,
+                }
+                # Propagate real docking metadata
+                for dk in ("vina_score", "cnn_score", "cnn_affinity", "docking_engine", "pose_pdbqt_path"):
+                    if sv.get(dk) is not None:
+                        mol_entry[dk] = sv[dk]
+                all_top_molecules.append(mol_entry)
+
+        prev_score = current_score
         if top5 and top5[0]["score"] > current_score:
             current_smiles = top5[0]["smiles"]
             current_score = top5[0]["score"]
@@ -210,6 +494,37 @@ def run_optimization(
             best_ever_score = current_score
             best_ever_affinity = current_affinity
             best_ever_admet = current_admet
+            # Track docking metadata for the best molecule
+            if top5 and top5[0].get("docking_engine"):
+                best_ever_dock_meta = {k: top5[0].get(k) for k in
+                    ("vina_score", "cnn_score", "cnn_affinity", "docking_engine", "pose_pdbqt_path")
+                    if top5[0].get(k) is not None}
+
+        # Early termination: 3 consecutive stale iterations in real or no-docking mode
+        if use_real_docking or use_no_docking:
+            if current_score <= prev_score:
+                stale_iterations += 1
+            else:
+                stale_iterations = 0
+            if stale_iterations >= 3 and iteration >= 3:
+                logger.info("Early termination: no improvement for %d consecutive iterations", stale_iterations)
+                iter_summary = {
+                    "iteration": iteration,
+                    "best_score": round(current_score, 4),
+                    "best_smiles": current_smiles,
+                    "n_tested": n_tested,
+                    "n_valid": n_valid,
+                    "n_improved": n_improved,
+                    "early_stop": True,
+                }
+                iterations.append(iter_summary)
+                if progress_callback is not None:
+                    try:
+                        progress_callback(iteration, current_score,
+                            f"Early stop at iteration {iteration}/{n_iterations}: no improvement for 3 iterations")
+                    except Exception:
+                        pass
+                break
 
         iter_summary = {
             "iteration": iteration,
@@ -244,6 +559,41 @@ def run_optimization(
         start_admet, best_ever_admet,
     )
 
+    final_lead: dict = {
+        "name": f"{starting_name}_opt",
+        "smiles": best_ever_smiles,
+        "score": round(best_ever_score, 4),
+        "affinity": round(best_ever_affinity, 2),
+        "admet": best_ever_admet,
+    }
+    # Propagate docking metadata to final lead
+    for dk in ("vina_score", "cnn_score", "cnn_affinity", "docking_engine", "pose_pdbqt_path"):
+        if best_ever_dock_meta.get(dk) is not None:
+            final_lead[dk] = best_ever_dock_meta[dk]
+
+    # Build objectives dict (frontend-compatible format: {key: {start, current}})
+    objectives = {
+        "binding_affinity": {
+            "start": comparison.get("affinity", {}).get("start", round(start_affinity, 2)),
+            "current": comparison.get("affinity", {}).get("end", round(best_ever_affinity, 2)),
+        },
+        "toxicity": {
+            "start": comparison.get("toxicity_score", {}).get("start", 0.5),
+            "current": comparison.get("toxicity_score", {}).get("end", 0.5),
+        },
+        "bioavailability": {
+            "start": comparison.get("bioavailability_score", {}).get("start", 0.5),
+            "current": comparison.get("bioavailability_score", {}).get("end", 0.5),
+        },
+        "synthesis_score": {
+            "start": comparison.get("synthesis_score", {}).get("start", 0.7),
+            "current": comparison.get("synthesis_score", {}).get("end", 0.7),
+        },
+    }
+
+    # Sort top molecules by score descending, keep up to 10
+    top_molecules = sorted(all_top_molecules, key=lambda x: x["score"], reverse=True)[:10]
+
     result = {
         "starting_molecule": {
             "name": starting_name,
@@ -251,18 +601,18 @@ def run_optimization(
             "score": round(start_score, 4),
             "affinity": round(start_affinity, 2),
         },
-        "final_lead": {
-            "name": f"{starting_name}_opt",
-            "smiles": best_ever_smiles,
-            "score": round(best_ever_score, 4),
-            "affinity": round(best_ever_affinity, 2),
-            "admet": best_ever_admet,
-        },
+        "final_lead": final_lead,
+        # Frontend-compatible aliases
+        "best_molecule": final_lead,
+        "objectives": objectives,
         "iterations": iterations,
         "comparison": comparison,
         "total_tested": total_tested,
         "total_valid": total_valid,
         "total_improved": total_improved,
+        "top_molecules": top_molecules,
+        "docking_mode": "none" if use_no_docking else ("real" if use_real_docking else "mock"),
+        "docking_engine_used": best_ever_dock_meta.get("docking_engine", "mock"),
     }
 
     logger.info(

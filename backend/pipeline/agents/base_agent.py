@@ -18,7 +18,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # Agent version for tracking
-AGENT_VERSION = "2.0.0"
+AGENT_VERSION = "2.1.0"
 
 
 class BaseAgent:
@@ -84,6 +84,30 @@ class BaseAgent:
         return hashlib.md5(
             json.dumps(context, sort_keys=True, default=str).encode()
         ).hexdigest()[:16]
+
+    def _compute_tools(self, context: dict) -> dict:
+        """Run computational tools to inject factual data before LLM call.
+
+        Override in subclasses to register agent-specific tools.
+        Returns {} by default (no tools).
+        """
+        return {}
+
+    def _effective_system_prompt(self, enriched_context: dict) -> str:
+        """Build system prompt, appending computed-data instructions if present."""
+        prompt = self.system_prompt
+        if enriched_context.get("_computed_data"):
+            prompt += (
+                "\n\n## COMPUTED DATA (GROUND TRUTH)\n"
+                "The `_computed_data` field in the input contains FACTUAL COMPUTED RESULTS "
+                "from validated RDKit/ADMET/scoring pipeline functions. These are NOT estimates — "
+                "they are exact computed values.\n"
+                "- NEVER contradict computed values. They override any prior assumptions.\n"
+                "- ALWAYS cite specific numbers from _computed_data (e.g., 'MW = 432.5 Da').\n"
+                "- Use computed flags and scores as ground truth for your assessment.\n"
+                "- If _computed_data shows a PAINS alert or Lipinski violation, you MUST flag it.\n"
+            )
+        return prompt
 
     def _gather_research(self, context: dict) -> dict:
         """Gather research data from public APIs based on agent type."""
@@ -178,7 +202,12 @@ class BaseAgent:
 
         client = self._get_client()
         if client is None:
-            return self._fallback_response(input_hash, timestamp, "OpenAI API key not configured or openai not installed")
+            # Still run computational tools even without API key
+            computed_data = self._compute_tools(context)
+            resp = self._fallback_response(input_hash, timestamp, "OpenAI API key not configured or openai not installed")
+            if computed_data.get("_meta", {}).get("tools_succeeded", 0) > 0:
+                resp["_computed_data"] = computed_data
+            return resp
 
         # Step 1: Gather research data
         research = self._gather_research(context)
@@ -192,6 +221,20 @@ class BaseAgent:
                 if k not in ("agent_type", "research_available", "research_summary")
             }
 
+        # Step 2: Run computational tools (pipeline-based, no API key needed)
+        computed_data = self._compute_tools(enriched_context)
+        if computed_data.get("_meta", {}).get("tools_succeeded", 0) > 0:
+            enriched_context["_computed_data"] = computed_data
+            logger.info(
+                "Agent '%s' computed_data: %d/%d tools succeeded",
+                self.name,
+                computed_data["_meta"]["tools_succeeded"],
+                computed_data["_meta"]["tools_run"],
+            )
+
+        # Build effective system prompt (includes computed-data instructions if present)
+        effective_prompt = self._effective_system_prompt(enriched_context)
+
         user_message = json.dumps(enriched_context, indent=2, default=str)
 
         try:
@@ -199,10 +242,12 @@ class BaseAgent:
                 # Stage 1: Analysis
                 logger.info("Agent '%s' Stage 1: analyzing data (input_hash=%s)", self.name, input_hash)
                 stage1_messages = [
-                    {"role": "system", "content": self.system_prompt},
+                    {"role": "system", "content": effective_prompt},
                     {"role": "user", "content": user_message},
                     {"role": "user", "content": (
                         "STAGE 1: Analyze all the provided data including any research data (_research_data). "
+                        "The _computed_data field (if present) contains FACTUAL COMPUTED RESULTS from the pipeline. "
+                        "You MUST use these exact values as ground truth — do not estimate or contradict them. "
                         "Identify key insights, patterns, and critical findings. "
                         "Return your analysis as a JSON object with a key 'stage1_analysis' containing your detailed findings."
                     )},
@@ -212,13 +257,14 @@ class BaseAgent:
                 # Stage 2: Expert recommendation
                 logger.info("Agent '%s' Stage 2: generating recommendation", self.name)
                 stage2_messages = [
-                    {"role": "system", "content": self.system_prompt},
+                    {"role": "system", "content": effective_prompt},
                     {"role": "user", "content": user_message},
                     {"role": "assistant", "content": json.dumps(stage1_result, default=str)},
                     {"role": "user", "content": (
                         "STAGE 2: Based on your analysis above, provide your final expert recommendation. "
                         "Follow the exact JSON output schema specified in your system prompt. "
                         "Incorporate insights from the research literature data if available. "
+                        "IMPORTANT: All numbers from _computed_data are VERIFIED — cite them exactly. "
                         "Include 'literature_references' (list of {title, pmid, url, finding}) "
                         "and 'key_papers' (list of {title, finding, pmid}) if research papers were provided."
                     )},
@@ -229,7 +275,7 @@ class BaseAgent:
                 # Single-stage (fallback)
                 logger.info("Agent '%s' single-stage query (input_hash=%s)", self.name, input_hash)
                 messages = [
-                    {"role": "system", "content": self.system_prompt},
+                    {"role": "system", "content": effective_prompt},
                     {"role": "user", "content": user_message},
                 ]
                 analysis = self._call_llm(client, messages, temperature=0.3, max_tokens=4000)

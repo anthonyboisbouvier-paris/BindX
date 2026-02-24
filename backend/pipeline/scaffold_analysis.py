@@ -342,8 +342,8 @@ def _generate_annotated_svg(
         drawer.FinishDrawing()
         svg = drawer.GetDrawingText()
 
-        # Post-process: inject R-group labels as text elements
-        svg = _inject_labels(svg, mol, positions)
+        # Post-process: inject R-group labels using drawer's 2D coordinates
+        svg = _inject_labels(svg, mol, positions, drawer)
 
         return svg
 
@@ -352,33 +352,40 @@ def _generate_annotated_svg(
         return None
 
 
-def _inject_labels(svg: str, mol, positions: list[dict]) -> str:
-    """Inject R-group label text into the SVG XML."""
+def _inject_labels(svg: str, mol, positions: list[dict], drawer=None) -> str:
+    """Inject R-group label text into the SVG XML using drawer's 2D coordinates."""
     try:
-        from rdkit.Chem import AllChem
+        if drawer is None:
+            return svg
 
-        conf = mol.GetConformer()
-
-        # Find the SVG viewbox / dimensions for coordinate mapping
-        # The labels will be positioned near the atom coordinates
-        # We inject before the closing </svg> tag
         labels_xml = []
         for pos in positions:
             idx = pos["position_idx"]
-            pt = conf.GetAtomPosition(idx)
             label = pos["label"]
 
-            # These coords are in molecule-space; rdMolDraw2D maps them internally.
-            # We approximate by using relative positioning near atom.
-            # A simpler approach: add labels as title attributes
+            # Use the drawer's coordinate mapping (molecule-space -> SVG-space)
+            try:
+                point = drawer.GetDrawCoords(idx)
+                x = point.x
+                y = point.y
+            except Exception:
+                continue
+
+            # Offset the label slightly above and to the right of the atom
+            lx = x + 12
+            ly = y - 12
+
             labels_xml.append(
-                f'<text x="0" y="0" font-size="10" fill="#1e3a5f" font-weight="bold"'
-                f' font-family="Arial,sans-serif" data-atom-idx="{idx}"'
-                f' class="rgroup-label">{label}</text>'
+                f'<g>'
+                f'<rect x="{lx - 2}" y="{ly - 10}" width="{len(label) * 7 + 4}" height="14" rx="3" '
+                f'fill="white" stroke="#1e3a5f" stroke-width="0.8" opacity="0.9"/>'
+                f'<text x="{lx}" y="{ly}" font-size="10" fill="#1e3a5f" font-weight="bold"'
+                f' font-family="Arial,sans-serif" dominant-baseline="auto"'
+                f' data-atom-idx="{idx}" class="rgroup-label">{label}</text>'
+                f'</g>'
             )
 
         if labels_xml:
-            # Insert labels group before closing </svg>
             labels_group = '<g class="rgroup-labels">' + ''.join(labels_xml) + '</g>'
             svg = svg.replace('</svg>', labels_group + '</svg>')
 

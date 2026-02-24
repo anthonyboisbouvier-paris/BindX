@@ -7,7 +7,21 @@ ADMET profiling, safety pharmacology, and clinical compound comparison.
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+from tempfile import mkdtemp
+
 from pipeline.agents.base_agent import BaseAgent
+from pipeline.agents.tools import (
+    AgentTool,
+    ToolRunner,
+    tool_admet_profile,
+    tool_compute_properties,
+    tool_scaffold_analysis,
+    tool_synthesis_assessment,
+)
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a senior pharmacologist and drug discovery scientist with 20+ years of experience in candidate evaluation, ADMET profiling, and preclinical risk assessment. You hold expertise in medicinal chemistry, pharmacokinetics, and regulatory toxicology.
 
@@ -94,13 +108,153 @@ Return a JSON object with these exact keys:
 }"""
 
 
+_COMPUTED_DATA_PROMPT = """
+## COMPUTED DATA USAGE (Candidate Evaluation)
+When _computed_data is present:
+- **molecular_properties**: EXACT MW, LogP, QED, TPSA, HBD, HBA, PAINS alert, SA score, Lipinski/Veber pass.
+  Cite these numbers verbatim in your assessment. Do NOT estimate them.
+- **admet_profile**: Full ADMET prediction with hERG IC50, applicability domain, flags, and color code.
+  Report every RED flag. Use composite_score for overall ADMET quality.
+- **off_target_screening**: SEA broad scan + 10-panel docking results with combined selectivity score.
+  Flag any tier1_hits or low combined_selectivity (< 0.5).
+- **scaffold_analysis**: Murcko/BRICS decomposition with R-group positions.
+  Use scaffold_smiles for structural comparison.
+- **synthesis_assessment**: Retrosynthetic route, step count, cost estimate, reagent availability.
+  Report n_steps and cost_detail.total_cost_usd.
+- **similar_approved_drugs**: Property comparison vs approved drugs targeting the same protein.
+  Report deltas (candidate vs approved) for MW, LogP, QED.
+"""
+
+
+def _tool_off_target(smiles: str) -> dict:
+    """Run combined off-target screening."""
+    from pipeline.off_target import combined_off_target_screening
+
+    work_dir = Path(mkdtemp(prefix="agent_offtarget_"))
+    result = combined_off_target_screening(smiles, work_dir)
+    return {
+        "combined_selectivity": result.get("combined_selectivity"),
+        "tier1_hits": result.get("tier1_hits", []),
+        "tier2_safe_count": result.get("tier2_safe_count"),
+        "sea_total_targets": result.get("sea_results", {}).get("total_targets_scanned", 0),
+        "sea_hits": result.get("sea_results", {}).get("n_hits", 0),
+    }
+
+
+def _tool_similar_approved(smiles: str, uniprot_id: str) -> dict:
+    """Compare candidate properties vs approved drugs for the same target."""
+    from pipeline.ligands import fetch_chembl_ligands
+
+    import numpy as np
+
+    known = fetch_chembl_ligands(uniprot_id, max_count=20)
+    if not known:
+        return {"message": "No approved/active compounds found in ChEMBL"}
+
+    candidate_props = tool_compute_properties(smiles)
+    if "error" in candidate_props:
+        return candidate_props
+
+    known_props = []
+    for lig in known:
+        smi = lig.get("smiles")
+        if smi:
+            p = tool_compute_properties(smi)
+            if "error" not in p:
+                known_props.append(p)
+
+    if not known_props:
+        return {"n_approved": len(known), "profiles_computed": 0}
+
+    def _mean(lst, key):
+        vals = [x.get(key) for x in lst if x.get(key) is not None]
+        return round(float(np.mean(vals)), 2) if vals else None
+
+    approved_mw = _mean(known_props, "MW")
+    approved_logp = _mean(known_props, "logP")
+    approved_qed = _mean(known_props, "qed")
+
+    return {
+        "candidate": {
+            "MW": candidate_props.get("MW"),
+            "logP": candidate_props.get("logP"),
+            "qed": candidate_props.get("qed"),
+            "tpsa": candidate_props.get("tpsa"),
+        },
+        "approved_mean": {
+            "MW": approved_mw,
+            "logP": approved_logp,
+            "qed": approved_qed,
+        },
+        "delta_mw": round(candidate_props.get("MW", 0) - (approved_mw or 0), 2) if approved_mw else None,
+        "delta_logp": round(candidate_props.get("logP", 0) - (approved_logp or 0), 2) if approved_logp else None,
+        "delta_qed": round(candidate_props.get("qed", 0) - (approved_qed or 0), 2) if approved_qed else None,
+        "n_approved_profiled": len(known_props),
+    }
+
+
 class CandidateEvaluationAgent(BaseAgent):
     """Agent 3: In-depth scientific evaluation of individual candidates."""
 
     def __init__(self, model: str = "gpt-4o"):
         super().__init__(
             name="Candidate Evaluation Agent",
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=SYSTEM_PROMPT + _COMPUTED_DATA_PROMPT,
             agent_type="candidate",
             model=model,
         )
+
+    def _compute_tools(self, context: dict) -> dict:
+        """Run candidate-specific computational tools."""
+        smiles = context.get("smiles") or context.get("candidate_smiles")
+        if not smiles:
+            return {}
+
+        uid = context.get("uniprot_id") or context.get("target_uniprot_id")
+
+        tools = [
+            AgentTool(
+                name="molecular_properties",
+                description="Full physicochemical profile (MW, LogP, QED, PAINS, SA, Lipinski, Veber)",
+                fn=tool_compute_properties,
+                extract_args=lambda ctx: {"smiles": ctx.get("smiles") or ctx.get("candidate_smiles")},
+            ),
+            AgentTool(
+                name="admet_profile",
+                description="ADMET prediction + hERG + applicability domain",
+                fn=tool_admet_profile,
+                extract_args=lambda ctx: {"smiles": ctx.get("smiles") or ctx.get("candidate_smiles")},
+            ),
+            AgentTool(
+                name="off_target_screening",
+                description="Combined SEA + 10-panel off-target screening",
+                fn=_tool_off_target,
+                extract_args=lambda ctx: {"smiles": ctx.get("smiles") or ctx.get("candidate_smiles")},
+            ),
+            AgentTool(
+                name="scaffold_analysis",
+                description="Murcko/BRICS scaffold decomposition with R-group positions",
+                fn=tool_scaffold_analysis,
+                extract_args=lambda ctx: {"smiles": ctx.get("smiles") or ctx.get("candidate_smiles")},
+            ),
+            AgentTool(
+                name="synthesis_assessment",
+                description="Retrosynthetic route + cost estimate",
+                fn=tool_synthesis_assessment,
+                extract_args=lambda ctx: {"smiles": ctx.get("smiles") or ctx.get("candidate_smiles")},
+            ),
+        ]
+
+        if uid:
+            tools.append(AgentTool(
+                name="similar_approved_drugs",
+                description="Property delta vs approved drugs for this target",
+                fn=_tool_similar_approved,
+                extract_args=lambda ctx: {
+                    "smiles": ctx.get("smiles") or ctx.get("candidate_smiles"),
+                    "uniprot_id": ctx.get("uniprot_id") or ctx.get("target_uniprot_id"),
+                },
+                timeout_sec=15,
+            ))
+
+        return ToolRunner(tools).run(context)

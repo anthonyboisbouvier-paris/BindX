@@ -8,7 +8,21 @@ optimization strategy.
 
 from __future__ import annotations
 
+import logging
+
+import numpy as np
+
 from pipeline.agents.base_agent import BaseAgent
+from pipeline.agents.tools import (
+    AgentTool,
+    ToolRunner,
+    tool_admet_profile,
+    tool_compute_properties,
+    tool_scaffold_analysis,
+    tool_synthesis_assessment,
+)
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a senior medicinal chemist with 20+ years of experience in lead optimization, rational drug design, and structure-activity relationships (SAR). You are an expert in bioisosteric replacement, fragment-based design, and multi-parameter optimization (MPO).
 
@@ -102,13 +116,143 @@ Return a JSON object with these exact keys:
 }"""
 
 
+_COMPUTED_DATA_PROMPT = """
+## COMPUTED DATA USAGE (Optimization Strategy)
+When _computed_data is present:
+- **scaffold_decomposition**: BRICS/Murcko decomposition with R-group positions and labels.
+  Map your structural_modifications to the EXACT positions listed. Use position labels (R1, R2...).
+  Include suggested_replacements if available.
+- **current_properties**: EXACT current property profile of the lead.
+  Identify which properties need optimization (e.g., LogP > 5 → reduce lipophilicity).
+- **current_admet**: ADMET liabilities with flags and color code.
+  Map each RED/YELLOW flag to a specific structural modification that addresses it.
+- **synthesis_complexity**: Current synthesis route cost and complexity.
+  Avoid proposing modifications that significantly increase n_steps or cost.
+- **sar_from_known**: Property profiles of known actives per scaffold.
+  Use as historical SAR evidence for which modifications worked.
+- **commercial_availability**: Whether the lead is commercially available.
+  If available=true, recommend experimental validation before computational optimization.
+"""
+
+
+def _tool_sar_from_known(uniprot_id: str) -> dict:
+    """Compute per-scaffold property profiles from known actives as SAR reference."""
+    from pipeline.ligands import fetch_chembl_ligands
+
+    known = fetch_chembl_ligands(uniprot_id, max_count=40)
+    if not known:
+        return {"message": "No known actives found in ChEMBL"}
+
+    # Group by Murcko scaffold
+    from pipeline.scaffold_analysis import analyze_scaffold
+
+    scaffolds: dict[str, list] = {}
+    for lig in known:
+        smi = lig.get("smiles")
+        if not smi:
+            continue
+        try:
+            sc = analyze_scaffold(smi)
+            scaffold_smi = sc.get("scaffold_smiles", "unknown")
+        except Exception:
+            scaffold_smi = "unknown"
+
+        props = tool_compute_properties(smi)
+        if "error" in props:
+            continue
+
+        scaffolds.setdefault(scaffold_smi, []).append(props)
+
+    # Summarize top scaffolds
+    summary = []
+    for sc_smi, props_list in sorted(scaffolds.items(), key=lambda x: -len(x[1]))[:5]:
+        def _mean(key):
+            vals = [p.get(key) for p in props_list if p.get(key) is not None]
+            return round(float(np.mean(vals)), 2) if vals else None
+
+        summary.append({
+            "scaffold_smiles": sc_smi,
+            "n_actives": len(props_list),
+            "mean_mw": _mean("MW"),
+            "mean_logp": _mean("logP"),
+            "mean_qed": _mean("qed"),
+            "mean_sa": _mean("sa_score"),
+            "pains_rate": round(sum(1 for p in props_list if p.get("pains_alert")) / len(props_list), 2),
+        })
+
+    return {
+        "n_known_actives": len(known),
+        "n_scaffolds": len(scaffolds),
+        "top_scaffolds": summary,
+    }
+
+
+def _tool_commercial(smiles: str) -> dict:
+    """Check commercial availability of the lead."""
+    from pipeline.ligands import check_commercial_availability
+
+    return check_commercial_availability(smiles)
+
+
 class OptimizationStrategyAgent(BaseAgent):
     """Agent 4: Designs rational lead optimization strategies."""
 
     def __init__(self, model: str = "gpt-4o"):
         super().__init__(
             name="Optimization Strategy Agent",
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=SYSTEM_PROMPT + _COMPUTED_DATA_PROMPT,
             agent_type="optimization",
             model=model,
         )
+
+    def _compute_tools(self, context: dict) -> dict:
+        """Run optimization-specific computational tools."""
+        smiles = context.get("smiles") or context.get("candidate_smiles")
+        if not smiles:
+            return {}
+
+        uid = context.get("uniprot_id") or context.get("target_uniprot_id")
+
+        tools = [
+            AgentTool(
+                name="scaffold_decomposition",
+                description="BRICS/Murcko decomposition with R-group positions",
+                fn=tool_scaffold_analysis,
+                extract_args=lambda ctx: {"smiles": ctx.get("smiles") or ctx.get("candidate_smiles")},
+            ),
+            AgentTool(
+                name="current_properties",
+                description="Full current property profile of the lead",
+                fn=tool_compute_properties,
+                extract_args=lambda ctx: {"smiles": ctx.get("smiles") or ctx.get("candidate_smiles")},
+            ),
+            AgentTool(
+                name="current_admet",
+                description="Current ADMET liabilities and flags",
+                fn=tool_admet_profile,
+                extract_args=lambda ctx: {"smiles": ctx.get("smiles") or ctx.get("candidate_smiles")},
+            ),
+            AgentTool(
+                name="synthesis_complexity",
+                description="Current synthesis route, cost, and reagent availability",
+                fn=tool_synthesis_assessment,
+                extract_args=lambda ctx: {"smiles": ctx.get("smiles") or ctx.get("candidate_smiles")},
+            ),
+            AgentTool(
+                name="commercial_availability",
+                description="Check if the lead is commercially purchasable",
+                fn=_tool_commercial,
+                extract_args=lambda ctx: {"smiles": ctx.get("smiles") or ctx.get("candidate_smiles")},
+            ),
+        ]
+
+        if uid:
+            tools.append(AgentTool(
+                name="sar_from_known",
+                description="Per-scaffold SAR profiles from known ChEMBL actives",
+                fn=_tool_sar_from_known,
+                extract_args=lambda ctx: {"uniprot_id": ctx.get("uniprot_id") or ctx.get("target_uniprot_id")},
+                timeout_sec=20,
+            ))
+
+        return ToolRunner(tools).run(context)

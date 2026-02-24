@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react'
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useProject } from '../../contexts/ProjectContext.jsx'
 import { HitSelectionProvider, useHitSelection } from '../../contexts/HitSelectionContext.jsx'
@@ -542,7 +542,7 @@ function TagButton({ tag, activeTag, onClick }) {
   )
 }
 
-function EnhancedResultsTable({ allMols, selectedPoseIndex, setSelectedPoseIndex, generatedMolCount }) {
+function EnhancedResultsTable({ allMols, selectedPoseIndex, setSelectedPoseIndex, generatedMolCount, onAutoSelect, onClearAll, onDetail }) {
   const { selections, setTag, removeSelection } = useHitSelection()
   const [sortKey, setSortKey] = useState('composite_score')
   const [sortDir, setSortDir] = useState('desc')
@@ -595,7 +595,24 @@ function EnhancedResultsTable({ allMols, selectedPoseIndex, setSelectedPoseIndex
             <span className="ml-1 text-purple-300 text-xs font-normal">(incl. {generatedMolCount} AI-generated)</span>
           )}
         </h3>
-        <span className="text-white/60 text-xs">{allMols.length} molecules</span>
+        <div className="flex items-center gap-2">
+          {onAutoSelect && (
+            <button onClick={onAutoSelect}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-[#22c55e] hover:bg-[#16a34a] text-white text-xs font-semibold rounded-lg transition-colors">
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+              </svg>
+              Auto-Select Hits
+            </button>
+          )}
+          {onClearAll && (
+            <button onClick={onClearAll}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-white/10 hover:bg-white/20 text-white/80 text-xs font-medium rounded-lg border border-white/20 transition-colors">
+              Clear All
+            </button>
+          )}
+          <span className="text-white/60 text-xs ml-2">{allMols.length} molecules</span>
+        </div>
       </div>
 
       <div className="overflow-x-auto">
@@ -679,11 +696,22 @@ function EnhancedResultsTable({ allMols, selectedPoseIndex, setSelectedPoseIndex
                     </td>
                     {/* Name */}
                     <td className="px-2 py-2 max-w-[200px]">
-                      <span className={`text-sm font-medium break-words ${
-                        isEliminated ? 'text-red-400 line-through' : isGenerated ? 'text-purple-700' : 'text-gray-800'
-                      }`} title={getName(mol)}>
-                        {getName(mol)}
-                      </span>
+                      <div className="flex items-start gap-1.5">
+                        <span className={`text-sm font-medium break-words ${
+                          isEliminated ? 'text-red-400 line-through' : isGenerated ? 'text-purple-700' : 'text-gray-800'
+                        }`} title={getName(mol)}>
+                          {getName(mol)}
+                        </span>
+                        {onDetail && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); onDetail(mol, origIdx) }}
+                            className="flex-shrink-0 mt-0.5 px-1.5 py-0.5 text-[10px] font-semibold text-[#1e3a5f] bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded transition-colors"
+                            title="View full details"
+                          >
+                            Detail
+                          </button>
+                        )}
+                      </div>
                       {isEliminated && mol.elimination_reason && (
                         <span className="block text-[10px] text-red-500">{mol.elimination_reason}</span>
                       )}
@@ -748,6 +776,7 @@ function EnhancedResultsTable({ allMols, selectedPoseIndex, setSelectedPoseIndex
                     {hasSource && (
                       <td className="px-2 py-2 hidden md:table-cell">
                         {isGenerated ? <Badge variant="purple">AI</Badge>
+                          : mol.source?.toLowerCase().includes('optimization') ? <Badge variant="purple">Optim.</Badge>
                           : mol.source?.toLowerCase().includes('zinc') ? <Badge variant="blue">ZINC</Badge>
                           : mol.source ? <Badge variant="green">ChEMBL</Badge>
                           : <span className="text-xs text-gray-400">-</span>}
@@ -787,8 +816,8 @@ function EnhancedResultsTable({ allMols, selectedPoseIndex, setSelectedPoseIndex
       </div>
 
       <div className="px-4 py-2 bg-gray-50 border-t border-gray-100 flex items-center gap-4 text-xs text-gray-400">
-        <span>Click a row to view 3D pose</span>
-        <span className="ml-auto">Tag molecules directly using Hit / Inv / X buttons</span>
+        <span>Click a row to view 3D pose and full details above</span>
+        <span className="ml-auto">Tag molecules using Hit / Inv / X buttons</span>
       </div>
     </div>
   )
@@ -858,6 +887,21 @@ function ProjectResultsInner({ selectedJobId, results, targetConfig }) {
   const [safetyMol, setSafetyMol] = useState(null)
   const [confidenceMol, setConfidenceMol] = useState(null)
   const [showAgentCard, setShowAgentCard] = useState(false)
+  const [detailFlash, setDetailFlash] = useState(false)
+  const [detailMol, setDetailMol] = useState(null)
+  const [detailMolIdx, setDetailMolIdx] = useState(null)
+  const detailPanelRef = useRef(null)
+
+  // When user selects a molecule from the table, scroll to detail panel and flash it
+  const handleSelectMolecule = useCallback((idx) => {
+    setSelectedPoseIndex(idx)
+    setDetailFlash(true)
+    setTimeout(() => setDetailFlash(false), 800)
+    // Scroll to detail panel smoothly
+    if (detailPanelRef.current) {
+      detailPanelRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
+  }, [])
 
   // Merge all molecules (docking + generated)
   const allMolsUnfiltered = useMemo(() => {
@@ -919,30 +963,21 @@ function ProjectResultsInner({ selectedJobId, results, targetConfig }) {
       <SummaryStrip results={results} />
       <HitBar />
 
-      {/* Action buttons */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <button onClick={() => setShowAutoHit(true)}
-          className="flex items-center gap-2 px-4 py-2 bg-[#22c55e] hover:bg-[#16a34a] text-white text-sm font-semibold rounded-lg transition-colors shadow-sm">
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
-          </svg>
-          Auto-Select Hits
-        </button>
-        <button onClick={clearAll}
-          className="flex items-center gap-2 px-4 py-2 bg-white hover:bg-gray-50 text-gray-600 text-sm font-medium rounded-lg border border-gray-200 transition-colors">
-          Clear All Tags
-        </button>
-      </div>
-
-      <FilterBar
-        filters={filters} setFilters={setFilters}
-        counts={{ shown: allMols.length, total: allMolsUnfiltered.length }}
-        hasAdmet={hasAdmet} hasSources={hasSources}
-      />
-
-      {/* 3D Viewer + Molecule Card */}
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
-        <div className="xl:col-span-2">
+      {/* Main layout: MoleculeCard (left) + 3D Viewer & Safety (right) */}
+      <div
+        ref={detailPanelRef}
+        className={`grid grid-cols-1 xl:grid-cols-3 gap-5 scroll-mt-20 transition-all duration-300 ${
+          detailFlash ? 'ring-2 ring-[#22c55e] ring-offset-2 rounded-xl' : ''
+        }`}
+      >
+        {/* Left column: MoleculeCard */}
+        <div className="space-y-4">
+          {selectedMol && (
+            <MoleculeCard molecule={selectedMol} rank={selectedPoseIndex} jobId={selectedJobId} />
+          )}
+        </div>
+        {/* Right column: 3D Viewer + Safety & Advanced Metrics stacked */}
+        <div className="xl:col-span-2 space-y-4">
           <Viewer3D
             jobId={selectedJobId}
             results={results}
@@ -962,11 +997,6 @@ function ProjectResultsInner({ selectedJobId, results, targetConfig }) {
             })()}
             uniprotFeatures={targetConfig?.uniprot_features || null}
           />
-        </div>
-        <div className="space-y-4">
-          {selectedMol && (
-            <MoleculeCard molecule={selectedMol} rank={selectedPoseIndex} jobId={selectedJobId} />
-          )}
           {selectedMol && (
             <SafetyConfidencePanel
               mol={selectedMol}
@@ -979,12 +1009,21 @@ function ProjectResultsInner({ selectedJobId, results, targetConfig }) {
         </div>
       </div>
 
+      <FilterBar
+        filters={filters} setFilters={setFilters}
+        counts={{ shown: allMols.length, total: allMolsUnfiltered.length }}
+        hasAdmet={hasAdmet} hasSources={hasSources}
+      />
+
       {/* Full results table with inline tagging */}
       <EnhancedResultsTable
         allMols={allMols}
         selectedPoseIndex={selectedPoseIndex}
-        setSelectedPoseIndex={setSelectedPoseIndex}
+        setSelectedPoseIndex={handleSelectMolecule}
         generatedMolCount={generatedMolCount}
+        onAutoSelect={() => setShowAutoHit(true)}
+        onClearAll={clearAll}
+        onDetail={(mol, idx) => { setDetailMol(mol); setDetailMolIdx(idx) }}
       />
 
       {/* Pareto Front */}
@@ -1010,6 +1049,43 @@ function ProjectResultsInner({ selectedJobId, results, targetConfig }) {
           onApply={handleAutoHit}
           onClose={() => setShowAutoHit(false)}
         />
+      )}
+
+      {/* Molecule Detail modal — full MoleculeCard in a large modal */}
+      {detailMol && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/50 backdrop-blur-sm pt-6 pb-6 px-4 overflow-y-auto">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl">
+            <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100 bg-[#1e3a5f] rounded-t-2xl">
+              <h2 className="font-bold text-white text-base">
+                {detailMol.name || detailMol.ligand_name || 'Molecule Detail'}
+                <span className="ml-2 text-white/50 text-sm font-normal">#{(detailMolIdx ?? 0) + 1}</span>
+              </h2>
+              <button
+                onClick={() => { setDetailMol(null); setDetailMolIdx(null) }}
+                className="w-8 h-8 rounded-lg hover:bg-white/10 flex items-center justify-center text-white/60 hover:text-white transition-colors"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="overflow-y-auto max-h-[80vh]">
+              <MoleculeCard molecule={detailMol} rank={detailMolIdx ?? 0} jobId={selectedJobId} />
+            </div>
+            {/* Safety data if available */}
+            {(detailMol.off_target || detailMol.confidence) && (
+              <div className="border-t border-gray-100 p-5">
+                <SafetyConfidencePanel
+                  mol={detailMol}
+                  pipelineSummary={results?.pipeline_summary}
+                  onSafetyReport={() => { setSafetyMol(detailMol); setDetailMol(null); setDetailMolIdx(null) }}
+                  onConfidenceBreakdown={() => { setConfidenceMol(detailMol); setDetailMol(null); setDetailMolIdx(null) }}
+                  onAIAnalysis={() => { setShowAgentCard(v => !v); setDetailMol(null); setDetailMolIdx(null) }}
+                />
+              </div>
+            )}
+          </div>
+        </div>
       )}
 
       {/* Safety Report modal */}

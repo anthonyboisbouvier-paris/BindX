@@ -317,19 +317,36 @@ export default function ResultsTable({ results, selectedIndex, onSelect }) {
                     {/* Name — sticky second column, wider and wrapping */}
                     <td className={`px-2 py-3 sticky left-[52px] z-10 relative ${stickyBg} ${STICKY_SHADOW}`}>
                       <div className="flex flex-col max-w-[220px]">
-                        <span
-                          className={`text-sm font-medium whitespace-normal break-words ${
-                            result.eliminated
-                              ? 'text-red-400 line-through'
-                              : isTop
-                              ? 'text-dockit-green'
-                              : result._isGeneratedMol
-                              ? 'text-purple-700'
-                              : 'text-gray-800'
-                          }`}
-                          title={getName(result)}
-                        >
-                          {getName(result)}
+                        <span className="flex items-center gap-1">
+                          <span
+                            className={`text-sm font-medium whitespace-normal break-words ${
+                              result.eliminated
+                                ? 'text-red-400 line-through'
+                                : isTop
+                                ? 'text-dockit-green'
+                                : result._isGeneratedMol
+                                ? 'text-purple-700'
+                                : 'text-gray-800'
+                            }`}
+                            title={getName(result)}
+                          >
+                            {getName(result)}
+                          </span>
+                          {/* Engine indicator dot */}
+                          <span
+                            className={`inline-block w-2 h-2 rounded-full flex-shrink-0 ${
+                              result.docking_status === 'docked' ? 'bg-green-500' :
+                              result.docking_status === 'failed' ? 'bg-red-500' :
+                              'bg-gray-300'
+                            }`}
+                            title={
+                              result.docking_status === 'docked'
+                                ? (result.docking_engine || 'Docked')
+                                : result.docking_status === 'failed'
+                                ? 'Docking failed'
+                                : 'Not docked'
+                            }
+                          />
                         </span>
                         {result.eliminated && (
                           <span className="text-[10px] text-red-500 font-semibold">{result.elimination_reason || 'Eliminated'}</span>

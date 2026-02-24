@@ -38,7 +38,7 @@ from database import (
 from models import (
     ADMETResult, DockingResult, JobCreate, JobResults, JobStatus,
     OffTargetResult, OptimizationRequest, OptimizationStatus,
-    ScaffoldAnalysisResponse,
+    PoseQuality, ScaffoldAnalysisResponse,
     SynthesisRoute, SynthesisStep,
     UserCreate, UserLogin, UserResponse,
     ProjectCreate, ProjectUpdate, ProjectResponse,
@@ -269,20 +269,23 @@ def _get_pedagogical_tip(step: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _map_mode_to_params(mode: str, body: JobCreate) -> dict:
-    """Map V3 mode (rapid/standard/deep) to pipeline parameters.
+    """Map request body to pipeline parameters.
 
-    Parameters
-    ----------
-    mode : str
-        One of "rapid", "standard", "deep", or V2 compat "basic"/"advanced".
-    body : JobCreate
-        The original request body.
-
-    Returns
-    -------
-    dict
-        Pipeline parameters dict ready for the Celery task.
+    V11: mode is kept for backward compat but the key control is now
+    `enable_dmpk`. The frontend sends compounds count, engine choice,
+    and DMPK toggle directly.
     """
+    enable_dmpk = body.enable_dmpk if hasattr(body, 'enable_dmpk') else True
+
+    # V12: granular analysis flags (backward compat: enable_dmpk=False disables all)
+    master = enable_dmpk
+    enable_admet = getattr(body, 'enable_admet', master) if master else False
+    enable_synthesis = getattr(body, 'enable_synthesis', master) if master else False
+    enable_selectivity = getattr(body, 'enable_selectivity', master) if master else False
+    enable_herg = getattr(body, 'enable_herg', master) if master else False
+    enable_safety = getattr(body, 'enable_safety', master) if master else False
+    box_size = getattr(body, 'box_size', None)
+
     base_params: dict = {
         "uniprot_id": body.uniprot_id or "",
         "sequence": body.sequence,
@@ -290,58 +293,29 @@ def _map_mode_to_params(mode: str, body: JobCreate) -> dict:
         "mode": mode,
         "docking_engine": body.docking_engine,
         "notification_email": body.notification_email,
+        "enable_dmpk": enable_dmpk,
+        "enable_admet": enable_admet,
+        "enable_synthesis": enable_synthesis,
+        "enable_selectivity": enable_selectivity,
+        "enable_herg": enable_herg,
+        "enable_safety": enable_safety,
+        "box_size": box_size,
+        "max_ligands": body.max_ligands or 50,
+        "use_chembl": body.use_chembl if body.use_chembl is not None else True,
+        "use_zinc": body.use_zinc if body.use_zinc is not None else True,
+        "enable_generation": False,
+        "enable_diffdock": body.enable_diffdock if body.enable_diffdock is not None else False,
+        "enable_retrosynthesis": enable_synthesis,
+        "n_generated_molecules": 0,
+        "auto_strategy": True,
     }
 
-    if mode == "rapid" or mode == "basic":
-        # Quick V1-style pipeline: small ligand set, no generation, no ADMET
-        base_params.update({
-            "max_ligands": body.max_ligands or 50,
-            "use_chembl": body.use_chembl if body.use_chembl is not None else True,
-            "use_zinc": body.use_zinc if body.use_zinc is not None else False,
-            "enable_generation": False,
-            "enable_diffdock": False,
-            "enable_retrosynthesis": False,
-            "n_generated_molecules": 0,
-            "auto_strategy": False,
-        })
-
-    elif mode == "standard" or mode == "advanced":
-        # Hit Discovery pipeline: ChEMBL + ZINC, ADMET, no AI generation (reserved for Optimization phase)
-        base_params.update({
-            "max_ligands": body.max_ligands or 50,
-            "use_chembl": True,
-            "use_zinc": True,
-            "enable_generation": False,
-            "enable_diffdock": body.enable_diffdock if body.enable_diffdock is not None else False,
-            "enable_retrosynthesis": False,
-            "n_generated_molecules": 0,
-            "auto_strategy": True,
-        })
-
-    elif mode == "deep":
-        # Massive screening, up to 4h, email notification
+    # Deep screening for very large compound sets (>200)
+    if (body.max_ligands or 0) > 200 or mode == "deep":
         base_params.update({
             "max_ligands": body.max_ligands or 5000,
-            "use_chembl": True,
-            "use_zinc": True,
-            "enable_generation": True,
-            "enable_diffdock": False,
-            "enable_retrosynthesis": True,
-            "n_generated_molecules": body.n_generated_molecules or 200,
-            "auto_strategy": True,
-        })
-
-    else:
-        # Fallback to rapid
-        base_params.update({
-            "max_ligands": body.max_ligands or 50,
-            "use_chembl": True,
-            "use_zinc": False,
-            "enable_generation": False,
-            "enable_diffdock": False,
-            "enable_retrosynthesis": False,
-            "n_generated_molecules": 0,
-            "auto_strategy": False,
+            "enable_generation": enable_dmpk,
+            "n_generated_molecules": body.n_generated_molecules or 200 if enable_dmpk else 0,
         })
 
     return base_params
@@ -430,6 +404,28 @@ def _extract_admet_domain(admet_data: Optional[dict]) -> Optional[dict]:
     return None
 
 
+def _lazy_svg(smiles: Optional[str]) -> Optional[str]:
+    """Generate 2D SVG on-the-fly for results that lack a pre-rendered SVG."""
+    if not smiles:
+        return None
+    try:
+        from pipeline.scoring import generate_2d_svg
+        return generate_2d_svg(smiles)
+    except Exception:
+        return None
+
+
+def _infer_docking_status(r: dict) -> str:
+    """Infer docking status from result data."""
+    engine = r.get("docking_engine") or r.get("docking_method") or ""
+    has_pose = bool(r.get("pose_pdbqt_path") or r.get("pose_sdf_path"))
+    if has_pose and engine.lower() in ("gnina", "vina", "autodock_vina"):
+        return "docked"
+    if engine.lower() in ("mock",):
+        return "docked"  # mock still counts as having been through docking
+    return "not_docked"
+
+
 def _parse_results(raw_list: list[dict]) -> list[DockingResult]:
     """Convert raw JSON dicts into DockingResult pydantic models with V3 fields."""
     results: list[DockingResult] = []
@@ -495,8 +491,8 @@ def _parse_results(raw_list: list[dict]) -> list[DockingResult]:
             hba=r.get("hba"),
             rotatable_bonds=r.get("rotatable_bonds"),
             composite_score=composite,
-            svg=r.get("svg_2d") or r.get("svg"),
-            pose_pdbqt=r.get("pose_pdbqt_path"),
+            svg=r.get("svg_2d") or r.get("svg") or _lazy_svg(r.get("smiles")),
+            pose_pdbqt=r.get("pose_pdbqt_path") or r.get("pose_sdf_path"),
             source=r.get("source"),
             admet=admet_obj,
             synthesis_route=synth_obj,
@@ -538,6 +534,11 @@ def _parse_results(raw_list: list[dict]) -> list[DockingResult]:
             # V6.3 fields
             combined_off_target=r.get("combined_off_target"),
             herg_specialized=r.get("herg_specialized"),
+            # V11 fields: docking transparency
+            docking_engine=r.get("docking_engine"),
+            docking_status=r.get("docking_status") or _infer_docking_status(r),
+            # V12 fields: pose quality
+            pose_quality=r.get("pose_quality"),
         ))
     return results
 
@@ -736,6 +737,7 @@ async def get_project_endpoint(
             "enable_generation": bool(j.enable_generation) if hasattr(j, 'enable_generation') else False,
             "has_custom_smiles": bool(j.smiles_list) if hasattr(j, 'smiles_list') else False,
             "best_score": _job_best_score(j),
+            "error_message": j.error_message if j.status == "failed" else None,
         } for j in jobs],
     }
 
@@ -1750,7 +1752,10 @@ async def download_pose(job_id: str, ligand_index: int) -> FileResponse:
             detail=f"Ligand index {ligand_index} out of range (0-{len(results)-1})",
         )
 
-    pose_path_str = results[ligand_index].get("pose_pdbqt_path")
+    pose_path_str = (
+        results[ligand_index].get("pose_pdbqt_path")
+        or results[ligand_index].get("pose_sdf_path")
+    )
     if not pose_path_str:
         raise HTTPException(status_code=404, detail="Pose file not available for this ligand")
 
@@ -1893,6 +1898,16 @@ async def start_optimization(job_id: str, body: OptimizationRequest) -> dict:
         "n_iterations": body.n_iterations,
         "variants_per_iter": body.variants_per_iter,
         "structural_rules": body.modification_rules.model_dump() if body.modification_rules else None,
+        "docking_engine": body.docking_engine,
+        "dock_top_n": body.dock_top_n,
+        "exhaustiveness": body.exhaustiveness,
+        # V12: granular analysis flags
+        "enable_admet": body.enable_admet,
+        "enable_synthesis": body.enable_synthesis,
+        "enable_selectivity": body.enable_selectivity,
+        "enable_herg": body.enable_herg,
+        "enable_safety": body.enable_safety,
+        "box_size": body.box_size,
     }
 
     # Store initial status
@@ -1951,6 +1966,40 @@ async def get_optimization_status(job_id: str, opt_id: str) -> OptimizationStatu
         Current status, progress, and results (if completed).
     """
     opt_data = _optimization_results.get(opt_id)
+
+    # If not in memory, try to recover from disk (e.g. after API restart)
+    if opt_data is None:
+        result_path = DATA_DIR / job_id / "optimization" / opt_id / "result.json"
+        if result_path.exists():
+            try:
+                with open(result_path, "r", encoding="utf-8") as f:
+                    result = json.load(f)
+                # Try to recover created_job_id from meta file
+                created_job_id = None
+                meta_path = DATA_DIR / job_id / "optimization" / opt_id / "meta.json"
+                if meta_path.exists():
+                    try:
+                        meta = json.loads(meta_path.read_text())
+                        created_job_id = meta.get("created_job_id")
+                    except Exception:
+                        pass
+                opt_data = {
+                    "optimization_id": opt_id,
+                    "job_id": job_id,
+                    "status": "completed",
+                    "progress": 100,
+                    "current_iteration": result.get("total_tested", 10),
+                    "total_iterations": len(result.get("iterations", [])) or 10,
+                    "best_score": result.get("final_lead", {}).get("score")
+                                 or result.get("best_molecule", {}).get("score"),
+                    "result": result,
+                    "error_message": None,
+                    "created_job_id": created_job_id,
+                }
+                _optimization_results[opt_id] = opt_data
+            except (json.JSONDecodeError, IOError):
+                pass
+
     if opt_data is None:
         raise HTTPException(
             status_code=404,
@@ -1970,12 +2019,24 @@ async def get_optimization_status(job_id: str, opt_id: str) -> OptimizationStatu
             try:
                 with open(result_path, "r", encoding="utf-8") as f:
                     result = json.load(f)
+                # Also recover created_job_id from meta.json
+                created_job_id = opt_data.get("created_job_id")
+                if not created_job_id:
+                    meta_path = DATA_DIR / job_id / "optimization" / opt_id / "meta.json"
+                    if meta_path.exists():
+                        try:
+                            meta = json.loads(meta_path.read_text())
+                            created_job_id = meta.get("created_job_id")
+                        except Exception:
+                            pass
                 opt_data.update({
                     "status": "completed",
                     "progress": 100,
                     "result": result,
-                    "best_score": result.get("final_lead", {}).get("score"),
+                    "best_score": result.get("final_lead", {}).get("score")
+                                 or result.get("best_molecule", {}).get("score"),
                     "current_iteration": opt_data.get("total_iterations", 10),
+                    "created_job_id": created_job_id,
                 })
             except (json.JSONDecodeError, IOError):
                 pass
@@ -1990,6 +2051,7 @@ async def get_optimization_status(job_id: str, opt_id: str) -> OptimizationStatu
         best_score=opt_data.get("best_score"),
         result=opt_data.get("result"),
         error_message=opt_data.get("error_message"),
+        created_job_id=opt_data.get("created_job_id"),
     )
 
 
@@ -2022,6 +2084,35 @@ def _dispatch_optimization_task(opt_id: str, params: dict) -> None:
         _run_optimization_sync(opt_id, params)
 
 
+def _create_job_from_optimization(opt_id: str, params: dict, result: dict) -> Optional[str]:
+    """Create a new job in the project from optimization results.
+
+    Delegates to the same function in tasks.py for consistency (single
+    implementation of the enrichment pipeline integration).
+
+    Parameters
+    ----------
+    opt_id : str
+        Optimization UUID.
+    params : dict
+        Original optimization parameters (contains ``job_id``).
+    result : dict
+        Optimization result dict with ``final_lead``, ``best_molecule``,
+        ``iterations``, etc.
+
+    Returns
+    -------
+    str or None
+        The new job_id, or None on failure.
+    """
+    try:
+        from tasks import _create_job_from_optimization as _tasks_create
+        return _tasks_create(opt_id, params, result)
+    except Exception as exc:
+        logger.warning("Failed to create job from optimization %s: %s", opt_id, exc)
+        return None
+
+
 def _run_optimization_sync(opt_id: str, params: dict) -> None:
     """Run optimization synchronously (fallback when Celery is unavailable).
 
@@ -2042,17 +2133,29 @@ def _run_optimization_sync(opt_id: str, params: dict) -> None:
         job_id = params["job_id"]
         work_dir = DATA_DIR / job_id
 
-        # Get pocket center from the job's pipeline summary
+        # Get pocket center and receptor path from the job's pipeline summary
         job = get_job(job_id)
         pocket_center = [22.0, 0.5, 18.0]  # fallback default
+        target_pdbqt = None
         if job and job.pipeline_summary_json:
             try:
                 summary = json.loads(job.pipeline_summary_json)
                 pocket_center = summary.get("best_pocket_center", pocket_center)
+                # V12: resolve receptor path from pipeline summary
+                rp = summary.get("receptor_path", "")
+                if rp and Path(rp).exists():
+                    target_pdbqt = rp
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        target_pdbqt = str(work_dir / "receptor.pdbqt")
+        # V12: resolve receptor path (same logic as celery task)
+        if not target_pdbqt:
+            receptor_candidates = sorted(work_dir.glob("*receptor*.pdbqt"))
+            if receptor_candidates:
+                target_pdbqt = str(receptor_candidates[0])
+            else:
+                target_pdbqt = str(work_dir / "receptor.pdbqt")
+                logger.warning("No receptor found for opt %s, using default: %s", opt_id, target_pdbqt)
 
         def progress_cb(iteration: int, score: float, message: str) -> None:
             n_iters = params.get("n_iterations", 10)
@@ -2074,20 +2177,29 @@ def _run_optimization_sync(opt_id: str, params: dict) -> None:
             work_dir=work_dir / "optimization" / opt_id,
             progress_callback=progress_cb,
             structural_rules=params.get("structural_rules"),
+            docking_engine=params.get("docking_engine", "auto"),
+            pocket_size=params.get("pocket_size", [25.0, 25.0, 25.0]),
+            exhaustiveness=params.get("exhaustiveness", 8),
+            dock_top_n=params.get("dock_top_n", 20),
         )
+
+        # Auto-create a new job in the project with optimization results
+        new_job_id = _create_job_from_optimization(opt_id, params, result)
 
         _optimization_results[opt_id].update({
             "status": "completed",
             "progress": 100,
             "result": result,
             "best_score": result["final_lead"]["score"],
+            "created_job_id": new_job_id,
         })
 
         logger.info(
-            "Optimization %s completed: score %.3f -> %.3f",
+            "Optimization %s completed: score %.3f -> %.3f (new job: %s)",
             opt_id,
             result["starting_molecule"]["score"],
             result["final_lead"]["score"],
+            new_job_id,
         )
 
     except Exception as exc:

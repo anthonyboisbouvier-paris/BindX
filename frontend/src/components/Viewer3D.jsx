@@ -271,6 +271,7 @@ export default function Viewer3D({
   const [currentStyle, setCurrentStyle] = useState('cartoon')
   const [colorMode, setColorMode] = useState('default')
   const [ligandLoaded, setLigandLoaded] = useState(false)
+  const [noPose, setNoPose] = useState(false)
   const [showPocket, setShowPocket] = useState(true)
   const [annotations, setAnnotations] = useState({
     activeSites: false,
@@ -322,6 +323,7 @@ export default function Viewer3D({
     setLoading(true)
     setError(null)
     setLigandLoaded(false)
+    setNoPose(false)
 
     try {
       const $3Dmol = await load3Dmol()
@@ -376,18 +378,31 @@ export default function Viewer3D({
       }
 
       const poseUrl = getPoseUrl(jobId, poseIndex)
-      const response = await fetch(poseUrl)
-      if (!response.ok) {
-        console.warn(`[Viewer3D] Pose ${poseIndex} not available: ${response.status}`)
+      let poseLoaded = false
+      try {
+        const response = await fetch(poseUrl)
+        if (response.ok) {
+          const poseData = await response.text()
+          const isSdf = /V2000|V3000|\$\$\$\$/.test(poseData)
+          const isPdbqt = /BRANCH|ENDROOT|TORSDOF/.test(poseData)
+          const format = isSdf ? 'sdf' : isPdbqt ? 'pdbqt' : 'pdb'
+          viewer.addModel(poseData, format)
+          poseLoaded = true
+        }
+      } catch (fetchErr) {
+        console.warn(`[Viewer3D] Pose fetch failed for index ${poseIndex}:`, fetchErr)
+      }
+
+      // No pose file available — show "not docked" banner, do NOT render fake ligand
+      if (!poseLoaded) {
+        console.info(`[Viewer3D] No docking pose for index ${poseIndex} — showing banner`)
+        setNoPose(true)
+        setLigandLoaded(false)
+        viewer.render()
         return
       }
 
-      const poseData = await response.text()
-      // Detect SDF format first, then PDBQT, then fall back to PDB
-      const isSdf = /V2000|V3000|\$\$\$\$/.test(poseData)
-      const isPdbqt = /BRANCH|ENDROOT|TORSDOF/.test(poseData)
-      const format = isSdf ? 'sdf' : isPdbqt ? 'pdbqt' : 'pdb'
-      viewer.addModel(poseData, format)
+      setNoPose(false)
 
       // Last model is the ligand
       const models2 = viewer.getModelList()
@@ -412,8 +427,13 @@ export default function Viewer3D({
         }
       }
 
-      viewer.zoomTo()
-      viewer.zoom(1.2)
+      // Zoom to ligand region (not the whole protein) so the pose is visible
+      try {
+        viewer.zoomTo({ model: ligandModel })
+        viewer.zoom(0.7) // zoom out slightly to show surrounding pocket
+      } catch (_) {
+        viewer.zoomTo()
+      }
       viewer.render()
       setLigandLoaded(true)
     } catch (err) {
@@ -685,6 +705,22 @@ export default function Viewer3D({
           className="w-full h-full viewer-container"
           style={{ visibility: loading || error ? 'hidden' : 'visible' }}
         />
+
+        {/* "Not docked" banner — shown when selected molecule has no pose */}
+        {noPose && !loading && !error && (
+          <div className="absolute inset-x-0 bottom-0 flex items-center justify-center z-10 pointer-events-none pb-6">
+            <div className="bg-gray-800/90 backdrop-blur-sm border border-gray-600 rounded-xl px-6 py-3 flex items-center gap-3 shadow-lg pointer-events-auto">
+              <svg className="w-5 h-5 text-amber-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                  d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" />
+              </svg>
+              <div>
+                <p className="text-white text-sm font-semibold">No docking pose available</p>
+                <p className="text-gray-400 text-xs">This molecule was not docked — only real docked poses are shown</p>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Legend + annotation toggles */}

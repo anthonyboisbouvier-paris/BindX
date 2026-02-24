@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useProject } from '../../contexts/ProjectContext.jsx'
 import { previewTarget, previewSequence, updateProject, runTargetAssessment } from '../../api.js'
@@ -397,7 +397,7 @@ function UniProtInfoCard({ uniprotId, onFeaturesLoaded }) {
 }
 
 // ---------------------------------------------------------------------------
-// ProteinPreviewViewer — lightweight 3D viewer for Target Setup
+// ProteinPreviewViewer — full-featured 3D viewer for Target Setup
 // ---------------------------------------------------------------------------
 
 function load3DmolLib() {
@@ -420,31 +420,84 @@ function load3DmolLib() {
 
 const PREVIEW_DOMAIN_COLORS = ['#6366f1', '#8b5cf6', '#ec4899', '#14b8a6', '#f59e0b', '#06b6d4']
 
-function ProteinPreviewViewer({ pdbUrl, pdbData, uniprotFeatures }) {
-  const containerRef = React.useRef(null)
-  const viewerRef = React.useRef(null)
-  const [viewerError, setViewerError] = React.useState(null)
-  const [viewerReady, setViewerReady] = React.useState(false)
+const PREVIEW_COLOR_LABELS = {
+  default: 'Default',
+  chain:   'Chain',
+  ss:      'Sec. Structure',
+  spectrum: 'Spectrum',
+}
 
+function previewGetColorSpec(mode) {
+  switch (mode) {
+    case 'chain':    return { colorscheme: 'chain' }
+    case 'ss':       return { colorscheme: 'ssJmol' }
+    case 'spectrum': return { colorscheme: { gradient: 'roygb', min: 0, max: 1, prop: 'resi' } }
+    default:         return { color: '#4a9eff' }
+  }
+}
+
+// Parse residue numbers from pocket.residues (array of "ALA_123" or plain integers)
+function parsePocketResidues(residues) {
+  if (!residues) return []
+  const arr = Array.isArray(residues)
+    ? residues
+    : typeof residues === 'string'
+      ? residues.split(',').map(s => s.trim()).filter(Boolean)
+      : []
+  return arr.map((r) => {
+    if (typeof r === 'number') return r
+    const parts = String(r).split('_')
+    const n = parseInt(parts[parts.length - 1])
+    return isNaN(n) ? null : n
+  }).filter(n => n !== null)
+}
+
+/**
+ * ProteinPreviewViewer
+ * Props:
+ *   pdbUrl        — URL to fetch PDB from
+ *   pdbData       — raw PDB string (if already available)
+ *   uniprotFeatures — { domains, activeSites, bindingSites }
+ *   selectedPocket  — pocket object { center, residues } or null
+ */
+function ProteinPreviewViewer({ pdbUrl, pdbData, uniprotFeatures, selectedPocket }) {
+  const containerRef = useRef(null)
+  const viewerRef = useRef(null)
+  const surfaceActiveRef = useRef(false)
+
+  const [viewerError, setViewerError] = useState(null)
+  const [viewerLoading, setViewerLoading] = useState(false)
+  const [viewerReady, setViewerReady] = useState(false)
+  const [currentStyle, setCurrentStyle] = useState('cartoon')
+  const [colorMode, setColorMode] = useState('default')
+  const [showPocket, setShowPocket] = useState(true)
+  const [showAnnotations, setShowAnnotations] = useState(true)
+
+  // ------------------------------------------------------------------
+  // Initialize viewer when PDB source changes
+  // ------------------------------------------------------------------
   useEffect(() => {
     if (!containerRef.current) return
     if (!pdbUrl && !pdbData) return
 
     let cancelled = false
+    setViewerLoading(true)
+    setViewerReady(false)
+    setViewerError(null)
 
     async function initViewer() {
       try {
         const $3Dmol = await load3DmolLib()
         if (cancelled || !containerRef.current) return
 
-        // Clean up previous viewer
         if (viewerRef.current) {
           try { viewerRef.current.clear() } catch (_) {}
         }
         containerRef.current.innerHTML = ''
+        surfaceActiveRef.current = false
 
         const viewer = $3Dmol.createViewer(containerRef.current, {
-          backgroundColor: '#f8fafc',
+          backgroundColor: '#0f1923',
           antialias: true,
         })
         viewerRef.current = viewer
@@ -458,12 +511,14 @@ function ProteinPreviewViewer({ pdbUrl, pdbData, uniprotFeatures }) {
           viewer.addModel(text, 'pdb')
         }
 
-        viewer.setStyle({}, { cartoon: { color: '#4a9eff' } })
+        viewer.setStyle({}, { cartoon: { color: '#4a9eff', opacity: 0.85 } })
         viewer.zoomTo()
         viewer.render()
-        setViewerReady(true)
+        if (!cancelled) setViewerReady(true)
       } catch (err) {
         if (!cancelled) setViewerError(err.message)
+      } finally {
+        if (!cancelled) setViewerLoading(false)
       }
     }
 
@@ -471,36 +526,312 @@ function ProteinPreviewViewer({ pdbUrl, pdbData, uniprotFeatures }) {
     return () => { cancelled = true }
   }, [pdbUrl, pdbData])
 
-  // Apply domain coloring when UniProt features arrive
+  // ------------------------------------------------------------------
+  // applyAllStyles — rebuild representation + pocket highlight
+  // ------------------------------------------------------------------
+  const applyAllStyles = useCallback(() => {
+    const viewer = viewerRef.current
+    if (!viewer || !viewerReady) return
+
+    const models = viewer.getModelList()
+    const proteinModel = models?.[0]
+    if (!proteinModel) return
+
+    // Remove surfaces and shapes before rebuilding
+    if (surfaceActiveRef.current) {
+      try { viewer.removeAllSurfaces() } catch (_) {}
+      surfaceActiveRef.current = false
+    }
+    try { viewer.removeAllShapes() } catch (_) {}
+
+    const colorSpec = previewGetColorSpec(colorMode)
+
+    // Base protein style
+    if (currentStyle === 'surface') {
+      viewer.setStyle({ model: proteinModel }, {
+        cartoon: { ...colorSpec, opacity: 0.25 },
+      })
+      const $3Dmol = window.$3Dmol
+      const surfaceType = $3Dmol?.SurfaceType?.VDW ?? 1
+      viewer.addSurface(
+        surfaceType,
+        { opacity: 0.35, color: '#e2e8f0' },
+        { model: proteinModel }
+      )
+      surfaceActiveRef.current = true
+    } else if (currentStyle === 'cartoon') {
+      viewer.setStyle({ model: proteinModel }, {
+        cartoon: { ...colorSpec, opacity: 0.85 },
+      })
+    } else if (currentStyle === 'ball+stick') {
+      viewer.setStyle({ model: proteinModel }, {
+        stick: { ...colorSpec, radius: 0.12 },
+        sphere: { ...colorSpec, radius: 0.25 },
+      })
+    } else {
+      // stick
+      viewer.setStyle({ model: proteinModel }, {
+        stick: { ...colorSpec, radius: 0.15 },
+      })
+    }
+
+    // Domain coloring overlay (UniProt)
+    if (uniprotFeatures?.domains?.length) {
+      uniprotFeatures.domains.forEach((d, i) => {
+        if (!d.start || !d.end) return
+        const resis = []
+        for (let r = d.start; r <= d.end; r++) resis.push(r)
+        viewer.addStyle(
+          { resi: resis, model: proteinModel },
+          { cartoon: { color: PREVIEW_DOMAIN_COLORS[i % PREVIEW_DOMAIN_COLORS.length], opacity: 0.95 } }
+        )
+      })
+    }
+
+    // Active sites (UniProt annotations)
+    if (showAnnotations && uniprotFeatures?.activeSites?.length) {
+      uniprotFeatures.activeSites.forEach(site => {
+        if (!site.position) return
+        viewer.addStyle(
+          { resi: [site.position], model: proteinModel },
+          { stick: { color: '#ef4444', radius: 0.18, opacity: 0.9 } }
+        )
+        viewer.addStyle(
+          { resi: [site.position], atom: 'CA', model: proteinModel },
+          { sphere: { color: '#ef4444', radius: 0.35, opacity: 0.8 } }
+        )
+      })
+    }
+
+    // Binding sites (UniProt annotations)
+    if (showAnnotations && uniprotFeatures?.bindingSites?.length) {
+      uniprotFeatures.bindingSites.forEach(site => {
+        if (!site.start) return
+        const resis = []
+        for (let r = site.start; r <= (site.end || site.start); r++) resis.push(r)
+        viewer.addStyle(
+          { resi: resis, model: proteinModel },
+          { stick: { color: '#f97316', radius: 0.16, opacity: 0.85 } }
+        )
+      })
+    }
+
+    // Pocket highlight
+    if (showPocket && selectedPocket) {
+      const center = selectedPocket.center
+      if (Array.isArray(center) && center.length === 3) {
+        const [x, y, z] = center
+        viewer.addSphere({
+          center: { x, y, z },
+          radius: 7,
+          color: '#facc15',
+          opacity: 0.35,
+          wireframe: false,
+        })
+      }
+
+      const residueNums = parsePocketResidues(selectedPocket.residues)
+      if (residueNums.length > 0) {
+        viewer.addStyle(
+          { resi: residueNums, model: proteinModel },
+          { stick: { color: '#f59e0b', radius: 0.14, opacity: 0.85 } }
+        )
+        // Small spheres on pocket residue CA atoms for clarity
+        viewer.addStyle(
+          { resi: residueNums, atom: 'CA', model: proteinModel },
+          { sphere: { color: '#fbbf24', radius: 0.28, opacity: 0.7 } }
+        )
+      }
+    }
+
+    viewer.render()
+  }, [viewerReady, currentStyle, colorMode, showPocket, showAnnotations, selectedPocket, uniprotFeatures])
+
+  // Re-apply styles whenever representation or pocket changes
+  useEffect(() => {
+    applyAllStyles()
+  }, [applyAllStyles])
+
+  // Auto-zoom to pocket when it changes
   useEffect(() => {
     const viewer = viewerRef.current
-    if (!viewer || !viewerReady || !uniprotFeatures?.domains?.length) return
-
-    uniprotFeatures.domains.forEach((d, i) => {
-      if (!d.start || !d.end) return
-      const resis = []
-      for (let r = d.start; r <= d.end; r++) resis.push(r)
-      viewer.addStyle({ resi: resis }, {
-        cartoon: { color: PREVIEW_DOMAIN_COLORS[i % PREVIEW_DOMAIN_COLORS.length], opacity: 1.0 },
-      })
-    })
+    if (!viewer || !viewerReady || !selectedPocket?.center) return
+    const [x, y, z] = selectedPocket.center
+    // Zoom to region around pocket center
+    viewer.zoomTo({ resi: parsePocketResidues(selectedPocket.residues).slice(0, 5) })
+    viewer.zoom(1.1)
     viewer.render()
-  }, [viewerReady, uniprotFeatures])
+  }, [selectedPocket, viewerReady])
 
+  const handleReset = () => {
+    const viewer = viewerRef.current
+    if (!viewer) return
+    viewer.zoomTo()
+    viewer.render()
+  }
+
+  // ------------------------------------------------------------------
+  // Render
+  // ------------------------------------------------------------------
   if (viewerError) {
     return (
-      <div className="h-48 w-full rounded-xl bg-gray-50 border border-gray-200 flex items-center justify-center">
-        <p className="text-xs text-gray-400">3D viewer unavailable: {viewerError}</p>
+      <div className="rounded-xl overflow-hidden border border-gray-200 bg-gray-900">
+        <div className="h-64 flex flex-col items-center justify-center gap-2">
+          <svg className="w-8 h-8 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+          <p className="text-xs text-red-400 font-medium">3D viewer unavailable</p>
+          <p className="text-[10px] text-gray-500 text-center px-6">{viewerError}</p>
+        </div>
       </div>
     )
   }
 
+  const hasPocket = !!selectedPocket?.center
+
   return (
-    <div
-      ref={containerRef}
-      className="h-64 w-full rounded-xl overflow-hidden border border-gray-200 bg-[#f8fafc]"
-      style={{ position: 'relative' }}
-    />
+    <div className="rounded-xl overflow-hidden border border-gray-200 shadow-sm">
+      {/* Compact toolbar */}
+      <div className="flex items-center justify-between px-3 py-2 bg-[#1e3a5f] gap-2 flex-wrap">
+        {/* Title */}
+        <span className="text-white text-xs font-semibold flex items-center gap-1.5 flex-shrink-0">
+          <svg className="w-3.5 h-3.5 text-[#22c55e]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+          </svg>
+          3D Preview
+        </span>
+
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {/* Style toggle */}
+          <div className="flex rounded overflow-hidden border border-white/20">
+            {[
+              { id: 'cartoon', label: 'Ribbon' },
+              { id: 'surface', label: 'Surface' },
+              { id: 'stick', label: 'Stick' },
+              { id: 'ball+stick', label: 'Ball+Stick' },
+            ].map((s) => (
+              <button
+                key={s.id}
+                onClick={() => setCurrentStyle(s.id)}
+                className={`px-2 py-1 text-[11px] font-medium transition-colors ${
+                  currentStyle === s.id
+                    ? 'bg-[#22c55e] text-white'
+                    : 'text-white/70 hover:text-white hover:bg-white/10'
+                }`}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Color mode dropdown */}
+          <select
+            value={colorMode}
+            onChange={(e) => setColorMode(e.target.value)}
+            title="Color mode"
+            className="text-[11px] bg-[#2a4f7c] text-white border border-white/20 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-[#22c55e]"
+          >
+            {Object.entries(PREVIEW_COLOR_LABELS).map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
+          </select>
+
+          {/* Pocket toggle — only shown when a pocket is available */}
+          {hasPocket && (
+            <button
+              onClick={() => setShowPocket(v => !v)}
+              title={showPocket ? 'Hide pocket' : 'Show pocket'}
+              className={`flex items-center gap-1 px-2 py-1 rounded border text-[11px] font-medium transition-colors ${
+                showPocket
+                  ? 'bg-amber-500/20 border-amber-400/50 text-amber-300'
+                  : 'border-white/20 text-white/50 hover:text-white/80 hover:bg-white/10'
+              }`}
+            >
+              <span className="w-2 h-2 rounded-full bg-amber-400 inline-block" style={{ opacity: showPocket ? 1 : 0.4 }} />
+              Pocket
+            </button>
+          )}
+
+          {/* Annotations toggle — only shown when active or binding sites are available */}
+          {(uniprotFeatures?.activeSites?.length > 0 || uniprotFeatures?.bindingSites?.length > 0) && (
+            <button
+              onClick={() => setShowAnnotations(v => !v)}
+              title={showAnnotations ? 'Hide annotations' : 'Show annotations'}
+              className={`flex items-center gap-1 px-2 py-1 rounded border text-[11px] font-medium transition-colors ${
+                showAnnotations
+                  ? 'bg-red-500/20 border-red-400/50 text-red-300'
+                  : 'border-white/20 text-white/50 hover:text-white/80 hover:bg-white/10'
+              }`}
+            >
+              <span className="w-2 h-2 rounded-full bg-red-400 inline-block" style={{ opacity: showAnnotations ? 1 : 0.4 }} />
+              Sites
+            </button>
+          )}
+
+          {/* Reset view */}
+          <button
+            onClick={handleReset}
+            title="Reset view"
+            className="p-1 text-white/60 hover:text-white hover:bg-white/10 rounded transition-colors"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      {/* Viewer canvas */}
+      <div className="relative bg-gray-900" style={{ height: '340px' }}>
+        {viewerLoading && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center z-10 bg-[#0f1923]">
+            <div className="w-10 h-10 border-2 border-[#22c55e] border-t-transparent rounded-full animate-spin mb-3" />
+            <p className="text-white/60 text-xs">Loading 3D structure...</p>
+          </div>
+        )}
+        <div
+          ref={containerRef}
+          className="w-full h-full"
+          style={{ visibility: viewerLoading ? 'hidden' : 'visible' }}
+        />
+      </div>
+
+      {/* Legend bar */}
+      <div className="flex items-center gap-3 px-3 py-1.5 bg-gray-50 border-t border-gray-100 text-[11px] text-gray-400 flex-wrap">
+        <span className="flex items-center gap-1.5">
+          <span className="w-2.5 h-2.5 rounded-full bg-blue-400 inline-block" />
+          Protein
+        </span>
+        {uniprotFeatures?.domains?.length > 0 && (
+          <span className="flex items-center gap-1.5">
+            <span className="w-2.5 h-2.5 rounded-full bg-indigo-400 inline-block" />
+            Domains
+          </span>
+        )}
+        {hasPocket && showPocket && (
+          <span className="flex items-center gap-1.5">
+            <span className="w-2.5 h-2.5 rounded-full bg-amber-400 inline-block" />
+            Selected Pocket
+          </span>
+        )}
+        {showAnnotations && uniprotFeatures?.activeSites?.length > 0 && (
+          <span className="flex items-center gap-1.5">
+            <span className="w-2.5 h-2.5 rounded-full bg-red-500 inline-block" />
+            Active Sites
+          </span>
+        )}
+        {showAnnotations && uniprotFeatures?.bindingSites?.length > 0 && (
+          <span className="flex items-center gap-1.5">
+            <span className="w-2.5 h-2.5 rounded-full bg-orange-500 inline-block" />
+            Binding Sites
+          </span>
+        )}
+        <span className="ml-auto text-gray-300 hidden sm:inline">
+          Drag: rotate  |  Scroll: zoom  |  Right-drag: pan
+        </span>
+      </div>
+    </div>
   )
 }
 
@@ -955,11 +1286,13 @@ export default function TargetSetup() {
       {hasPreview && hasStructures && (() => {
         const sel = structures[selectedStructureIdx] || structures[0]
         if (!sel) return null
+        const activePocket = pockets[selectedPocketIdx] || null
         return (
           <ProteinPreviewViewer
             pdbUrl={sel.download_url || null}
             pdbData={sel.pdb_data || null}
             uniprotFeatures={uniprotFeatures}
+            selectedPocket={activePocket}
           />
         )
       })()}

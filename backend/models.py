@@ -192,6 +192,19 @@ class JobCreate(BaseModel):
         default=None, description="Email address for completion notification (deep mode)",
     )
 
+    # V11: unified pipeline controls
+    enable_dmpk: bool = Field(
+        default=True, description="Master toggle: DMPK analysis (backward compat, overrides all below when False)",
+    )
+
+    # V12: granular analysis toggles
+    enable_admet: bool = Field(default=True, description="ADMET prediction")
+    enable_synthesis: bool = Field(default=True, description="Retrosynthesis analysis")
+    enable_selectivity: bool = Field(default=True, description="Off-target selectivity screening")
+    enable_herg: bool = Field(default=True, description="hERG channel safety")
+    enable_safety: bool = Field(default=True, description="Confidence, PAINS, applicability domain")
+    box_size: Optional[list[float]] = Field(default=None, description="Docking box [x,y,z] Angstroms, None=auto from pocket")
+
     # V7: Project association
     project_id: Optional[str] = Field(
         default=None, description="Project ID to associate this job with",
@@ -335,6 +348,17 @@ class SynthesisRoute(BaseModel):
 # Docking result (V1 + V2 + V3 fields)
 # ---------------------------------------------------------------------------
 
+class PoseQuality(BaseModel):
+    """Structured pose quality metrics from interaction analysis."""
+
+    n_contacts_4A: int = 0
+    n_hbonds: int = 0
+    key_residue_distances: Optional[dict] = None  # {"MET793": 2.8, "THR790": 3.1}
+    has_clashes: bool = False
+    n_clashes: int = 0
+    interaction_quality: float = 0.0
+
+
 class DockingResult(BaseModel):
     """One docked ligand with computed properties."""
 
@@ -400,6 +424,13 @@ class DockingResult(BaseModel):
     # V6.3 fields
     combined_off_target: Optional[dict] = None  # SEA + docking combined screening
     herg_specialized: Optional[dict] = None  # Specialized hERG IC50 prediction
+
+    # V11 fields: docking transparency
+    docking_engine: Optional[str] = None  # "gnina" | "vina" | "mock" | None
+    docking_status: Optional[str] = None  # "docked" | "not_docked" | "failed"
+
+    # V12 fields: pose quality
+    pose_quality: Optional[PoseQuality] = None
 
 
 class JobResults(BaseModel):
@@ -516,7 +547,27 @@ class OptimizationRequest(BaseModel):
         default=50, ge=10, le=200,
         description="Number of variants to generate per iteration",
     )
+    docking_engine: str = Field(
+        default="gnina",
+        description="Docking engine for optimization: gnina (recommended), vina, none (skip docking), auto, or mock",
+    )
+    dock_top_n: int = Field(
+        default=20, ge=5, le=100,
+        description="Number of pre-filtered variants to actually dock per iteration",
+    )
+    exhaustiveness: int = Field(
+        default=8, ge=1, le=32,
+        description="Docking search exhaustiveness",
+    )
     modification_rules: Optional[StructuralRules] = None  # structural rules
+
+    # V12: granular analysis toggles (same as JobCreate for parity)
+    enable_admet: bool = Field(default=True, description="ADMET prediction")
+    enable_synthesis: bool = Field(default=True, description="Retrosynthesis analysis")
+    enable_selectivity: bool = Field(default=True, description="Off-target selectivity screening")
+    enable_herg: bool = Field(default=True, description="hERG channel safety")
+    enable_safety: bool = Field(default=True, description="Confidence, PAINS, applicability domain")
+    box_size: Optional[list[float]] = Field(default=None, description="Docking box [x,y,z] Angstroms")
 
 
 class OptimizationStatus(BaseModel):
@@ -531,6 +582,7 @@ class OptimizationStatus(BaseModel):
     best_score: Optional[float] = None
     result: Optional[dict] = None
     error_message: Optional[str] = None
+    created_job_id: Optional[str] = None  # New job created from optimization results
 
 
 # ---------------------------------------------------------------------------

@@ -33,9 +33,9 @@ const SCIENCE_CARDS = {
   },
   docking: {
     icon: '⚡',
-    title: 'AutoDock Vina — Simulating Molecular Binding',
-    body: 'AutoDock Vina uses a gradient-based optimizer and an empirical scoring function to predict how each molecule fits into the binding pocket. For each candidate it explores millions of conformational poses and reports the lowest-energy binding mode as a kcal/mol affinity score.',
-    ref: 'Trott & Olson, AutoDock Vina: improving speed and accuracy, J Comput Chem 2010',
+    title: 'Molecular Docking — Simulating Binding',
+    body: 'The docking engine uses sophisticated scoring functions to predict how each molecule fits into the binding pocket. For each candidate it explores millions of conformational poses and reports the lowest-energy binding mode as a kcal/mol affinity score. GNINA adds CNN-based rescoring for higher accuracy.',
+    ref: 'McNutt et al., GNINA 1.0: molecular docking with deep learning, JCIM 2021',
   },
   admet: {
     icon: '🔬',

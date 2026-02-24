@@ -202,7 +202,7 @@ def run_docking(
     receptor_pdbqt: Path,
     ligand_pdbqt: Path,
     center: tuple[float, float, float],
-    size: tuple[float, float, float] = (25.0, 25.0, 25.0),
+    size: tuple[float, float, float] = (20.0, 20.0, 20.0),
     exhaustiveness: int = 8,
     docking_engine: str = "auto",
 ) -> dict:
@@ -277,7 +277,7 @@ def run_docking(
         logger.warning("Real Vina run failed; falling back to mock")
 
     # ----- Mock fallback -----
-    return _run_mock_docking(ligand_pdbqt)
+    return _run_mock_docking(ligand_pdbqt, center=center)
 
 
 def _extract_first_model_sdf(path: Path) -> None:
@@ -359,8 +359,8 @@ def _run_vina_real(
 ) -> Optional[dict]:
     """Execute the actual Vina binary."""
     out_path = ligand_pdbqt.parent / f"{ligand_pdbqt.stem}_out.pdbqt"
-    log_path = ligand_pdbqt.parent / f"{ligand_pdbqt.stem}_log.txt"
 
+    # NOTE: Vina 1.2+ does NOT support --log. Output goes to stdout.
     cmd = [
         "vina",
         "--receptor", str(receptor_pdbqt),
@@ -373,7 +373,6 @@ def _run_vina_real(
         "--size_z", f"{size[2]:.1f}",
         "--exhaustiveness", str(exhaustiveness),
         "--out", str(out_path),
-        "--log", str(log_path),
     ]
 
     try:
@@ -391,13 +390,13 @@ def _run_vina_real(
             )
             return None
 
-        # Parse affinity from log or stdout
-        affinity = _parse_vina_affinity(log_path, proc.stdout)
+        # Parse affinity from stdout (Vina 1.2+ prints results table there)
+        affinity = _parse_vina_affinity(proc.stdout)
         if affinity is None:
             affinity = _parse_vina_affinity_from_pdbqt(out_path)
 
         if affinity is None:
-            logger.warning("Could not parse Vina affinity")
+            logger.warning("Could not parse Vina affinity from stdout or PDBQT")
             return None
 
         return {
@@ -417,23 +416,32 @@ def _run_vina_real(
         return None
 
 
-def _parse_vina_affinity(log_path: Path, stdout: str) -> Optional[float]:
-    """Extract the best binding affinity from Vina log/stdout."""
-    text = ""
-    if log_path.exists():
-        text = log_path.read_text()
-    text += "\n" + stdout
+def _parse_vina_affinity(stdout: str) -> Optional[float]:
+    """Extract the best binding affinity from Vina stdout.
 
-    # Pattern: "   1     -8.3      0.000      0.000"
-    matches = re.findall(r"^\s*1\s+([-\d.]+)", text, re.MULTILINE)
+    Vina 1.2+ prints a results table to stdout like:
+        mode |   affinity | dist from best mode
+                          | rmsd l.b.| rmsd u.b.
+        -----+------------+----------+----------
+           1       -8.3          0.000      0.000
+           2       -7.9          1.234      2.345
+    """
+    # Match lines like: "   1       -8.3      0.000      0.000"
+    # The key change: allow multiple spaces between mode number and affinity
+    matches = re.findall(
+        r"^\s*(\d+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)",
+        stdout,
+        re.MULTILINE,
+    )
     if matches:
+        # First match is mode 1 (best pose)
         try:
-            return float(matches[0])
-        except ValueError:
+            return float(matches[0][1])
+        except (ValueError, IndexError):
             pass
 
-    # Alternative: "Affinity: -8.3 (kcal/mol)"
-    m = re.search(r"Affinity:\s*([-\d.]+)", text)
+    # Fallback: "Affinity: -8.3 (kcal/mol)"
+    m = re.search(r"Affinity:\s*([-\d.]+)", stdout)
     if m:
         return float(m.group(1))
 
@@ -471,10 +479,8 @@ def _run_mock_docking(ligand_pdbqt: Path) -> dict:
     Uses deterministic hash-based generation so repeated runs produce
     the same results for the same input.
 
-    Score ranges:
-    - vina_score: -12.0 to -4.0 (kcal/mol, lower = better)
-    - cnn_score: 0.3 to 0.95 (pose confidence, higher = better)
-    - cnn_affinity: 5.0 to 9.5 (pK units, higher = better)
+    Mock docking does NOT produce a valid 3D pose — the pose file is
+    not generated because coordinates would be scientifically meaningless.
 
     Parameters
     ----------
@@ -485,7 +491,7 @@ def _run_mock_docking(ligand_pdbqt: Path) -> dict:
     -------
     dict
         Mock result with ``affinity``, ``vina_score``, ``cnn_score``,
-        ``cnn_affinity``, ``pose_pdbqt_path``, ``docking_engine``.
+        ``cnn_affinity``, ``pose_pdbqt_path`` (None), ``docking_engine``.
     """
     # Use hash of ligand stem for deterministic scores
     stem = ligand_pdbqt.stem
@@ -496,7 +502,6 @@ def _run_mock_docking(ligand_pdbqt: Path) -> dict:
     vina_score = round(rng.uniform(-12.0, -4.0), 1)
 
     # CNN score (pose confidence 0-1)
-    # Use a different part of the hash for variety
     seed2 = int(hashlib.md5(stem.encode()).hexdigest()[8:16], 16)
     rng2 = random.Random(seed2)
     cnn_score = round(rng2.uniform(0.3, 0.95), 3)
@@ -506,23 +511,8 @@ def _run_mock_docking(ligand_pdbqt: Path) -> dict:
     rng3 = random.Random(seed3)
     cnn_affinity = round(rng3.uniform(5.0, 9.5), 2)
 
-    # Create a mock pose file from the input ligand PDBQT
-    pose_path = ligand_pdbqt.parent / f"{ligand_pdbqt.stem}_out.pdbqt"
-    try:
-        ligand_content = ligand_pdbqt.read_text() if ligand_pdbqt.exists() else ""
-        pose_content = (
-            f"REMARK VINA RESULT:    {vina_score:.1f}      0.000      0.000\n"
-            f"REMARK CNN SCORE:      {cnn_score:.3f}\n"
-            f"REMARK CNN AFFINITY:   {cnn_affinity:.2f}\n"
-            f"REMARK  Name = {stem}\n"
-            f"MODEL 1\n"
-            f"{ligand_content}"
-            f"ENDMDL\n"
-        )
-        pose_path.write_text(pose_content)
-    except Exception as exc:
-        logger.warning("Failed to create mock pose file: %s", exc)
-        pose_path = None
+    # Mock docking: NO pose file — coordinates would be meaningless
+    pose_path = None
 
     logger.debug(
         "Mock docking for %s: vina=%.1f cnn_score=%.3f cnn_aff=%.2f",
@@ -613,7 +603,7 @@ def dock_all_ligands(
     center: tuple[float, float, float],
     work_dir: Path,
     progress_callback: Optional[Callable[[int, str], None]] = None,
-    size: tuple[float, float, float] = (25.0, 25.0, 25.0),
+    size: tuple[float, float, float] = (20.0, 20.0, 20.0),
     exhaustiveness: int = 8,
     docking_engine: str = "auto",
 ) -> list[dict]:

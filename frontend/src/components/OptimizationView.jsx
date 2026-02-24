@@ -228,11 +228,14 @@ export default function OptimizationView({ jobId, molecule, onBack, onComplete }
         total: data.total_iterations || data.total || prev.total,
         iterations: data.iterations || prev.iterations,
       }))
-      if (data.status === 'complete' || data.status === 'done') {
+      if (data.status === 'completed' || data.status === 'complete' || data.status === 'done') {
         clearInterval(pollRef.current)
-        setFinalData(data)
+        setFinalData(data.result || data)
         setPhase('complete')
-        if (onComplete) onComplete(data)
+        if (onComplete) onComplete(data.result || data)
+      } else if (data.status === 'error' || data.status === 'failed') {
+        clearInterval(pollRef.current)
+        setError(data.error_message || 'Optimization failed')
       }
     } catch {
       // ignore poll errors
@@ -488,8 +491,9 @@ export default function OptimizationView({ jobId, molecule, onBack, onComplete }
   // PHASE: complete
   // --------------------------------------------------
   const data = finalData || progress
+  const bestMol = data?.best_molecule || data?.final_lead || {}
   const startScoreVal = data?.objectives?.binding_affinity?.start || startScore
-  const finalScoreVal = data?.best_molecule?.score || 0
+  const finalScoreVal = bestMol?.score || 0
   const improvement = finalScoreVal - startScore
 
   return (
@@ -522,7 +526,7 @@ export default function OptimizationView({ jobId, molecule, onBack, onComplete }
           <p className="text-xs font-semibold text-dockit-green uppercase tracking-wide mb-3">After Optimization</p>
           <div className="text-center">
             <div className="text-4xl font-extrabold text-dockit-green">{Math.round(finalScoreVal * 100)}</div>
-            <div className="text-sm text-gray-500 mt-1">{data?.best_molecule?.name || 'Optimized molecule'}</div>
+            <div className="text-sm text-gray-500 mt-1">{bestMol?.name || 'Optimized molecule'}</div>
             <div className={`text-sm font-semibold mt-1 ${improvement >= 0 ? 'text-green-600' : 'text-red-500'}`}>
               {improvement >= 0 ? '+' : ''}{Math.round(improvement * 100)} points
             </div>
