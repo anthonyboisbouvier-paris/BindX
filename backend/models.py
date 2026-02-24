@@ -186,7 +186,7 @@ class JobCreate(BaseModel):
     )
     docking_engine: str = Field(
         default="auto",
-        description="Docking engine: gnina (CNN-scored), vina (classic), or auto (GNINA -> Vina -> mock fallback)",
+        description="Docking engine: gnina (CNN-scored CPU), gnina_gpu (GPU RunPod ~10x faster), vina (classic), or auto (GPU -> GNINA -> Vina -> mock fallback)",
     )
     notification_email: Optional[str] = Field(
         default=None, description="Email address for completion notification (deep mode)",
@@ -549,7 +549,7 @@ class OptimizationRequest(BaseModel):
     )
     docking_engine: str = Field(
         default="gnina",
-        description="Docking engine for optimization: gnina (recommended), vina, none (skip docking), auto, or mock",
+        description="Docking engine for optimization: gnina (recommended), gnina_gpu (GPU RunPod), vina, none (skip docking), auto, or mock",
     )
     dock_top_n: int = Field(
         default=20, ge=5, le=100,

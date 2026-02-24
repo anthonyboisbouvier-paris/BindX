@@ -237,6 +237,12 @@ def run_docking(
     """
     engine = docking_engine.lower().strip() if docking_engine else "auto"
 
+    # ----- Engine: gnina_gpu (single molecule: same as gnina local) -----
+    # GPU batch docking is handled at dock_all_ligands() level.
+    # For single-molecule calls, gnina_gpu falls back to local GNINA.
+    if engine == "gnina_gpu":
+        engine = "gnina"
+
     # ----- Engine: gnina (only GNINA, then mock) -----
     if engine == "gnina":
         if _check_gnina():
@@ -643,6 +649,33 @@ def dock_all_ligands(
     """
     ligand_dir = work_dir / "ligands"
     ligand_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- GPU batch docking (gnina_gpu or auto with GPU available) ---
+    engine = docking_engine.lower().strip() if docking_engine else "auto"
+    if engine in ("gnina_gpu", "auto"):
+        try:
+            from pipeline.docking_gpu import is_gpu_available, dock_all_runpod_batch
+            if engine == "gnina_gpu" or (engine == "auto" and is_gpu_available()):
+                if is_gpu_available():
+                    logger.info("Attempting GPU batch docking (%d ligands)", len(ligands))
+                    gpu_results = dock_all_runpod_batch(
+                        receptor_pdbqt=receptor_pdbqt,
+                        ligands=ligands,
+                        center=center,
+                        work_dir=work_dir,
+                        progress_callback=progress_callback,
+                        size=size,
+                        exhaustiveness=exhaustiveness,
+                    )
+                    if gpu_results:
+                        logger.info("GPU batch docking succeeded: %d results", len(gpu_results))
+                        return gpu_results
+                    logger.warning("GPU batch returned empty results, falling back to local")
+                else:
+                    if engine == "gnina_gpu":
+                        logger.warning("gnina_gpu requested but RUNPOD_API_KEY not set, falling back to local")
+        except Exception as exc:
+            logger.warning("GPU batch docking failed: %s, falling back to local", exc)
 
     results: list[dict] = []
     total = len(ligands)

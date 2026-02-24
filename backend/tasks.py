@@ -631,7 +631,7 @@ def run_pipeline(self, job_id: str, params: dict) -> dict:
             for r in docking_results:
                 r["docking_method"] = "diffdock"
         else:
-            engine_label = {"auto": "Auto (GNINA/Vina)", "gnina": "GNINA", "vina": "Vina"}.get(docking_engine, docking_engine)
+            engine_label = {"auto": "Auto (GPU/GNINA/Vina)", "gnina": "GNINA", "gnina_gpu": "GNINA GPU (RunPod)", "vina": "Vina"}.get(docking_engine, docking_engine)
             _update_progress(job_id, 31, f"Docking with {engine_label}")
             from pipeline.docking import dock_all_ligands
             docking_results = dock_all_ligands(

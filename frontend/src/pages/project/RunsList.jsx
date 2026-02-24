@@ -360,13 +360,24 @@ export default function RunsList() {
             <label className="block text-xs font-medium text-gray-500 mb-2">Docking Engine</label>
             <div className="space-y-2">
               <label className={`flex items-start gap-3 p-3 rounded-lg border-2 cursor-pointer transition-all ${
+                engine === 'gnina_gpu' ? 'border-green-500 bg-green-50/40' : 'border-gray-200 hover:border-gray-300'
+              }`}>
+                <input type="radio" name="engine" value="gnina_gpu" checked={engine === 'gnina_gpu'}
+                  onChange={() => setEngine('gnina_gpu')} className="mt-0.5 accent-[#22c55e]" />
+                <div>
+                  <span className="text-sm font-medium text-green-700">GNINA GPU</span>
+                  <span className="ml-1.5 text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700 font-medium">Cloud</span>
+                  <p className="text-xs text-gray-400">Cloud GPU — 10x faster, ~0.03 USD/run</p>
+                </div>
+              </label>
+              <label className={`flex items-start gap-3 p-3 rounded-lg border-2 cursor-pointer transition-all ${
                 engine === 'gnina' ? 'border-[#1e3a5f] bg-blue-50/40' : 'border-gray-200 hover:border-gray-300'
               }`}>
                 <input type="radio" name="engine" value="gnina" checked={engine === 'gnina'}
                   onChange={() => setEngine('gnina')} className="mt-0.5 accent-[#1e3a5f]" />
                 <div>
                   <span className="text-sm font-medium text-gray-800">GNINA</span>
-                  <p className="text-xs text-gray-400">CNN-scored (~15s/mol) — More accurate poses</p>
+                  <p className="text-xs text-gray-400">CNN-scored (~15s/mol) — Local CPU</p>
                 </div>
               </label>
               <label className={`flex items-start gap-3 p-3 rounded-lg border-2 cursor-pointer transition-all ${

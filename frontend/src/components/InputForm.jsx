@@ -411,6 +411,25 @@ export default function InputForm({ onJobCreated }) {
             <div className="space-y-2">
               <label
                 className="flex items-start gap-3 p-3 border rounded-lg cursor-pointer hover:bg-gray-50 transition-colors"
+                style={dockingEngine === 'gnina_gpu' ? { borderColor: '#22c55e', backgroundColor: '#f0fdf4' } : {}}
+              >
+                <input
+                  type="radio"
+                  name="engine"
+                  value="gnina_gpu"
+                  checked={dockingEngine === 'gnina_gpu'}
+                  onChange={() => setDockingEngine('gnina_gpu')}
+                  disabled={loading}
+                  className="mt-0.5 accent-[#22c55e]"
+                />
+                <div>
+                  <span className="font-medium text-sm text-green-700">GNINA GPU</span>
+                  <span className="ml-1.5 text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700 font-medium">Cloud</span>
+                  <p className="text-xs text-gray-500">Cloud GPU -- 10x faster, ~0.03 USD/run</p>
+                </div>
+              </label>
+              <label
+                className="flex items-start gap-3 p-3 border rounded-lg cursor-pointer hover:bg-gray-50 transition-colors"
                 style={dockingEngine === 'gnina' ? { borderColor: '#1e3a5f', backgroundColor: '#f0f4f8' } : {}}
               >
                 <input
@@ -424,7 +443,7 @@ export default function InputForm({ onJobCreated }) {
                 />
                 <div>
                   <span className="font-medium text-sm">GNINA</span>
-                  <p className="text-xs text-gray-500">CNN-scored (~15s/mol) -- More accurate poses</p>
+                  <p className="text-xs text-gray-500">CNN-scored (~15s/mol) -- Local CPU</p>
                 </div>
               </label>
               <label

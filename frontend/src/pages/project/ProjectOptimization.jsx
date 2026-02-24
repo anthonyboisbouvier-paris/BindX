@@ -416,7 +416,7 @@ function OptimizationInner({ jobId, results, project }) {
                 {selectedMol && ` — ${selectedMol.name || selectedMol.ligand_name || 'Hit'}`}
                 {dockingEngine !== 'mock' && (
                   <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-bold bg-white/20 text-white/80">
-                    {dockingEngine === 'gnina' ? 'GNINA' : dockingEngine === 'vina' ? 'Vina' : 'No docking'}
+                    {dockingEngine === 'gnina_gpu' ? 'GNINA GPU' : dockingEngine === 'gnina' ? 'GNINA' : dockingEngine === 'vina' ? 'Vina' : 'No docking'}
                   </span>
                 )}
               </p>
@@ -504,7 +504,7 @@ function OptimizationInner({ jobId, results, project }) {
                 {data?.iterations?.length || numIterations} iterations
                 {(data?.docking_engine_used || dockingEngine) !== 'mock' && (
                   <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-bold bg-white/20 text-white/80">
-                    {(data?.docking_engine_used || dockingEngine).toUpperCase()}
+                    {(() => { const e = data?.docking_engine_used || dockingEngine; return e === 'gnina_gpu' ? 'GNINA GPU' : e.toUpperCase() })()}
                   </span>
                 )}
               </p>
@@ -669,13 +669,23 @@ function OptimizationInner({ jobId, results, project }) {
                 <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">3 — Docking Engine</h2>
                 <div className="space-y-2">
                   <label className="flex items-start gap-3 p-3 border rounded-lg cursor-pointer hover:bg-gray-50 transition-colors"
+                    style={dockingEngine === "gnina_gpu" ? {borderColor: "#22c55e", backgroundColor: "#f0fdf4"} : {}}>
+                    <input type="radio" name="opt-engine" value="gnina_gpu" checked={dockingEngine === "gnina_gpu"}
+                      onChange={() => setDockingEngine("gnina_gpu")} className="mt-0.5 accent-[#22c55e]" />
+                    <div>
+                      <span className="font-medium text-sm text-green-700">GNINA GPU</span>
+                      <span className="ml-1.5 text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700 font-medium">Cloud</span>
+                      <p className="text-xs text-gray-500">Cloud GPU — 10x faster, ~0.03 USD/run</p>
+                    </div>
+                  </label>
+                  <label className="flex items-start gap-3 p-3 border rounded-lg cursor-pointer hover:bg-gray-50 transition-colors"
                     style={dockingEngine === "gnina" ? {borderColor: "#1e3a5f", backgroundColor: "#f0f4f8"} : {}}>
                     <input type="radio" name="opt-engine" value="gnina" checked={dockingEngine === "gnina"}
                       onChange={() => setDockingEngine("gnina")} className="mt-0.5 accent-[#1e3a5f]" />
                     <div>
                       <span className="font-medium text-sm">GNINA</span>
                       <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-blue-100 text-blue-700 font-medium">Recommended</span>
-                      <p className="text-xs text-gray-500">CNN-scored — Recommended for lead optimization</p>
+                      <p className="text-xs text-gray-500">CNN-scored — Local CPU, recommended for optimization</p>
                     </div>
                   </label>
                   <label className="flex items-start gap-3 p-3 border rounded-lg cursor-pointer hover:bg-gray-50 transition-colors"
@@ -698,7 +708,7 @@ function OptimizationInner({ jobId, results, project }) {
                   </label>
                 </div>
                 {(() => {
-                  const timePerMol = dockingEngine === "gnina" ? 60 : dockingEngine === "vina" ? 2 : 0
+                  const timePerMol = dockingEngine === "gnina" ? 60 : dockingEngine === "gnina_gpu" ? 3 : dockingEngine === "vina" ? 2 : 0
                   const estimatedMinutes = Math.ceil(variantsPerIter * numIterations * timePerMol / 60)
                   if (dockingEngine === "none") {
                     return (
@@ -713,7 +723,7 @@ function OptimizationInner({ jobId, results, project }) {
                         Estimated time: ~{estimatedMinutes} min
                       </p>
                       <p className="text-xs text-blue-500 mt-0.5">
-                        {variantsPerIter * numIterations} dockings total ({dockingEngine === 'gnina' ? '~60s' : '~2s'} each)
+                        {variantsPerIter * numIterations} dockings total ({dockingEngine === 'gnina' ? '~60s' : dockingEngine === 'gnina_gpu' ? '~3s GPU' : '~2s'} each)
                       </p>
                     </div>
                   )
