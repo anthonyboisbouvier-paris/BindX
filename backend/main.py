@@ -513,6 +513,10 @@ def _parse_results(raw_list: list[dict]) -> list[DockingResult]:
             vina_score=r.get("vina_score"),
             cnn_score=r.get("cnn_score"),
             cnn_affinity=r.get("cnn_affinity"),
+            cnn_vs=r.get("cnn_vs") or (
+                round((r.get("cnn_score") or 0) * (r.get("cnn_affinity") or 0), 4)
+                if r.get("cnn_score") and r.get("cnn_affinity") else None
+            ),
             consensus_rank=r.get("consensus_rank"),
             consensus_robust=r.get("consensus_robust"),
             interactions=r.get("interactions"),

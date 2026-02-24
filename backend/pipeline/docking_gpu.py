@@ -51,7 +51,7 @@ def dock_batch_gpu(
     center: list[float],
     size: list[float],
     exhaustiveness: int = 8,
-    num_modes: int = 3,
+    num_modes: int = 9,
 ) -> dict:
     """Send a batch of ligands to RunPod GPU for GNINA docking.
 
@@ -98,6 +98,10 @@ def dock_batch_gpu(
             "exhaustiveness": exhaustiveness,
             "num_modes": num_modes,
             "cnn_scoring": "rescore",
+            # Use default CNN ensemble (5 models) — do NOT specify a single
+            # model. Matches CPU config per McNutt et al. 2021.
+            "seed": 0,
+            "min_rmsd_filter": 1.0,
         }
     }
 
@@ -349,8 +353,19 @@ def dock_all_runpod_batch(
             cnn_score_raw = best.get("CNNscore", best.get("cnn_score", 0.0))
             cnn_affinity = best.get("CNNaffinity", best.get("cnn_affinity", 0.0))
 
+            # Reject positive Vina scores (steric clash artifacts) — same as CPU
+            if vina_score > 0:
+                logger.warning(
+                    "GPU: positive Vina score (%.2f) for %s — rejecting",
+                    vina_score, lig.get("name"),
+                )
+                continue
+
             # Clamp CNN score to [0, 1]
             cnn_score = max(0.0, min(1.0, cnn_score_raw or 0.0))
+
+            # CNN_VS composite (CNNscore × CNNaffinity) per CACHE Challenge / Sunseri 2021
+            cnn_vs = round(cnn_score * (cnn_affinity or 0.0), 4)
 
             all_results.append({
                 **lig,  # preserve original keys (name, smiles, source, etc.)
@@ -358,6 +373,7 @@ def dock_all_runpod_batch(
                 "vina_score": vina_score,
                 "cnn_score": round(cnn_score, 3),
                 "cnn_affinity": cnn_affinity,
+                "cnn_vs": cnn_vs,
                 "docking_engine": "gnina_gpu",
                 "pose_pdbqt_path": None,  # GPU doesn't return local file paths
             })

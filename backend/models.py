@@ -400,6 +400,7 @@ class DockingResult(BaseModel):
     vina_score: Optional[float] = None  # Vina affinity (kcal/mol)
     cnn_score: Optional[float] = None  # GNINA CNN pose confidence (0-1)
     cnn_affinity: Optional[float] = None  # GNINA CNN affinity (pK)
+    cnn_vs: Optional[float] = None  # CNN_VS = CNNscore × CNNaffinity (VS ranking score)
     consensus_rank: Optional[float] = None  # Mean of 3 score ranks
     consensus_robust: Optional[bool] = None  # In top 50 of 2/3 methods
     interactions: Optional[dict] = None  # ProLIF interaction analysis

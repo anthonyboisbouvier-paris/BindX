@@ -215,16 +215,26 @@ def dock_gnina(
 
     output_sdf = str(Path(ligand_sdf).with_suffix(".docked.sdf"))
 
-    # Standard docking preprocessing: place initial ligand conformer at the
-    # search box center. GNINA/Vina require the starting pose to be within
-    # the search space. This is standard practice per GNINA documentation.
-    # The OUTPUT pose coordinates from the docking engine are used as-is.
-    actual_ligand = _place_ligand_at_box_center(ligand_sdf, center)
+    # GNINA MCMC sampling explores the full search box — no ligand
+    # pre-centering needed (CACHE Challenge #1; Sunseri & Koes 2021).
+    # Passing the original 3D conformer directly.
+
+    # Prefer PDB receptor over PDBQT: GNINA handles PDB natively via
+    # OpenBabel (CACHE Challenge recommendation). If receptor_pdb is a
+    # .pdbqt, try to find the .pdb sibling.
+    receptor_file = receptor_pdb
+    if receptor_pdb.endswith(".pdbqt"):
+        pdb_sibling = receptor_pdb.rsplit(".pdbqt", 1)[0] + ".pdb"
+        clean_pdb = receptor_pdb.rsplit(".pdbqt", 1)[0].replace("_receptor", "_clean") + ".pdb"
+        for candidate in [pdb_sibling, clean_pdb]:
+            if Path(candidate).exists():
+                receptor_file = candidate
+                break
 
     cmd = [
         gnina_bin,
-        "--receptor", receptor_pdb,
-        "--ligand", actual_ligand,
+        "--receptor", receptor_file,
+        "--ligand", ligand_sdf,
         "--center_x", str(center[0]),
         "--center_y", str(center[1]),
         "--center_z", str(center[2]),
@@ -233,9 +243,12 @@ def dock_gnina(
         "--size_z", str(size[2]),
         "--exhaustiveness", str(exhaustiveness),
         "--cnn_scoring", "rescore",
-        "--cnn", "crossdock_default2018",
+        # Default CNN ensemble (5 models) per McNutt et al. 2021 —
+        # outperforms any single model on DUD-E and LIT-PCBA.
+        "--num_modes", "9",
+        "--seed", "0",
+        "--min_rmsd_filter", "1.0",
         "--out", output_sdf,
-        "--num_modes", "3",
     ]
 
     try:
@@ -514,12 +527,16 @@ def _try_gnina_single(
             # Clamp CNN score to valid [0, 1] range
             raw_cnn = best.get("cnn_score", 0.0) or 0.0
             clamped_cnn = max(0.0, min(1.0, raw_cnn))
+            cnn_aff = best.get("cnn_affinity", 0.0) or 0.0
+            # CNN_VS composite (CNNscore × CNNaffinity) per CACHE Challenge / Sunseri 2021
+            cnn_vs = round(clamped_cnn * cnn_aff, 4)
             return {
                 "affinity": best["vina_score"],
                 "pose_pdbqt_path": pose_path if pose_path.exists() else None,
                 "vina_score": best["vina_score"],
                 "cnn_score": round(clamped_cnn, 3),
-                "cnn_affinity": best["cnn_affinity"],
+                "cnn_affinity": cnn_aff,
+                "cnn_vs": cnn_vs,
                 "docking_engine": "gnina",
             }
     except Exception as exc:

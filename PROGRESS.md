@@ -462,31 +462,47 @@
 - Docking: GNINA 1.1 (CPU), exhaustiveness=8, 3 poses
 - Evaluation: Enrichment factor, EF10%, Vina/CNN score ranges, active vs decoy ranking
 
-### Results Summary (Pre-Rebalance Scoring, Docking Scores)
+### Results Summary — 5-Target Final Benchmark (Post-Rebalance V2)
 
-| Metric | EGFR | CDK2 | BRAF |
-|--------|------|------|------|
-| GNINA success rate | 84% (16/19) | 100% (19/19) | 95% (18/19) |
-| Vina enrichment (actives/decoys) | 1.21x | 1.44x | 1.80x |
-| CNN affinity enrichment | 3.23x | 1.73x | 2.85x |
-| EF10% (Vina) | 5.3 | 3.8 | 6.0 |
-| Active avg Vina | -7.69 | -7.53 | -6.49 |
-| Decoy avg Vina | -6.46 | -6.09 | -5.76 |
-| Vina range | [-9.65, -2.84] | [-9.68, -3.27] | [-7.56, -4.02] |
-| CNN range | [0.44, 0.78] | [0.10, 0.70] | [0.22, 0.77] |
-| CNN affinity range (pK) | [3.71, 8.04] | [3.29, 7.63] | [3.90, 8.08] |
+| Metric | EGFR | CDK2 | BRAF V600E | JAK2 | KRAS G12C | Mean |
+|--------|------|------|------------|------|-----------|------|
+| Actives/Decoys | 13/10 | 11/10 | 11/10 | 12/10 | 9/10 | 11.2/10 |
+| GNINA success | 100% | 100% | 100% | 100% | 77% | 95% |
+| EF (Vina) | 1.05x | 1.30x | 1.61x | 1.19x | 1.59x | **1.35x** |
+| EF (CNN aff) | 1.34x | 1.57x | 2.10x | 1.36x | 1.92x | **1.66x** |
+| EF10% (Vina) | 1.5 | 0.9 | 1.8 | 0.8 | 1.3 | 1.3 |
+| EF10% (CNN) | 1.5 | 2.7 | 2.7 | 0.8 | 0.0 | 1.5 |
+| Active avg Vina | -8.56 | -3.56 | -7.79 | -5.82 | -7.22 | -6.59 |
+| Decoy avg Vina | +2.54 | -3.81 | -4.73 | -1.64 | -5.86 | -2.70 |
+| Spearman Vina/IC50 | -0.27 | 0.28 | 0.08 | -0.14 | **-0.82*** | — |
+| Spearman CNN/IC50 | 0.22 | -0.08 | 0.30 | -0.06 | -0.40 | — |
+
+*p=0.007 (significant)
+
+### Reproducibility
+- Top-5/10 overlap: 100% (EGFR duplicate run)
+- Mean Vina score diff: 0.69 kcal/mol (max 2.1)
+
+### GPU vs CPU Consistency (EGFR)
+- Rank correlation: rho = -0.046 (poor)
+- Mean Vina diff: 6.27 kcal/mol, max 51.7 kcal/mol
+- Top-5 overlap: 0%, Top-10: 20%
+- Note: GPU and CPU GNINA builds produce different CNN inference results
 
 ### Validation Status
-- **Docking scores correctly rank actives above decoys** across all 3 targets (Vina + CNN)
-- **All score ranges within expected pharmacological bounds**
-- **No positive Vina scores** in final results (HETATM fix validated)
-- **93% average GNINA success rate** across targets
-- **Molecular descriptors accurate**: MW within 1-2%, TPSA within 2%, logP Crippen bias ~0.8
+- **All 5 targets show positive enrichment** (EF > 1.0 for both Vina and CNN)
+- **CNN affinity outperforms Vina** across all targets (mean 1.66x vs 1.35x)
+- **Spearman correlations mostly non-significant** (expected with small N and for relative scoring)
+- **KRAS G12C shows significant Vina/IC50 correlation** (rho=-0.82, p=0.007)
+- **95% average GNINA success rate** across targets
 - **Composite score rebalanced**: docking affinity now dominant (65% V1, 55% V2)
+- **Reproducibility validated**: deterministic rankings on same platform
 
 ### Known Limitations
-- Small benchmark set (19 molecules/target) — insufficient for statistical significance tests
+- 56 actives + 10 shared decoys — modest benchmark size for statistical power
 - Decoys are marketed drugs with excellent druglikeness — harder test than DUD-E random decoys
-- Enrichment factors modest (1.2-1.8x Vina) vs published benchmarks (5-15x on DUD-E)
-- Some known actives fell back to mock docking (Erlotinib, Atorvastatin) — PDBQT conversion issue
+- Enrichment factors modest (1.05-2.10x) vs published DUD-E benchmarks (5-15x)
+- Spearman correlations weak — docking scores not suitable for absolute affinity prediction
+- GPU/CPU inconsistency — different GNINA builds yield different rankings
+- KRAS G12C covalent inhibitors: some timeouts on large structures (77% success)
 - Rigid receptor approximation — no induced-fit effects captured

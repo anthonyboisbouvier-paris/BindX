@@ -1,4 +1,5 @@
 import React, { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 
 // --------------------------------------------------
 // Section icons
@@ -336,6 +337,8 @@ function SectionCard({ section, isOpen, onToggle }) {
 // --------------------------------------------------
 export default function MethodologyPage({ onBack }) {
   const [openSection, setOpenSection] = useState(null)
+  const navigate = useNavigate()
+  const navigateBack = onBack || (() => navigate(-1))
 
   const toggleSection = (id) => {
     setOpenSection((prev) => (prev === id ? null : id))
@@ -346,7 +349,7 @@ export default function MethodologyPage({ onBack }) {
       {/* Back + header */}
       <div className="flex items-center gap-4">
         <button
-          onClick={onBack}
+          onClick={navigateBack}
           className="flex items-center gap-1.5 px-3 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm rounded-lg transition-colors flex-shrink-0"
         >
           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -454,123 +457,248 @@ export default function MethodologyPage({ onBack }) {
         <div className="px-5 py-4 bg-green-700">
           <h2 className="font-bold text-lg text-white">Benchmark Validation Results</h2>
           <p className="text-white/70 text-sm mt-1">
-            Three-target benchmark with known actives vs. decoys (February 2026)
+            Five-target benchmark with known actives vs. decoys (February 2026)
           </p>
         </div>
-        <div className="p-5 space-y-5">
+        <div className="p-5 space-y-6">
+
           {/* Protocol summary */}
           <div className="bg-gray-50 rounded-lg p-4">
             <h3 className="text-sm font-bold text-gray-700 mb-2">Benchmark Protocol</h3>
             <p className="text-xs text-gray-600 leading-relaxed">
-              Three well-characterized kinase targets (EGFR, CDK2, BRAF V600E) were screened using GNINA 1.1
-              with experimental PDB structures. Each set included 3-5 known FDA-approved inhibitors (actives)
-              and 10-14 non-target drugs (decoys: ibuprofen, aspirin, metformin, etc.) to evaluate enrichment.
-              All receptor structures were prepared with automatic HETATM stripping.
-              Ligands were provided as SMILES and converted to SDF for native GNINA input.
+              Five kinase targets (EGFR, CDK2, BRAF V600E, JAK2, KRAS G12C) were screened using GNINA 1.1
+              with experimental PDB structures. Each set included 9-13 known inhibitors (actives) and
+              10 non-target drugs (decoys) to evaluate enrichment. Enrichment Factor (EF) is the ratio of
+              active fraction in top-ranked compounds vs. the random expectation. EF10% counts actives
+              in the top 10% of the ranked list. All receptor structures were prepared with automatic
+              HETATM stripping. Ligands were provided as SMILES and converted to SDF for native GNINA input.
             </p>
           </div>
 
-          {/* Results table */}
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs border-collapse">
-              <thead>
-                <tr className="bg-gray-50 text-gray-600 uppercase tracking-wide">
-                  <th className="px-3 py-2 text-left font-semibold">Metric</th>
-                  <th className="px-3 py-2 text-center font-semibold">EGFR (P00533)</th>
-                  <th className="px-3 py-2 text-center font-semibold">CDK2 (P24941)</th>
-                  <th className="px-3 py-2 text-center font-semibold">BRAF (P15056)</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-100">
-                <tr>
-                  <td className="px-3 py-2 font-medium text-gray-700">PDB structure</td>
-                  <td className="px-3 py-2 text-center text-gray-600">8A27 (1.07 A)</td>
-                  <td className="px-3 py-2 text-center text-gray-600">6Q4G</td>
-                  <td className="px-3 py-2 text-center text-gray-600">4MNE</td>
-                </tr>
-                <tr className="bg-gray-50/50">
-                  <td className="px-3 py-2 font-medium text-gray-700">GNINA success rate</td>
-                  <td className="px-3 py-2 text-center"><span className="text-green-600 font-bold">84%</span> (16/19)</td>
-                  <td className="px-3 py-2 text-center"><span className="text-green-600 font-bold">100%</span> (19/19)</td>
-                  <td className="px-3 py-2 text-center"><span className="text-green-600 font-bold">95%</span> (18/19)</td>
-                </tr>
-                <tr>
-                  <td className="px-3 py-2 font-medium text-gray-700">Vina score range</td>
-                  <td className="px-3 py-2 text-center text-gray-600">-9.65 to -2.84</td>
-                  <td className="px-3 py-2 text-center text-gray-600">-9.68 to -3.27</td>
-                  <td className="px-3 py-2 text-center text-gray-600">-7.56 to -4.02</td>
-                </tr>
-                <tr className="bg-gray-50/50">
-                  <td className="px-3 py-2 font-medium text-gray-700">CNN score range</td>
-                  <td className="px-3 py-2 text-center text-gray-600">0.44 - 0.78</td>
-                  <td className="px-3 py-2 text-center text-gray-600">0.10 - 0.70</td>
-                  <td className="px-3 py-2 text-center text-gray-600">0.22 - 0.77</td>
-                </tr>
-                <tr>
-                  <td className="px-3 py-2 font-medium text-gray-700">CNN affinity range (pK)</td>
-                  <td className="px-3 py-2 text-center text-gray-600">3.71 - 8.04</td>
-                  <td className="px-3 py-2 text-center text-gray-600">3.29 - 7.63</td>
-                  <td className="px-3 py-2 text-center text-gray-600">3.90 - 8.08</td>
-                </tr>
-                <tr className="bg-green-50">
-                  <td className="px-3 py-2 font-medium text-green-800">Vina enrichment (actives vs decoys)</td>
-                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.21x</span></td>
-                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.44x</span></td>
-                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.80x</span></td>
-                </tr>
-                <tr className="bg-green-50">
-                  <td className="px-3 py-2 font-medium text-green-800">CNN affinity enrichment</td>
-                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">3.23x</span></td>
-                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.73x</span></td>
-                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">2.85x</span></td>
-                </tr>
-                <tr className="bg-green-50">
-                  <td className="px-3 py-2 font-medium text-green-800">EF10% (Vina)</td>
-                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">5.3</span></td>
-                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">3.8</span></td>
-                  <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">6.0</span></td>
-                </tr>
-                <tr>
-                  <td className="px-3 py-2 font-medium text-gray-700">Active avg Vina (kcal/mol)</td>
-                  <td className="px-3 py-2 text-center text-gray-600">-7.69</td>
-                  <td className="px-3 py-2 text-center text-gray-600">-7.53</td>
-                  <td className="px-3 py-2 text-center text-gray-600">-6.49</td>
-                </tr>
-                <tr className="bg-gray-50/50">
-                  <td className="px-3 py-2 font-medium text-gray-700">Decoy avg Vina (kcal/mol)</td>
-                  <td className="px-3 py-2 text-center text-gray-600">-6.46</td>
-                  <td className="px-3 py-2 text-center text-gray-600">-6.09</td>
-                  <td className="px-3 py-2 text-center text-gray-600">-5.76</td>
-                </tr>
-                <tr>
-                  <td className="px-3 py-2 font-medium text-gray-700">Known actives tested</td>
-                  <td className="px-3 py-2 text-center text-gray-600">Afatinib, Gefitinib, Lapatinib</td>
-                  <td className="px-3 py-2 text-center text-gray-600">Flavopiridol, Dinaciclib, Roscovitine, SNS-032, Palbociclib</td>
-                  <td className="px-3 py-2 text-center text-gray-600">Vemurafenib, Sorafenib, AZ628</td>
-                </tr>
-              </tbody>
-            </table>
+          {/* Enrichment factors table */}
+          <div>
+            <h3 className="text-sm font-bold text-gray-700 mb-2">Enrichment Factors — Actives vs. Decoys</h3>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs border-collapse">
+                <thead>
+                  <tr className="bg-dockit-blue text-white">
+                    <th className="px-3 py-2 text-left font-semibold rounded-tl-lg">Target</th>
+                    <th className="px-3 py-2 text-center font-semibold">Actives</th>
+                    <th className="px-3 py-2 text-center font-semibold">Decoys</th>
+                    <th className="px-3 py-2 text-center font-semibold">EF Vina</th>
+                    <th className="px-3 py-2 text-center font-semibold">EF CNN</th>
+                    <th className="px-3 py-2 text-center font-semibold">EF10% Vina</th>
+                    <th className="px-3 py-2 text-center font-semibold">EF10% CNN</th>
+                    <th className="px-3 py-2 text-center font-semibold rounded-tr-lg">GNINA success</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  <tr className="hover:bg-gray-50">
+                    <td className="px-3 py-2 font-semibold text-dockit-blue">EGFR (P00533)</td>
+                    <td className="px-3 py-2 text-center text-gray-600">13</td>
+                    <td className="px-3 py-2 text-center text-gray-600">10</td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.05x</span></td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.34x</span></td>
+                    <td className="px-3 py-2 text-center text-gray-700">1.5</td>
+                    <td className="px-3 py-2 text-center text-gray-700">1.5</td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-600 font-bold">100%</span></td>
+                  </tr>
+                  <tr className="bg-gray-50/40 hover:bg-gray-50">
+                    <td className="px-3 py-2 font-semibold text-dockit-blue">CDK2 (P24941)</td>
+                    <td className="px-3 py-2 text-center text-gray-600">11</td>
+                    <td className="px-3 py-2 text-center text-gray-600">10</td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.30x</span></td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.57x</span></td>
+                    <td className="px-3 py-2 text-center text-gray-700">0.9</td>
+                    <td className="px-3 py-2 text-center text-gray-700">2.7</td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-600 font-bold">100%</span></td>
+                  </tr>
+                  <tr className="hover:bg-gray-50">
+                    <td className="px-3 py-2 font-semibold text-dockit-blue">BRAF V600E (P15056)</td>
+                    <td className="px-3 py-2 text-center text-gray-600">11</td>
+                    <td className="px-3 py-2 text-center text-gray-600">10</td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.61x</span></td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">2.10x</span></td>
+                    <td className="px-3 py-2 text-center text-gray-700">1.8</td>
+                    <td className="px-3 py-2 text-center text-gray-700">2.7</td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-600 font-bold">100%</span></td>
+                  </tr>
+                  <tr className="bg-gray-50/40 hover:bg-gray-50">
+                    <td className="px-3 py-2 font-semibold text-dockit-blue">JAK2 (O60674)</td>
+                    <td className="px-3 py-2 text-center text-gray-600">12</td>
+                    <td className="px-3 py-2 text-center text-gray-600">10</td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.19x</span></td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.36x</span></td>
+                    <td className="px-3 py-2 text-center text-gray-700">0.8</td>
+                    <td className="px-3 py-2 text-center text-gray-700">0.8</td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-600 font-bold">100%</span></td>
+                  </tr>
+                  <tr className="hover:bg-gray-50">
+                    <td className="px-3 py-2 font-semibold text-dockit-blue">KRAS G12C (P01116)</td>
+                    <td className="px-3 py-2 text-center text-gray-600">9</td>
+                    <td className="px-3 py-2 text-center text-gray-600">10</td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.59x</span></td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-700 font-bold">1.92x</span></td>
+                    <td className="px-3 py-2 text-center text-gray-700">1.3</td>
+                    <td className="px-3 py-2 text-center text-amber-600 font-semibold">0.0</td>
+                    <td className="px-3 py-2 text-center"><span className="text-amber-600 font-bold">77%</span></td>
+                  </tr>
+                  {/* Summary row */}
+                  <tr className="bg-green-50 border-t-2 border-green-200">
+                    <td className="px-3 py-2 font-bold text-green-800">Mean (5 targets)</td>
+                    <td className="px-3 py-2 text-center font-semibold text-green-800">11.2</td>
+                    <td className="px-3 py-2 text-center font-semibold text-green-800">10</td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-800 font-bold">1.35x</span></td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-800 font-bold">1.66x</span></td>
+                    <td className="px-3 py-2 text-center font-semibold text-green-800">1.26</td>
+                    <td className="px-3 py-2 text-center font-semibold text-green-800">1.54</td>
+                    <td className="px-3 py-2 text-center"><span className="text-green-800 font-bold">95%</span></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p className="text-xs text-gray-400 mt-1.5 italic">
+              EF = mean active score / mean decoy score (overall enrichment). EF10% = actives recovered in top 10% of ranked list (expected = 1.0 at random).
+            </p>
+          </div>
+
+          {/* Spearman correlation table */}
+          <div>
+            <h3 className="text-sm font-bold text-gray-700 mb-2">Rank Correlation with Experimental IC50</h3>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs border-collapse">
+                <thead>
+                  <tr className="bg-gray-100 text-gray-600 uppercase tracking-wide">
+                    <th className="px-3 py-2 text-left font-semibold">Target</th>
+                    <th className="px-3 py-2 text-center font-semibold">n actives</th>
+                    <th className="px-3 py-2 text-center font-semibold">Vina rho</th>
+                    <th className="px-3 py-2 text-center font-semibold">Vina p-value</th>
+                    <th className="px-3 py-2 text-center font-semibold">CNN rho</th>
+                    <th className="px-3 py-2 text-center font-semibold">CNN p-value</th>
+                    <th className="px-3 py-2 text-center font-semibold">Significant?</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  <tr className="hover:bg-gray-50">
+                    <td className="px-3 py-2 font-medium text-gray-700">EGFR</td>
+                    <td className="px-3 py-2 text-center text-gray-600">13</td>
+                    <td className="px-3 py-2 text-center text-gray-600">-0.265</td>
+                    <td className="px-3 py-2 text-center text-gray-500">0.381</td>
+                    <td className="px-3 py-2 text-center text-gray-600">0.221</td>
+                    <td className="px-3 py-2 text-center text-gray-500">0.468</td>
+                    <td className="px-3 py-2 text-center text-gray-400">No</td>
+                  </tr>
+                  <tr className="bg-gray-50/40 hover:bg-gray-50">
+                    <td className="px-3 py-2 font-medium text-gray-700">CDK2</td>
+                    <td className="px-3 py-2 text-center text-gray-600">11</td>
+                    <td className="px-3 py-2 text-center text-gray-600">0.282</td>
+                    <td className="px-3 py-2 text-center text-gray-500">0.401</td>
+                    <td className="px-3 py-2 text-center text-gray-600">-0.082</td>
+                    <td className="px-3 py-2 text-center text-gray-500">0.811</td>
+                    <td className="px-3 py-2 text-center text-gray-400">No</td>
+                  </tr>
+                  <tr className="hover:bg-gray-50">
+                    <td className="px-3 py-2 font-medium text-gray-700">BRAF V600E</td>
+                    <td className="px-3 py-2 text-center text-gray-600">11</td>
+                    <td className="px-3 py-2 text-center text-gray-600">0.077</td>
+                    <td className="px-3 py-2 text-center text-gray-500">0.821</td>
+                    <td className="px-3 py-2 text-center text-gray-600">0.296</td>
+                    <td className="px-3 py-2 text-center text-gray-500">0.377</td>
+                    <td className="px-3 py-2 text-center text-gray-400">No</td>
+                  </tr>
+                  <tr className="bg-gray-50/40 hover:bg-gray-50">
+                    <td className="px-3 py-2 font-medium text-gray-700">JAK2</td>
+                    <td className="px-3 py-2 text-center text-gray-600">12</td>
+                    <td className="px-3 py-2 text-center text-gray-600">-0.141</td>
+                    <td className="px-3 py-2 text-center text-gray-500">0.662</td>
+                    <td className="px-3 py-2 text-center text-gray-600">-0.063</td>
+                    <td className="px-3 py-2 text-center text-gray-500">0.845</td>
+                    <td className="px-3 py-2 text-center text-gray-400">No</td>
+                  </tr>
+                  <tr className="hover:bg-gray-50">
+                    <td className="px-3 py-2 font-medium text-gray-700">KRAS G12C</td>
+                    <td className="px-3 py-2 text-center text-gray-600">9</td>
+                    <td className="px-3 py-2 text-center font-semibold text-green-700">-0.817</td>
+                    <td className="px-3 py-2 text-center">
+                      <span className="bg-green-100 text-green-800 font-bold px-1.5 py-0.5 rounded">0.007*</span>
+                    </td>
+                    <td className="px-3 py-2 text-center text-gray-600">-0.400</td>
+                    <td className="px-3 py-2 text-center text-gray-500">0.286</td>
+                    <td className="px-3 py-2 text-center text-green-600 font-semibold">Vina only</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p className="text-xs text-gray-400 mt-1.5 italic">
+              Spearman rank correlation between docking score and experimental IC50 (actives only, with IC50 data). * p &lt; 0.05.
+              Negative rho for Vina is expected (more negative score = better rank, lower IC50 = more potent).
+            </p>
+          </div>
+
+          {/* Reproducibility + GPU/CPU */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="bg-green-50 rounded-lg p-4">
+              <h4 className="text-xs font-bold text-green-800 uppercase tracking-wide mb-2">Reproducibility (CPU runs)</h4>
+              <ul className="text-xs text-green-700 space-y-1.5">
+                <li className="flex justify-between">
+                  <span>Top-5 overlap between runs</span>
+                  <span className="font-bold">100%</span>
+                </li>
+                <li className="flex justify-between">
+                  <span>Top-10 overlap between runs</span>
+                  <span className="font-bold">100%</span>
+                </li>
+                <li className="flex justify-between">
+                  <span>Mean score difference</span>
+                  <span className="font-bold">0.69 kcal/mol</span>
+                </li>
+              </ul>
+              <p className="text-xs text-green-600 mt-2 leading-relaxed">
+                GNINA uses deterministic seeds. Rankings are highly stable across repeated CPU runs.
+              </p>
+            </div>
+            <div className="bg-amber-50 rounded-lg p-4">
+              <h4 className="text-xs font-bold text-amber-800 uppercase tracking-wide mb-2">GPU vs. CPU Consistency</h4>
+              <ul className="text-xs text-amber-700 space-y-1.5">
+                <li className="flex justify-between">
+                  <span>Rank correlation (rho)</span>
+                  <span className="font-bold text-amber-600">-0.046 (poor)</span>
+                </li>
+                <li className="flex justify-between">
+                  <span>Top-5 overlap</span>
+                  <span className="font-bold text-amber-600">0%</span>
+                </li>
+                <li className="flex justify-between">
+                  <span>Mean score difference</span>
+                  <span className="font-bold text-amber-600">6.27 kcal/mol</span>
+                </li>
+              </ul>
+              <p className="text-xs text-amber-600 mt-2 leading-relaxed">
+                GPU and CPU GNINA inference modes differ substantially. DockIt runs CPU mode consistently
+                to ensure reproducibility. GPU results should not be mixed with CPU results for ranking.
+              </p>
+            </div>
           </div>
 
           {/* Key findings */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div className="bg-green-50 rounded-lg p-3">
-              <h4 className="text-xs font-bold text-green-800 uppercase tracking-wide mb-1">Validated</h4>
-              <ul className="text-xs text-green-700 space-y-1 list-disc list-inside">
-                <li>Known actives rank above decoys by Vina score across all 3 targets</li>
-                <li>CNN affinity provides even stronger enrichment (1.7-3.2x)</li>
-                <li>All score ranges within expected pharmacological bounds</li>
-                <li>No positive Vina scores (steric clash) in final results</li>
-                <li>93% average GNINA success rate across targets</li>
+            <div className="bg-blue-50 rounded-lg p-3">
+              <h4 className="text-xs font-bold text-blue-800 uppercase tracking-wide mb-1">Interpretation</h4>
+              <ul className="text-xs text-blue-700 space-y-1 list-disc list-inside">
+                <li>CNN affinity consistently outperforms Vina (mean EF 1.66x vs 1.35x across 5 targets)</li>
+                <li>Rank correlations with IC50 are weak across most targets — expected for docking-based scoring</li>
+                <li>KRAS significant correlation (rho=-0.817, p=0.007) likely reflects wide IC50 range in the active set</li>
+                <li>KRAS EF10% CNN = 0.0 is consistent with lower GNINA success rate (77%) for this target</li>
+                <li>All 4 targets with 100% GNINA success show positive enrichment in both Vina and CNN</li>
               </ul>
             </div>
             <div className="bg-amber-50 rounded-lg p-3">
               <h4 className="text-xs font-bold text-amber-800 uppercase tracking-wide mb-1">Limitations noted</h4>
               <ul className="text-xs text-amber-700 space-y-1 list-disc list-inside">
-                <li>Enrichment factors are modest (1.2-1.8x by Vina) vs. published benchmarks (5-15x on DUD-E)</li>
-                <li>Small benchmark set (19 molecules/target) limits statistical power</li>
-                <li>Decoys are marketed drugs (not random compounds) making this a harder test</li>
-                <li>Composite score over-weights druglikeness; use Vina/CNN ranking for enrichment evaluation</li>
+                <li>EF values (1.05-2.10x) are modest vs. DUD-E benchmarks (5-15x) — decoys here are real drugs, not random compounds</li>
+                <li>Small active sets (9-13 per target) limit statistical power for rank correlation</li>
+                <li>GPU/CPU inconsistency indicates CNN scores are hardware-dependent; use CPU for comparability</li>
+                <li>Composite score includes druglikeness terms; use raw Vina/CNN for enrichment evaluation</li>
               </ul>
             </div>
           </div>

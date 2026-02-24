@@ -228,6 +228,23 @@ function SidebarLayoutInner() {
         {/* Bottom links */}
         <div className="px-3 py-3 border-t border-white/10 space-y-1">
           <NavLink
+            to="/methodology"
+            className={({ isActive }) =>
+              [
+                'flex items-center gap-2 px-3 py-1.5 text-xs rounded-md transition-colors duration-150',
+                isActive
+                  ? 'bg-white/10 text-white font-medium'
+                  : 'text-white/40 hover:text-white hover:bg-white/5',
+              ].join(' ')
+            }
+          >
+            <svg className="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8}
+                d="M9.75 3.104v5.714a2.25 2.25 0 01-.659 1.591L5 14.5M9.75 3.104c-.251.023-.501.05-.75.082m.75-.082a24.301 24.301 0 014.5 0m0 0v5.714a2.25 2.25 0 00.659 1.591L19 14.5M14.25 3.104c.251.023.501.05.75.082M19 14.5l-1.47 4.9a2.25 2.25 0 01-2.156 1.6H8.626a2.25 2.25 0 01-2.156-1.6L5 14.5m14 0H5" />
+            </svg>
+            <span>Methodology</span>
+          </NavLink>
+          <NavLink
             to="/references"
             className={({ isActive }) =>
               [

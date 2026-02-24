@@ -535,6 +535,7 @@ export default function App() {
 
           {/* V9: References / Methodology page */}
           <Route path="/references" element={<ReferencesPage />} />
+          <Route path="/methodology" element={<MethodologyPage />} />
 
           {/* Legacy routes (anonymous, backward compat) */}
           <Route path="/run" element={<RunPageWrapper flow={flow} />} />
